@@ -8,12 +8,12 @@ The DDE (Diesel Engine Electronics) on this F11 talks to the rest of the car pri
 
 The plan is to build a small emulator that:
 
-- Speaks FlexRay to the car (two channels)
+- Speaks FlexRay and CAN to the car
 - Speaks CAN to the ZombieVerter VCU
 - Translates the essential signals (RPM, coolant temp, fuel rate / power, status bits, etc.) so the car continues to behave normally
 - Provides USB for programming and logging
 
-Hardware target: two FlexRay channels + one CAN channel + USB.  
+Hardware target: one FlexRay channel + two CAN channels + USB.  
 Bench development is being done with OpenFSD FlexRayRPIPanda boards and software based on dynm/pico-flexray, with SavvyCAN (flexray-phase1-capture branch) for capture and analysis.
 
 ## The DDE
