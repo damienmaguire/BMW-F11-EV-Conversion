@@ -1,0 +1,8 @@
+Designator,Val,Package,Mid X,Mid Y,Rotation,Layer
+A1,RaspberryPi_Pico,RaspberryPi_Pico_Common_Unspecified,102.925,-77.04,0.0,top
+C1,0.1uF,C_0805_2012Metric,129.4,-98.125,90.0,top
+C2,0.1uF,C_0805_2012Metric,65.525,-95.4,180.0,top
+C3,0.1uF,C_0805_2012Metric,76.275,-98.225,-90.0,top
+C4,0.1uF,C_0805_2012Metric,136.7,-98.125,-90.0,top
+IC1,NCV7383DB0R2G,TSSOP-14_4.4x5mm_P0.65mm,132.275,-93.1925,180.0,top
+IC2,NCV7383DB0R2G,TSSOP-14_4.4x5mm_P0.65mm,72.075,-93.425,180.0,top

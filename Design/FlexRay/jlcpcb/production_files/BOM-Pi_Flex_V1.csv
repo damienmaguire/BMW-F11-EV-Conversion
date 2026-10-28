@@ -1,0 +1,4 @@
+Comment,Designator,Footprint,LCSC,Quantity
+0.1uF,"C1,C2,C3,C4",C_0805_2012Metric,C126469,4
+NCV7383DB0R2G,"IC1,IC2",TSSOP-14_4.4x5mm_P0.65mm,C904660,2
+RaspberryPi_Pico,A1,RaspberryPi_Pico_Common_Unspecified,C41407547,1
