@@ -8,6 +8,7 @@ see `Design/FlexRay`).
 | Folder | What is in it |
 |---|---|
 | [`firmware/`](firmware/) | The two UF2 builds that are known to work in the car |
+| [`passthrough-mitm/`](passthrough-mitm/) | Source of the pass-through MITM firmware (`pico_flexray_passthrough_KNOWN_GOOD.uf2`), with build steps |
 | [`tools/`](tools/) | Python logger and schedule analyser for timestamped captures |
 | [`dbc/`](dbc/) | DBC files for the DDE FlexRay frames (SavvyCAN layout) and the DDE's PT-CAN / PT-CAN2 messages, plus Fred's signal table and E2E notes |
 

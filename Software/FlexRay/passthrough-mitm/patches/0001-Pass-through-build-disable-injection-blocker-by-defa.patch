@@ -1,0 +1,118 @@
+From 9a9ddcc71fb5c6e410c38a6ef33a7772346323c9 Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Thu, 29 Oct 2026 10:32:31 +0000
+Subject: [PATCH] Pass-through build: disable injection + blocker by default,
+ target Pico 2 (pico2/rp2350-arm-s)
+
+- flexray_injector_rules.h: empty INJECT_TRIGGERS[] (no injection rules)
+- flexray_injector.c: injector_enabled defaults false; add _Static_assert(NUM_TRIGGER_RULES==0)
+- flexray_blocker.c: flexray_filter_enabled defaults false
+- CMakeLists.txt: PICO_BOARD pico2 (was pico2_w)
+---
+ CMakeLists.txt               |  2 +-
+ src/flexray_blocker.c        |  2 +-
+ src/flexray_injector.c       |  5 ++++-
+ src/flexray_injector_rules.h | 38 +-----------------------------------
+ 4 files changed, 7 insertions(+), 40 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 45a502e..ca65e86 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -26,7 +26,7 @@ if (EXISTS ${picoVscode})
+     include(${picoVscode})
+ endif()
+ # ====================================================================================
+-set(PICO_BOARD pico2_w CACHE STRING "Board type")
++set(PICO_BOARD pico2 CACHE STRING "Board type")
+ 
+ # Pull in Raspberry Pi Pico SDK (must be before project)
+ include(pico_sdk_import.cmake)
+diff --git a/src/flexray_blocker.c b/src/flexray_blocker.c
+index 07920bd..f15ab9f 100644
+--- a/src/flexray_blocker.c
++++ b/src/flexray_blocker.c
+@@ -9,7 +9,7 @@ typedef struct {
+     uint8_t direction_mask;
+ } flexray_filter_rule_t;
+ 
+-static volatile bool flexray_filter_enabled = true;
++static volatile bool flexray_filter_enabled = false; /* pass-through: blocker off by default */
+ static volatile uint8_t flexray_filter_whitelist_direction_mask = 0;
+ static volatile uint8_t flexray_filter_rule_count = 0;
+ static volatile flexray_filter_rule_t flexray_filter_rules[FLEXRAY_FILTER_MAX_RULES];
+diff --git a/src/flexray_injector.c b/src/flexray_injector.c
+index 9ceea0a..9847f5c 100644
+--- a/src/flexray_injector.c
++++ b/src/flexray_injector.c
+@@ -15,6 +15,9 @@
+ _Static_assert((INJECT_FRAME_PADDED_BYTES % sizeof(uint32_t)) == 0,
+                "DMA frame storage must be padded to 32-bit words");
+ 
++_Static_assert(NUM_TRIGGER_RULES == 0,
++               "pass-through build: INJECT_TRIGGERS table must be empty");
++
+ typedef struct {
+     uint8_t valid;
+     uint16_t len;
+@@ -50,7 +53,7 @@ static prepared_injection_t prepared_injection;
+ static volatile uint32_t host_override_head = 0;
+ static volatile uint32_t host_override_tail = 0;
+ static host_override_t host_overrides[HOST_OVERRIDE_CAP];
+-static volatile bool injector_enabled = true;
++static volatile bool injector_enabled = false; /* pass-through: injection off by default */
+ static uint8_t replace_bytes[254];
+ 
+ static inline uint8_t block_exclusion_mask_for_inject_direction(uint8_t direction)
+diff --git a/src/flexray_injector_rules.h b/src/flexray_injector_rules.h
+index cad660a..c8fd4ea 100644
+--- a/src/flexray_injector_rules.h
++++ b/src/flexray_injector_rules.h
+@@ -21,43 +21,7 @@ typedef struct {
+ } trigger_rule_t;
+ 
+ static const trigger_rule_t INJECT_TRIGGERS[] = {
+-	// I connect the ECU side to the Domain Controller, so reverse the direction
+-	{
+-		.trigger_id = 0x47,
+-		.target_id = 0x48,
+-		.cycle_mask = 0b11,
+-		.cycle_base = 1,
+-		.e2e_offset = 0,
+-		.e2e_len = 15,
+-		.e2e_init_value = 0xd6,
+-		.replace_offset = 2,
+-		.replace_len = 14,
+-		.direction = INJECT_DIRECTION_TO_FR1,
+-	},
+-	{
+-		.trigger_id = 0x1,
+-		.target_id = 0x2,
+-		.cycle_mask = 0b11,
+-		.cycle_base = 0,
+-		.e2e_offset = 0,
+-		.e2e_len = 0,
+-		.e2e_init_value = 0xf1,
+-		.replace_offset = 0,
+-		.replace_len = 26,
+-		.direction = INJECT_DIRECTION_TO_FR1,
+-	},
+-	{
+-		.trigger_id = 0x1,
+-		.target_id = 0x2,
+-		.cycle_mask = 0b11,
+-		.cycle_base = 1,
+-		.e2e_offset = 0,
+-		.e2e_len = 0,
+-		.e2e_init_value = 0xf1,
+-		.replace_offset = 0,
+-		.replace_len = 26,
+-		.direction = INJECT_DIRECTION_TO_FR1,
+-	},
++	// Pass-through build: no injection rules (table intentionally empty).
+ };
+ 
+ #define NUM_TRIGGER_RULES (sizeof(INJECT_TRIGGERS)/sizeof(INJECT_TRIGGERS[0]))
+-- 
+2.47.3
+
