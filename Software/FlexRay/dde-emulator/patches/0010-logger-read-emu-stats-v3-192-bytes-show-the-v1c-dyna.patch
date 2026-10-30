@@ -1,0 +1,164 @@
+From 64375c7716753d300e83df02bbe3571a894116f1 Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Fri, 30 Oct 2026 17:27:44 +0000
+Subject: [PATCH 10/10] logger: read emu stats v3 (192 bytes), show the v1c
+ dynamic frames on the emu line
+
+v1b firmware answers 128 bytes, v1 64: both still parse as before.
+---
+ tools/dde_emu/test_logger_emulate.py | 33 +++++++++++++++++++--------
+ tools/ts_capture/frts.py             | 34 ++++++++++++++++++++++++++--
+ 2 files changed, 55 insertions(+), 12 deletions(-)
+
+diff --git a/tools/dde_emu/test_logger_emulate.py b/tools/dde_emu/test_logger_emulate.py
+index 5221912..4d2076c 100644
+--- a/tools/dde_emu/test_logger_emulate.py
++++ b/tools/dde_emu/test_logger_emulate.py
+@@ -21,12 +21,14 @@ class USBTimeoutError(USBError):
+ 
+ V1_FMT = "<4B5I6I3h2H2BI"
+ V2_FMT = "<4B6Ii4B5H2BhH3I"
++V3_FMT = "<6I6H7HH3H2BHH"
+ 
+ 
+ class FakeDev:
+-    def __init__(self, v2=True):
++    def __init__(self, v2=True, v3=False):
+         self.log = []
+         self.v2 = v2
++        self.v3 = v3
+         self.n_stats = 0
+ 
+     def set_configuration(self):
+@@ -42,13 +44,19 @@ class FakeDev:
+                 return bytes(struct.pack(V1_FMT, 1, 3, 1, 0, 10, 20, 10, 10, 0,
+                                          0, 0, 50, 0, 0, 400, -5, 30, 2, 180, 31, 7, 4, 1))[:data_or_len]
+             fault = 1 if self.n_stats >= 2 else 0          # a fault appears from the 2nd read on
+-            head = struct.pack(V1_FMT, 2, 4 if fault else 3, 1, fault, 2, 2, 2, 1, 0,
++            if self.v3:
++                fault = 0
++            head = struct.pack(V1_FMT, 3 if self.v3 else 2, 4 if fault else 3, 1, fault, 2, 2, 2, 1, 0,
+                                0, 1, 6, 0, 0, 400, 15, 180, 4, 338, 34, 7, 4, 1)
+             tail = struct.pack(V2_FMT, fault, 0x3D if fault else 0, 53 if fault else 0, 3 if fault else 0,
+                                1000000 if fault else 0, 7, 1, 6, 0, 0, 759 if fault else 0,
+                                fault, 0, 0, fault, 0, 0, 1, 0, 0, 0x3D, 3, 140, 0,
+                                1000000 if fault else 0, 3000000, 0)
+-            return bytes(head + tail)[:data_or_len]
++            if self.v3:   # v1c firmware: 192 bytes
++                dyn = struct.pack(V3_FMT, 50, 11, 250, 10, 50, 10, 0, 0, 0, 0, 0, 0, *([0] * 7), 0,
++                                  138, 148, 163, 7, 15, 250, 0)
++                return bytes(head + tail + dyn)[:data_or_len]
++            return bytes(head + tail)[:min(data_or_len, 128)]   # v1b firmware: 128 bytes max
+         return None
+ 
+     def read(self, ep, n, timeout=0):
+@@ -56,8 +64,8 @@ class FakeDev:
+         raise USBTimeoutError("timeout")
+ 
+ 
+-def run(stop_by_sigint, v2=True):
+-    dev = FakeDev(v2)
++def run(stop_by_sigint, v2=True, v3=False):
++    dev = FakeDev(v2, v3)
+     core = types.ModuleType("usb.core")
+     core.USBError, core.USBTimeoutError = USBError, USBTimeoutError
+     core.find = lambda **kw: dev
+@@ -89,9 +97,13 @@ def run(stop_by_sigint, v2=True):
+     ok &= any(r[1] == 0xC0 and r[2] == 0xA4 for r in dev.log)             # stats read
+     ok &= time.time() - t0 < 10
+     lens = [r[4] for r in dev.log if r[1] == 0xC0 and r[2] == 0xA4]
+-    ok &= all(n == 128 for n in lens)                                     # v2 request length
++    ok &= all(n == 192 for n in lens)                                     # v3 request length
+     n_ff = text.count("EMU FAULT ")
+-    if v2:
++    if v3:
++        ok &= n_ff == 0 and "dyn[E6=50 FB5=11 FB7=250 FB9=10 E8L9=50 E8L5=10] ms[E6=138 E8=148 FB=163] ign=on" in text
++        ok &= "skip[" not in text and "parks=" not in text
++        print([l for l in text.splitlines() if "dyn[" in l][0])
++    elif v2:
+         ok &= n_ff == 1 and dev.n_stats >= 3                              # printed once, not per read
+         line = [l for l in text.splitlines() if l.startswith("EMU FAULT ")][0]
+         ok &= "slot=0x3D cycle=53" in line and "detail=759" in line and "sent=7" in line
+@@ -106,6 +118,7 @@ if __name__ == "__main__":
+     a = run(False)
+     b = run(True)
+     c = run(False, v2=False)
+-    print("test_logger_emulate: %s" % ("all OK" if a and b and c else
+-                                       "FAIL (duration %s, sigint %s, v1 device %s)" % (a, b, c)))
+-    sys.exit(0 if a and b and c else 1)
++    d = run(False, v3=True)
++    print("test_logger_emulate: %s" % ("all OK" if a and b and c and d else
++                                       "FAIL (duration %s, sigint %s, v1 device %s, v1c device %s)" % (a, b, c, d)))
++    sys.exit(0 if a and b and c and d else 1)
+diff --git a/tools/ts_capture/frts.py b/tools/ts_capture/frts.py
+index 1749c66..80da58f 100644
+--- a/tools/ts_capture/frts.py
++++ b/tools/ts_capture/frts.py
+@@ -16,7 +16,7 @@ REQ_SET_RECORD_FORMAT = 0xA0
+ REQ_SET_CAN_RECORDS = 0xA1
+ REQ_GET_TS_INFO = 0xA2
+ REQ_SET_EMU = 0xA3        # DDE emulator build: wValue 1 = enable TX / keepalive, 0 = disable + clear fault
+-REQ_GET_EMU = 0xA4        # DDE emulator build: 64-byte stats (src/dde_emu.h dde_emu_stats_t)
++REQ_GET_EMU = 0xA4        # DDE emulator build: stats, 64/128/192 bytes by version (src/dde_emu.h dde_emu_stats_t)
+ REQ_RESET_COMMS = 0xC0
+ 
+ FLAG_FRAME_CRC_OK = 0x01
+@@ -46,7 +46,11 @@ EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h (v
+ assert EMU_STATS_STRUCT.size == 64
+ EMU_STATS_V2_STRUCT = struct.Struct("<4B6Ii4B5H2BhH3I")  # bytes 64..127 (v2, firmware v1b)
+ assert EMU_STATS_V2_STRUCT.size == 64
+-EMU_STATS_LEN = 128   # request this many; a v1 firmware answers 64
++EMU_STATS_V3_STRUCT = struct.Struct("<6I6H7HH3H2BHH")  # bytes 128..191 (v3, firmware v1c: dynamic frames)
++assert EMU_STATS_V3_STRUCT.size == 64
++EMU_STATS_LEN = 192   # request this many; v1 firmware answers 64, v1b 128
++EMU_DYN_PDUS = ("E6", "FB5", "FB7", "FB9", "E8L9", "E8L5")
++EMU_DYN_SKIP_REASONS = ("anchor", "mark", "passed", "len", "grid", "limit", "late")
+ EMU_LATE_REASONS = ("busy", "fire", "short", "win", "missed")
+ EMU_STATES = {0: "disabled", 1: "no-lock", 2: "arming", 3: "ACTIVE", 4: "FAULT"}
+ EMU_FAULTS = {0: "none", 1: "TX state machine stuck", 2: "DDE frame seen that we did not send (DDE still connected?)",
+@@ -70,9 +74,32 @@ def parse_emu_stats(raw):
+                  late_reason=list(w[15:20]), last_late_slot=w[20], last_late_reason=w[21], last_late_r=w[22],
+                  echo_dup=w[23], last_fault_us=w[24], now_us=w[25])
+         d["ff_age_s"] = ((d["now_us"] - d["ff_us"]) & 0xFFFFFFFF) / 1e6
++    d["v3"] = False
++    if d["version"] >= 3 and len(raw) >= 192:
++        x = EMU_STATS_V3_STRUCT.unpack(bytes(raw[128:192]))
++        d.update(v3=True, dyn_sent=list(x[0:6]), dyn_skip=list(x[6:12]), dyn_skip_reason=list(x[12:19]),
++                 dyn_defer=x[19], dyn_last_ms=list(x[20:23]), ign=x[23], dyn_flags=x[24], dyn_parks=x[25])
+     return d
+ 
+ 
++def fmt_emu_dyn(d):
++    """v1c dynamic-frame part of the emu line, '' for older firmware."""
++    if not d.get("v3"):
++        return ""
++    s = "dyn[%s] ms[E6=%d E8=%d FB=%d] ign=%s%s%s" % (
++        " ".join("%s=%d" % (n, c) for n, c in zip(EMU_DYN_PDUS, d["dyn_sent"])),
++        d["dyn_last_ms"][0], d["dyn_last_ms"][1], d["dyn_last_ms"][2],
++        "on" if d["ign"] & 2 else ("seen" if d["ign"] & 1 else "off"),
++        "" if d["dyn_flags"] & 15 == 15 else " build=0x%X" % d["dyn_flags"],
++        " parks=%d" % d["dyn_parks"] if d["dyn_parks"] != d["dyn_sent"][2] else "")
++    if any(d["dyn_skip"]) or d["dyn_defer"]:
++        s += " skip[%s] why[%s] defer=%d" % (
++            " ".join("%s=%d" % (n, c) for n, c in zip(EMU_DYN_PDUS, d["dyn_skip"]) if c),
++            " ".join("%s=%d" % (n, c) for n, c in zip(EMU_DYN_SKIP_REASONS, d["dyn_skip_reason"]) if c),
++            d["dyn_defer"])
++    return s
++
++
+ def fmt_emu_first_fault(d):
+     """One-line first-fault record (v2 stats), '' when there is none."""
+     if not d.get("v2") or not d["ff_code"]:
+@@ -108,6 +135,9 @@ def fmt_emu(d):
+         ff = fmt_emu_first_fault(d)
+         if ff:
+             s += " | first " + ff
++    dyn = fmt_emu_dyn(d)
++    if dyn:
++        s += " | " + dyn
+     return s
+ 
+ 
+-- 
+2.47.3
+

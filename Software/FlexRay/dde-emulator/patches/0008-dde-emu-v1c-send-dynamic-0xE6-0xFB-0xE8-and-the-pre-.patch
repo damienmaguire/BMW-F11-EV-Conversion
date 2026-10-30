@@ -1,0 +1,997 @@
+From a25652664217b15e68f775807ad6d87ab39943a8 Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Fri, 30 Oct 2026 17:27:44 +0000
+Subject: [PATCH 08/10] dde-emu v1c: send dynamic 0xE6/0xFB/0xE8 and the
+ pre-ign statics; stats v3
+
+Car test 2 (v1b) still degraded DSC/ICM/EPS at ign +1.15 s. The DTCs name
+missing dynamic messages; per f11_emu2_dsc.md (v1c_rank_after_emu2) v1c adds:
+
+- 0xE6 L9 (DT_PT_2): CRC 1<ctr> 80 64 45 44 23 47, E2E K=0x04, every 200
+  cycles, cycle%8 == 2
+- 0xFB L5 4<ctr> 60 f1 ff (1000 cycles, %8 5), L7 F<ctr> ff 47 32 00 f0
+  (40 cycles, %8 6), L9 1f 00 04 00 00 f3 ff ff (1000 cycles, %8 3;
+  pre-ign 1f 00 ff 7f 00 f3 ff ff as the real DDE)
+- 0xE8 L9 00 00 00 9a 29 f3 56 f0 (200 cycles, %8 3), L5 86 78 fe fe
+  (1000 cycles, %8 0, only from ign +225 ms)
+- pre-ign statics: 0x28 c1 b3-b5 c1 17 7c, 0x29 c3 b8 80 until 60 ms after
+  the first 0x103
+
+Counters 0..14, starting at 1 after each wake. Each frame has its own build
+switch (EMU_DYN_E6/FB/E8, EMU_PREIGN). Placement is skip-when-unsure: a
+per-cycle tracker follows every FR1 header after the cycle's first
+reference; the minislot of our frame is predicted from the last dynamic
+frame (minislot grid fitted on run 5, k = 4/5/5/6 minislots for 2-4/6/8/14
+payload bytes) and the frame is only sent when every frame start since the
+anchor is explained by a decoded header on the grid, re-checked just before
+TX. Otherwise the cycle is skipped (reason counted) and retried 8 cycles
+later. 0x5C/0x142/0x10A/0x68 stay out. 14-byte frames leave the TX SM one
+word short; it is restarted (counted as parks), not a fault. v1b fault
+behaviour unchanged.
+
+Stats v3 (192 bytes, first 128 = v2): sent/skip per PDU, skip reasons,
+defers, last minislots, ign state, build flags, parks. Console: "emu: dyn".
+---
+ CMakeLists.txt     |   7 +-
+ src/dde_emu.c      | 332 ++++++++++++++++++++++++++++++++++++++++++---
+ src/dde_emu.h      |  28 +++-
+ src/dde_emu_core.c | 166 ++++++++++++++++++++++-
+ src/dde_emu_core.h |  83 ++++++++++++
+ src/panda_usb.c    |   5 +-
+ 6 files changed, 589 insertions(+), 32 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d9bf150..39643a4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,11 +70,16 @@ option(PICO_FLEXRAY_DDE_EMU "Build the DDE emulator: transmit the DDE static fra
+ set(EMU_SYNC_BITS 0 CACHE STRING "1 = keep the DDE sync/startup bits on 0x3D (UNSAFE, UNTESTED)")
+ set(EMU_DYN_5C 0 CACHE STRING "1 = also send the dynamic frame 0x5C (minislot 0, cycles 1 mod 16; UNTESTED)")
+ set(EMU_TSS_BITS 7 CACHE STRING "Transmitted TSS length in bits (3..15)")
++set(EMU_DYN_E6 1 CACHE STRING "1 = send dynamic 0xE6 L9 (DT_PT_2, every 200 cycles, cycle%8==2)")
++set(EMU_DYN_FB 1 CACHE STRING "1 = send dynamic 0xFB L5/L7/L9 (cycle%8 5/6/3, every 1000/40/1000 cycles)")
++set(EMU_DYN_E8 1 CACHE STRING "1 = send dynamic 0xE8 L9/L5 (cycle%8 3/0, every 200/1000 cycles, L5 after ign)")
++set(EMU_PREIGN 1 CACHE STRING "1 = pre-ign content until 60 ms after the first 0x103")
+ if (PICO_FLEXRAY_DDE_EMU)
+     target_sources(pico_flexray PRIVATE src/dde_emu.c src/dde_emu_core.c)
+     pico_generate_pio_header(pico_flexray ${CMAKE_CURRENT_LIST_DIR}/src/dde_emu_tx.pio)
+     target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_DDE_EMU=1
+-        EMU_SYNC_BITS=${EMU_SYNC_BITS} EMU_DYN_5C=${EMU_DYN_5C} EMU_TSS_BITS=${EMU_TSS_BITS})
++        EMU_SYNC_BITS=${EMU_SYNC_BITS} EMU_DYN_5C=${EMU_DYN_5C} EMU_TSS_BITS=${EMU_TSS_BITS}
++        EMU_DYN_E6=${EMU_DYN_E6} EMU_DYN_FB=${EMU_DYN_FB} EMU_DYN_E8=${EMU_DYN_E8} EMU_PREIGN=${EMU_PREIGN})
+     if (EMU_SYNC_BITS)
+         message(WARNING "EMU_SYNC_BITS=1: the emulator will claim to be a sync/startup node. UNSAFE, UNTESTED.")
+     endif()
+diff --git a/src/dde_emu.c b/src/dde_emu.c
+index 6dd05b1..a9295ea 100644
+--- a/src/dde_emu.c
++++ b/src/dde_emu.c
+@@ -41,6 +41,31 @@
+ #ifndef EMU_DYN_5C
+ #define EMU_DYN_5C 0
+ #endif
++// v1c dynamic frames (one switch per frame ID / slot) and pre-ign content
++#ifndef EMU_DYN_E6
++#define EMU_DYN_E6 1
++#endif
++#ifndef EMU_DYN_FB
++#define EMU_DYN_FB 1
++#endif
++#ifndef EMU_DYN_E8
++#define EMU_DYN_E8 1
++#endif
++#ifndef EMU_PREIGN
++#define EMU_PREIGN 1
++#endif
++#ifndef DDE_EMU_SPIN_HOOK
++#define DDE_EMU_SPIN_HOOK() tight_loop_contents()
++#endif
++// slot index of dynamic slot ds (after the 4 statics + 0x5C)
++#define DSLOT(ds) (DDE_EMU_N_SLOTS + (unsigned)(ds))
++#define N_ALL (DDE_EMU_N_SLOTS + DDE_DYN_N_SLOT)
++#define DDE_EMU_R_DYN_CHECK 400         // dynamic: final frame-start check when <= 4 us are left
++#define DDE_EMU_IGN_TIMEOUT_US 500000u  // 0x103 every 200-220 ms while ign is on
++static inline bool dyn_enabled(unsigned ds)
++{
++    return ds == DDE_DSLOT_E6 ? EMU_DYN_E6 != 0 : ds == DDE_DSLOT_E8 ? EMU_DYN_E8 != 0 : EMU_DYN_FB != 0;
++}
+ 
+ #define DDE_EMU_PIO pio0
+ #define DDE_EMU_LEAD_US 6u              // alarm this long before the TXEN target
+@@ -59,20 +84,22 @@
+ #define DDE_EMU_WD_UNEXPECTED_US 200u   // TX SM busy with no committed frame: fault after this
+ #define DDE_EMU_ECHO_WINDOW_US 1000u    // echo header must arrive within this after our fire
+ 
+-enum { SL_IDLE = 0, SL_ARMED = 1, SL_DONE = 2 };
++enum { SL_IDLE = 0, SL_ARMED = 1, SL_DONE = 2, SL_WAIT = 3 };   // WAIT: dynamic, due, no certain minislot yet
+ 
+ typedef struct {
+     uint8_t state;
+     uint8_t cycle;
+     uint8_t nwords;
+     uint8_t is_data;
++    int8_t pdu;             // dynamic: DDE_PDU_* (-1 static)
++    uint16_t ms;            // dynamic: planned minislot
+     uint16_t txen_fine;
+     uint16_t bus_fine;
+     uint32_t alarm_us;
+     uint32_t words[DDE_TX_MAX_WORDS];
+ } emu_slot_t;
+ 
+-static emu_slot_t slots[DDE_EMU_N_SLOTS];
++static emu_slot_t slots[N_ALL];
+ static uint8_t counter[DDE_EMU_N_STATIC][4];
+ static dde_lock_t lock;
+ 
+@@ -103,7 +130,7 @@ typedef struct {
+     uint32_t us;
+     uint32_t seq1;          // side-1 (our TXEN) ts entries produced before the fire
+ } fire_rec_t;
+-static fire_rec_t fired[DDE_EMU_N_SLOTS];
++static fire_rec_t fired[N_ALL];
+ static int last_fired = -1;     // slot of the most recent fire (side-1 ts sequence check)
+ static uint32_t echo_miss_run;
+ static uint32_t echo_miss_run_cycles;
+@@ -143,7 +170,42 @@ static volatile struct {
+     uint32_t late, echo_ok, echo_miss, foreign, rearms;
+ } cnt;
+ 
+-static inline uint8_t slot_id(unsigned i) { return (uint8_t)(i < DDE_EMU_N_STATIC ? dde_emu_static_id[i] : DDE_EMU_DYN_ID); }
++// v1c dynamic state
++static dde_dyn_track_t trk;                  // this cycle's dynamic-segment tracker
++static uint16_t dref_fine;                   // latest reference of this cycle (mark)
++static uint32_t dref_us;
++static int32_t dref_off;
++static uint32_t abs_cycle;                   // cycles since wake
++static uint8_t abs_last_cycle;
++static uint32_t pdu_due[DDE_DYN_N_PDU];      // abs cycle from which the PDU is due
++static uint8_t pdu_ctr[DDE_DYN_N_PDU];       // 0..14, starts at 1 after wake
++static bool pdu_started[DDE_DYN_N_PDU];      // sent since wake (period grid running)
++static int8_t dyn_due[DDE_DYN_N_SLOT];       // PDU due in this cycle (-1 none)
++static uint8_t dyn_reason[DDE_DYN_N_SLOT];   // why not (yet) armed in this cycle
++static bool dyn_sent_cyc[DDE_DYN_N_SLOT];
++static bool ign_seen;                        // 0x103 seen since wake
++static uint32_t ign_abs;                     // abs cycle of the first 0x103
++static uint32_t last_103_us;
++static bool tx_parked_ok;                    // last frame had nbytes % 4 == 2: SM parks at idle+1
++static volatile struct {
++    uint32_t sent[DDE_DYN_N_PDU];
++    uint16_t skip[DDE_DYN_N_PDU];
++    uint16_t reason[DDE_SKIP_N];
++    uint16_t defer, parks;
++    uint16_t last_ms[DDE_DYN_N_SLOT];
++} dcnt;
++#ifdef DDE_EMU_TEST_HOOKS
++// host test: pick the PDU of dynamic slot ds for this cycle (-1 none, -2 = normal scheduler)
++int (*dde_emu_test_dyn_pick)(unsigned ds, unsigned cycle);
++#endif
++
++static inline uint16_t slot_id(unsigned i)
++{
++    if (i < DDE_EMU_N_STATIC) return dde_emu_static_id[i];
++    if (i == DDE_EMU_N_STATIC) return DDE_EMU_DYN_ID;
++    return dde_dyn_slot_id[i - DDE_EMU_N_SLOTS];
++}
++static inline bool sat16_inc(volatile uint16_t *v) { if (*v != 0xFFFFu) { (*v)++; return true; } return false; }
+ static inline int32_t clamp32(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
+ static inline uint16_t fine_now(void) { return (uint16_t)pwm_hw->slice[FLEXRAY_TS_PWM_SLICE].ctr; }
+ 
+@@ -185,9 +247,10 @@ static void __time_critical_func(count_late)(unsigned i, uint8_t reason, int32_t
+ {
+     cnt.late++;
+     if (late_reason[reason] != 0xFFFFu) late_reason[reason]++;
+-    last_late_slot = slot_id(i);
++    last_late_slot = (uint8_t)slot_id(i);
+     last_late_reason = reason;
+     last_late_r = (int16_t)clamp32(r, -32768, 32767);
++    if (i >= DDE_EMU_N_SLOTS) dyn_reason[i - DDE_EMU_N_SLOTS] = DDE_SKIP_LATE;
+ }
+ 
+ // slot: target index or -1. detail: see dde_emu_stats_t.ff_detail.
+@@ -203,7 +266,7 @@ static void __time_critical_func(enter_fault)(uint8_t f, int slot, int32_t detai
+         if (fault_count >= DDE_EMU_FAULT_LATCH_N) fault_latched = true;
+         if (first_fault.code == DDE_EMU_FAULT_NONE) {
+             first_fault.code = f;
+-            first_fault.slot = slot >= 0 ? slot_id((unsigned)slot) : 0;
++            first_fault.slot = slot >= 0 ? (uint8_t)slot_id((unsigned)slot) : 0;
+             first_fault.cycle = cur_cycle;
+             first_fault.flags = (uint8_t)((lock.locked ? 1u : 0u) | (tx_expect ? 2u : 0u) |
+                                           (f == DDE_EMU_FAULT_TX_STUCK ? 4u : 0u));
+@@ -226,7 +289,7 @@ static void __time_critical_func(enter_fault)(uint8_t f, int slot, int32_t detai
+         tx_expect = false;
+         tx_unexp_since = 0;
+     }
+-    for (unsigned i = 0; i < DDE_EMU_N_SLOTS; i++) slots[i].state = SL_IDLE;
++    for (unsigned i = 0; i < N_ALL; i++) slots[i].state = SL_IDLE;
+ }
+ 
+ // ---------------------------------------------------------------- alarm
+@@ -244,7 +307,7 @@ static void __time_critical_func(alarm_rearm_next)(uint32_t now)
+         uint32_t t = tx_deadline_us + DDE_EMU_WD_MARGIN_US + 1u;
+         if ((int32_t)(t - best) < 0) best = t;
+     }
+-    for (unsigned i = 0; i < DDE_EMU_N_SLOTS; i++) {
++    for (unsigned i = 0; i < N_ALL; i++) {
+         if (slots[i].state == SL_ARMED && (int32_t)(slots[i].alarm_us - best) < 0) best = slots[i].alarm_us;
+     }
+     alarm_arm(best);
+@@ -260,6 +323,24 @@ static inline bool fire_sm_idle(void)
+     return pio_sm_get_pc(DDE_EMU_PIO, sm_fire) == off_fire && pio_sm_is_tx_fifo_empty(DDE_EMU_PIO, sm_fire);
+ }
+ 
++static void tx_sm_abort(void);
++// Idle, or parked after a frame whose byte count is not a multiple of 4: the
++// pad half-word is consumed by "out x, 16" and the SM waits for the FIFO at
++// idle+1 with TXEN/TXD high. Restart it (only after the frame's computed end).
++static bool __time_critical_func(tx_sm_ready)(uint32_t now)
++{
++    if (tx_sm_idle()) return true;
++    if (tx_parked_ok && (int32_t)(now - tx_deadline_us) >= 0 &&
++        pio_sm_get_pc(DDE_EMU_PIO, sm_tx) == off_tx + dde_emu_tx_offset_idle + 1u &&
++        pio_sm_is_tx_fifo_empty(DDE_EMU_PIO, sm_tx)) {
++        tx_sm_abort();
++        tx_parked_ok = false;
++        sat16_inc(&dcnt.parks);
++        return tx_sm_idle();
++    }
++    return false;
++}
++
+ static void __time_critical_func(tx_sm_abort)(void)
+ {
+     // words were loaded but no fire was issued: put the SM back to idle with the pins high.
+@@ -298,7 +379,7 @@ static void hw_reinit(void)
+ 
+ static void clear_run_state(void)
+ {
+-    for (unsigned i = 0; i < DDE_EMU_N_SLOTS; i++) { fired[i].pending = false; fired[i].echoed = false; }
++    for (unsigned i = 0; i < N_ALL; i++) { fired[i].pending = false; fired[i].echoed = false; }
+     echo_miss_run = 0;
+     echo_miss_run_cycles = 0;
+     quiet_cycles = 0;
+@@ -307,7 +388,7 @@ static void clear_run_state(void)
+ static void __time_critical_func(housekeeping)(uint32_t now)
+ {
+     if (dde_lock_poll(&lock, now)) {
+-        for (unsigned i = 0; i < DDE_EMU_N_SLOTS; i++) if (slots[i].state == SL_ARMED) slots[i].state = SL_IDLE;
++        for (unsigned i = 0; i < N_ALL; i++) if (slots[i].state == SL_ARMED || slots[i].state == SL_WAIT) slots[i].state = SL_IDLE;
+     }
+     if (host_enabled && (int32_t)(now - host_last_us) > (int32_t)DDE_EMU_KEEPALIVE_US) host_enabled = false;
+     if (host_clear_req) {   // wValue 0: full reset of the fault state, incl. the latch
+@@ -329,7 +410,7 @@ static void __time_critical_func(housekeeping)(uint32_t now)
+     // Busy with nothing committed (should never happen) is a fault after 200 us of
+     // continuous busy observations; any idle observation restarts that timer.
+     if (hw_ready) {
+-        bool idle = tx_sm_idle();
++        bool idle = tx_expect ? tx_sm_ready(now) : tx_sm_idle();
+         if (tx_expect) {
+             if (idle) tx_expect = false;
+             else if ((int32_t)(now - (tx_deadline_us + DDE_EMU_WD_MARGIN_US)) > 0)
+@@ -360,7 +441,7 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
+     s->state = SL_DONE;
+     if (!tx_allowed()) return;
+     int32_t k = k_q4 >> 4;
+-    if (!tx_sm_idle()) { count_late(i, DDE_EMU_LATE_TX_BUSY, 0); return; }
++    if (!tx_sm_ready(now)) { count_late(i, DDE_EMU_LATE_TX_BUSY, 0); return; }
+     if (!fire_sm_idle()) { count_late(i, DDE_EMU_LATE_FIRE_BUSY, 0); return; }
+     int32_t r0 = dde_core_fire_delay(s->txen_fine, fine_now(), k);
+     if (r0 < DDE_EMU_R_PRECHECK) { count_late(i, DDE_EMU_LATE_SHORT, r0); return; }
+@@ -372,6 +453,31 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
+     pio_interrupt_clear(DDE_EMU_PIO, 5);
+     for (unsigned w = 0; w < s->nwords; w++) pio_sm_put(DDE_EMU_PIO, sm_tx, s->words[w]);
+     int32_t r = dde_core_fire_delay(s->txen_fine, fine_now(), k);
++    if (i >= DDE_EMU_N_SLOTS) {
++        // dynamic: wait until the latest possible start of a lower-ID frame has
++        // passed, then require that every frame start (side-0 mark) since the
++        // anchor was explained by a decoded header. Otherwise do not send.
++        unsigned guard = 0;
++        while (r > DDE_EMU_R_DYN_CHECK && guard++ < 4000u) {
++            DDE_EMU_SPIN_HOOK();
++            r = dde_core_fire_delay(s->txen_fine, fine_now(), k);
++        }
++        flexray_ts_t tm;
++        uint32_t pm, sqm;
++        unsigned m2 = 0;
++        unsigned ds = i - DDE_EMU_N_SLOTS;
++        bool ok = flexray_ts_peek_latest(0, &tm, &pm, &sqm) && (uint8_t)sqm == trk.acc_seq &&
++                  trk.cycle == s->cycle &&
++                  dde_dyn_predict(&trk, slot_id(i), &m2) == DDE_DYN_OK && m2 == s->ms;
++        if (!ok) {
++            tx_sm_abort();
++            sat16_inc(&dcnt.defer);
++            dyn_reason[ds] = DDE_SKIP_MARK;
++            s->state = SL_WAIT;   // a later header of this cycle may still explain it
++            return;
++        }
++        r = dde_core_fire_delay(s->txen_fine, fine_now(), k);
++    }
+     if (r < DDE_EMU_R_MIN || r > DDE_EMU_R_MAX) {
+         tx_sm_abort();
+         count_late(i, DDE_EMU_LATE_WINDOW, r);
+@@ -386,12 +492,26 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
+         tx_deadline_us = now + 1u + (uint32_t)((r + k) / 100) + (bits + 9u) / 10u;
+         tx_expect = true;
+         tx_unexp_since = 0;
++        tx_parked_ok = (nbytes & 3u) != 0;
+     }
+-    cnt.sent[i]++;
++    if (i < DDE_EMU_N_SLOTS) cnt.sent[i]++;
+     if (i < DDE_EMU_N_STATIC && s->is_data) {
+         uint8_t *c = &counter[i][s->cycle & 3u];
+         *c = (uint8_t)((*c + 1u) % DDE_EMU_COUNTER_MOD);
+     }
++    if (i >= DDE_EMU_N_SLOTS) {
++        unsigned ds = i - DDE_EMU_N_SLOTS, p = (unsigned)s->pdu;
++        dcnt.sent[p]++;
++        dcnt.last_ms[ds] = s->ms;
++        dyn_sent_cyc[ds] = true;
++        pdu_ctr[p] = (uint8_t)((pdu_ctr[p] + 1u) % 15u);
++        // periodic grid from the first TX after wake; a retry (skip, +8 cycles) keeps the
++        // grid, anything later than half a period restarts it from now
++        uint32_t per = dde_dyn_pdu[p].period;
++        bool keep = pdu_started[p] && (int32_t)(abs_cycle - pdu_due[p]) < (int32_t)(per / 2u);
++        pdu_due[p] = keep ? pdu_due[p] + per : abs_cycle + per;
++        pdu_started[p] = true;
++    }
+     fire_rec_t *f = &fired[i];
+     f->pending = true;
+     f->echoed = false;
+@@ -409,7 +529,7 @@ static void __time_critical_func(alarm_isr)(void)
+     hw_clear_bits(&timer_hw->intf, bit);
+     timer_hw->intr = bit;
+     uint32_t now = time_us_32();
+-    for (unsigned i = 0; i < DDE_EMU_N_SLOTS; i++) {
++    for (unsigned i = 0; i < N_ALL; i++) {
+         if (slots[i].state == SL_ARMED && (int32_t)(slots[i].alarm_us - now) <= 0) {
+             fire_slot(i, now);
+             break;   // one per alarm; the next one is >= 27 us away
+@@ -420,14 +540,27 @@ static void __time_critical_func(alarm_isr)(void)
+ }
+ 
+ // ---------------------------------------------------------------- header hook
++// Pre-ign content until DDE_IGN_STATIC_CYCLES after the first 0x103 since wake.
++static inline bool preign_static(void)
++{
++    return EMU_PREIGN && (!ign_seen || abs_cycle < ign_abs + DDE_IGN_STATIC_CYCLES);
++}
++
+ static void __time_critical_func(prepare_slot)(unsigned i, unsigned cycle)
+ {
+     emu_slot_t *s = &slots[i];
+     uint8_t frame[DDE_MAX_FRAME_BYTES];
+     unsigned n, dts = 0;
++    s->pdu = -1;
+     if (i < DDE_EMU_N_STATIC) {
+-        n = dde_core_build_static(i, cycle, counter[i][cycle & 3u], EMU_SYNC_BITS != 0, frame);
++        n = dde_core_build_static_ex(i, cycle, counter[i][cycle & 3u], EMU_SYNC_BITS != 0, preign_static(), frame);
+         s->is_data = (dde_core_emu_indicators(i, cycle, false) & 0x04u) != 0;
++    } else if (i >= DDE_EMU_N_SLOTS) {
++        unsigned p = (unsigned)dyn_due[i - DDE_EMU_N_SLOTS];
++        n = dde_core_build_dyn_pdu(p, cycle, pdu_ctr[p], preign_static(), frame);
++        dts = dde_core_dyn_dts_bits(n, EMU_TSS_BITS);
++        s->is_data = 1;
++        s->pdu = (int8_t)p;
+     } else {
+         n = dde_core_build_dyn(cycle, frame);
+         dts = DDE_EMU_DYN_DTS_BITS;
+@@ -490,25 +623,145 @@ static void __time_critical_func(on_echo)(unsigned i, unsigned cycle, const flex
+     loop_q4 = clamp32(loop_q4, 0, 60 * 16);
+ }
+ 
++// ---- v1c dynamic segment
++static void __time_critical_func(dyn_skip)(unsigned ds, unsigned reason)
++{
++    int p = dyn_due[ds];
++    if (p < 0) return;
++    sat16_inc(&dcnt.skip[p]);
++    if (reason == 0 || reason >= DDE_SKIP_N) reason = DDE_SKIP_NOANCHOR;
++    sat16_inc(&dcnt.reason[reason]);
++}
++
++// New cycle (first reference of it): close the old cycle, pick what is due.
++static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t seq0)
++{
++    for (unsigned ds = 0; ds < DDE_DYN_N_SLOT; ds++) {
++        if (dyn_due[ds] >= 0 && !dyn_sent_cyc[ds])
++            dyn_skip(ds, slots[DSLOT(ds)].state == SL_ARMED ? DDE_SKIP_LATE : dyn_reason[ds]);
++        dyn_due[ds] = -1;
++        dyn_sent_cyc[ds] = false;
++    }
++    if (ev == DDE_LOCK_NEW_WAKE) {
++        abs_cycle = 0;
++        ign_seen = false;
++        for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { pdu_due[p] = 0; pdu_ctr[p] = 1; pdu_started[p] = false; }
++    } else {
++        abs_cycle += (cycle - abs_last_cycle) & 63u;
++    }
++    abs_last_cycle = (uint8_t)cycle;
++    dde_dyn_track_start(&trk, cycle, true, seq0);
++    if (!tx_allowed()) return;
++    for (unsigned ds = 0; ds < DDE_DYN_N_SLOT; ds++) {
++        if (!dyn_enabled(ds)) continue;
++        int p = -2;
++#ifdef DDE_EMU_TEST_HOOKS
++        if (dde_emu_test_dyn_pick) p = dde_emu_test_dyn_pick(ds, cycle);
++        if (p == -1) continue;
++#endif
++        if (p == -2) {
++            p = dde_core_dyn_pdu_for(ds, cycle);
++            if (p < 0) continue;
++            bool due = (int32_t)(abs_cycle - pdu_due[p]) >= 0;
++            if (due && dde_dyn_pdu[p].ign_only) due = ign_seen && abs_cycle >= ign_abs + DDE_IGN_E8L5_CYCLES;
++            if (!due) continue;
++        }
++        dyn_due[ds] = (int8_t)p;
++        dyn_reason[ds] = DDE_DYN_OK;   // nothing has stopped it yet (a skip without a reason counts as noanchor)
++        prepare_slot(DSLOT(ds), cycle);
++        slots[DSLOT(ds)].state = SL_WAIT;
++    }
++}
++
++// (Re)plan the due dynamic frames of this cycle from the tracker.
++static bool __time_critical_func(dyn_plan)(void)
++{
++    if (!tx_allowed()) return false;
++    bool changed = false;
++    int32_t loop = loop_q4 >> 4;
++    for (unsigned ds = 0; ds < DDE_DYN_N_SLOT; ds++) {
++        emu_slot_t *s = &slots[DSLOT(ds)];
++        if (dyn_due[ds] < 0 || dyn_sent_cyc[ds] || (s->state != SL_WAIT && s->state != SL_ARMED)) continue;
++        unsigned m = 0;
++        int why = dde_dyn_predict(&trk, dde_dyn_slot_id[ds], &m);
++        if (why != DDE_DYN_OK) {
++            if (s->state == SL_ARMED) changed = true;
++            s->state = why == DDE_SKIP_PASSED ? SL_DONE : SL_WAIT;
++            // PASSED (a higher ID came first) keeps the reason that stopped us before it
++            if (why != DDE_SKIP_PASSED || dyn_reason[ds] == DDE_DYN_OK) dyn_reason[ds] = (uint8_t)why;
++            continue;
++        }
++        if (s->state == SL_ARMED && s->ms == m) continue;
++        int32_t delta = dde_core_dyn_ap_q8(m) - dref_off;
++        if (delta < DDE_EMU_MIN_DELTA_Q8 / 4) { s->state = SL_WAIT; dyn_reason[ds] = DDE_SKIP_LATE; continue; }
++        dde_sched_t sc;
++        dde_core_schedule(dref_fine, dref_us, delta, loop, DDE_EMU_LEAD_US, &sc);
++        // a late header (IRQ latency) can move the slot to a time already passed: not a "late"
++        if ((int32_t)(sc.alarm_us - time_us_32()) < 0) {
++            if (s->state == SL_ARMED) changed = true;
++            s->state = SL_WAIT;
++            dyn_reason[ds] = DDE_SKIP_LATE;
++            continue;
++        }
++        s->bus_fine = sc.bus_fine;
++        s->txen_fine = sc.txen_fine;
++        s->alarm_us = sc.alarm_us;
++        s->ms = (uint16_t)m;
++        s->state = SL_ARMED;
++        changed = true;
++    }
++    return changed;
++}
++
++// Every FR1 header of the current cycle (ours included) goes through the tracker.
++static void __time_critical_func(dyn_feed)(unsigned id, unsigned plen, unsigned cycle, const flexray_ts_t *t0,
++                                          bool t0_ok, uint8_t seq0)
++{
++    if (!trk.active || cycle != trk.cycle) return;
++    int64_t x_q8 = 0;
++    if (id >= DDE_DYN_FIRST_ID && t0_ok)
++        x_q8 = (int64_t)dde_core_elapsed_ticks(dref_us, dref_fine, t0->us, t0->fine) * 256 + dref_off;
++    dde_dyn_track_header(&trk, id, plen, t0_ok, seq0, x_q8);
++    if (dyn_plan()) alarm_rearm_next(time_us_32());
++}
++
+ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t start_pos, uint32_t ring_mask)
+ {
+     if (!hw_ready && fault == DDE_EMU_FAULT_NONE) return;
+     unsigned id = ((unsigned)(h[0] & 7u) << 8) | h[1];
+     unsigned cycle = h[4] & 0x3Fu;
++    unsigned plen = ((h[2] >> 1) & 0x7Fu) * 2u;
+     flexray_ts_t t0;
+     uint32_t pos0, seq0;
+     bool t0_ok = flexray_ts_peek_latest(0, &t0, &pos0, &seq0) && ((pos0 - start_pos) & ring_mask) == 0;
+ 
++    if (id == 0x103u) {   // ign-on indicator (run 5: every 200-220 ms while ign is on)
++        uint32_t irq = save_and_disable_interrupts();
++        last_103_us = time_us_32();
++        if (!ign_seen && lock.have) { ign_seen = true; ign_abs = abs_cycle; }
++        restore_interrupts(irq);
++    }
++
+     int ti = dde_core_target_index(id);
+     if (EMU_DYN_5C && ti < 0 && id == DDE_EMU_DYN_ID && dde_core_dyn_cycle(cycle)) ti = DDE_EMU_N_STATIC;
++    if (ti < 0) {
++        int ds = dde_core_dyn_slot_of_id(id);
++        if (ds >= 0 && dyn_enabled((unsigned)ds)) ti = (int)DSLOT(ds);
++    }
+     if (ti >= 0) {
+         uint32_t irq = save_and_disable_interrupts();
+         on_echo((unsigned)ti, cycle, &t0, t0_ok);
++        dyn_feed(id, plen, cycle, &t0, t0_ok, (uint8_t)seq0);
+         restore_interrupts(irq);
+         return;
+     }
+     int ri = dde_core_ref_index(id);
+-    if (ri < 0 || !t0_ok) return;
++    if (ri < 0 || !t0_ok) {
++        uint32_t irq = save_and_disable_interrupts();
++        dyn_feed(id, plen, cycle, &t0, t0_ok, (uint8_t)seq0);
++        restore_interrupts(irq);
++        return;
++    }
+ 
+     int32_t ref_off = dde_emu_ref_off_q8[ri];
+     uint32_t cs_us = t0.us - (uint32_t)(ref_off / 25600);
+@@ -519,9 +772,14 @@ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t st
+     }
+     if (ev != DDE_LOCK_SAME_CYCLE) {
+         cur_cycle = (uint8_t)cycle;
+-        for (unsigned i = 0; i < DDE_EMU_N_SLOTS; i++) {
++        // dynamic bookkeeping of the cycle that ended (before the slots are reset)
++        dref_fine = t0.fine; dref_us = t0.us; dref_off = ref_off;
++        if (ev != DDE_LOCK_BAD) dyn_new_cycle(ev, cycle, (uint8_t)seq0);
++        else trk.active = false;
++        for (unsigned i = 0; i < N_ALL; i++) {
+             if (slots[i].state == SL_ARMED && slots[i].cycle != cycle) count_late(i, DDE_EMU_LATE_MISSED, 0);
+-            if (slots[i].cycle != cycle) slots[i].state = SL_IDLE;
++            if (slots[i].cycle != cycle && i < DDE_EMU_N_SLOTS) slots[i].state = SL_IDLE;
++            if (i >= DDE_EMU_N_SLOTS && dyn_due[i - DDE_EMU_N_SLOTS] < 0) slots[i].state = SL_IDLE;
+             if (fired[i].pending && fired[i].cycle != cycle) {
+                 if (ev == DDE_LOCK_NEW_CYCLE) echo_missed(i);
+                 else fired[i].pending = false;   // wake / bad ref: no verdict
+@@ -534,10 +792,11 @@ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t st
+     }
+     if (lock.locked && !was_locked) cnt.rearms++;
+     was_locked = lock.locked;
++    if (trk.active && trk.cycle == cycle) { dref_fine = t0.fine; dref_us = t0.us; dref_off = ref_off; }
+ 
++    bool changed = false;
+     if (tx_allowed()) {
+         int32_t loop = loop_q4 >> 4;
+-        bool changed = false;
+         for (unsigned i = 0; i < DDE_EMU_N_SLOTS; i++) {
+             int32_t tgt;
+             if (i < DDE_EMU_N_STATIC) tgt = dde_emu_static_off_q8[i];
+@@ -558,8 +817,13 @@ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t st
+             s->state = SL_ARMED;
+             changed = true;
+         }
+-        if (changed) alarm_rearm_next(time_us_32());
+     }
++    // the reference is a frame too: tracker + dynamic plan from this reference
++    if (trk.active && trk.cycle == cycle) {
++        dde_dyn_track_header(&trk, id, plen, true, (uint8_t)seq0, 0);
++        changed |= dyn_plan();
++    }
++    if (changed) alarm_rearm_next(time_us_32());
+     restore_interrupts(irq);
+ }
+ 
+@@ -569,6 +833,9 @@ void dde_emu_init_core1(void)
+     dde_core_init();
+     dde_lock_reset(&lock);
+     for (unsigned i = 0; i < DDE_EMU_N_STATIC; i++) for (unsigned c = 0; c < 4; c++) counter[i][c] = 1;
++    for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { pdu_ctr[p] = 1; pdu_due[p] = 0; }
++    for (unsigned d = 0; d < DDE_DYN_N_SLOT; d++) dyn_due[d] = -1;
++    for (unsigned i = 0; i < N_ALL; i++) slots[i].pdu = -1;
+ 
+     PIO pio = DDE_EMU_PIO;
+     off_tx = pio_add_program(pio, &dde_emu_tx_program);
+@@ -624,8 +891,9 @@ void dde_emu_host_set(uint16_t wvalue)
+     if (!host_enabled) {
+         host_epoch++;
+         host_enabled = true;
+-        printf("emu: TX enabled by host (TSS %u, sync bits %u, dyn 0x5C %u)\n",
+-               (unsigned)EMU_TSS_BITS, (unsigned)EMU_SYNC_BITS, (unsigned)EMU_DYN_5C);
++        printf("emu: TX enabled by host (TSS %u, sync bits %u, dyn 0x5C %u, E6 %u, FB %u, E8 %u, pre-ign %u)\n",
++               (unsigned)EMU_TSS_BITS, (unsigned)EMU_SYNC_BITS, (unsigned)EMU_DYN_5C, (unsigned)EMU_DYN_E6,
++               (unsigned)EMU_DYN_FB, (unsigned)EMU_DYN_E8, (unsigned)EMU_PREIGN);
+     }
+ }
+ 
+@@ -678,6 +946,17 @@ void dde_emu_fill_stats(dde_emu_stats_t *st)
+     st->echo_dup = (uint16_t)(echo_dup > 0xFFFFu ? 0xFFFFu : echo_dup);
+     st->last_fault_us = last_fault_us;
+     st->now_us = time_us_32();
++    // v3
++    for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { st->dyn_sent[p] = dcnt.sent[p]; st->dyn_skip[p] = dcnt.skip[p]; }
++    for (unsigned r = 1; r < DDE_SKIP_N; r++) st->dyn_skip_reason[r - 1] = dcnt.reason[r];
++    st->dyn_defer = dcnt.defer;
++    for (unsigned d = 0; d < DDE_DYN_N_SLOT; d++) st->dyn_last_ms[d] = dcnt.last_ms[d];
++    bool ign_now = ign_seen && (uint32_t)(st->now_us - last_103_us) < DDE_EMU_IGN_TIMEOUT_US;
++    st->ign = (uint8_t)((ign_seen ? 1u : 0u) | (!preign_static() ? 2u : 0u) |
++                        (ign_seen && abs_cycle >= ign_abs + DDE_IGN_E8L5_CYCLES ? 4u : 0u) | (ign_now ? 8u : 0u));
++    st->dyn_flags = (uint8_t)((EMU_DYN_E6 ? 1u : 0u) | (EMU_DYN_FB ? 2u : 0u) | (EMU_DYN_E8 ? 4u : 0u) |
++                              (EMU_PREIGN ? 8u : 0u));
++    st->dyn_parks = dcnt.parks;
+ }
+ 
+ const char *dde_emu_fault_name(unsigned code)
+@@ -712,4 +991,13 @@ void dde_emu_print_stats(void)
+            "last_late=0x%02X/%u r=%d\n", s.fault_count, s.auto_clears, s.latched, s.late_reason[0],
+            s.late_reason[1], s.late_reason[2], s.late_reason[3], s.late_reason[4], s.last_late_slot,
+            s.last_late_reason, s.last_late_r);
++    printf("emu: dyn E6=%lu/%u FB5=%lu/%u FB7=%lu/%u FB9=%lu/%u E89=%lu/%u E85=%lu/%u (sent/skip) "
++           "skip[anchor=%u mark=%u passed=%u len=%u grid=%u limit=%u late=%u] defer=%u ms[E6=%u E8=%u FB=%u] "
++           "ign=0x%X build=0x%X parks=%u\n",
++           (unsigned long)s.dyn_sent[0], s.dyn_skip[0], (unsigned long)s.dyn_sent[1], s.dyn_skip[1],
++           (unsigned long)s.dyn_sent[2], s.dyn_skip[2], (unsigned long)s.dyn_sent[3], s.dyn_skip[3],
++           (unsigned long)s.dyn_sent[4], s.dyn_skip[4], (unsigned long)s.dyn_sent[5], s.dyn_skip[5],
++           s.dyn_skip_reason[0], s.dyn_skip_reason[1], s.dyn_skip_reason[2], s.dyn_skip_reason[3],
++           s.dyn_skip_reason[4], s.dyn_skip_reason[5], s.dyn_skip_reason[6], s.dyn_defer,
++           s.dyn_last_ms[0], s.dyn_last_ms[1], s.dyn_last_ms[2], s.ign, s.dyn_flags, s.dyn_parks);
+ }
+diff --git a/src/dde_emu.h b/src/dde_emu.h
+index 26628bc..8bbc697 100644
+--- a/src/dde_emu.h
++++ b/src/dde_emu.h
+@@ -1,5 +1,7 @@
+ // DDE emulator (PICO_FLEXRAY_DDE_EMU build): transmits the DDE's static frames
+-// 0x26/0x28/0x29/0x3D on FR1 in the DDE's slots, timed from the car's own frames.
++// 0x26/0x28/0x29/0x3D on FR1 in the DDE's slots, timed from the car's own frames,
++// and (v1c) the dynamic frames 0xE6, 0xFB (L5/L7/L9) and 0xE8 (L9/L5) in their
++// minislots when the minislot is certain.
+ // See Software/FlexRay/dde-emulator/README.md.
+ #ifndef DDE_EMU_H
+ #define DDE_EMU_H
+@@ -7,13 +9,13 @@
+ #include "dde_emu_core.h"
+ 
+ #define PICOFLEX_SET_EMU   0xa3u   // vendor OUT, wValue 1 = enable/keepalive, 0 = disable + clear fault
+-#define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 128 bytes: dde_emu_stats_t (first 64 = v1 layout)
++#define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 192 bytes: dde_emu_stats_t (first 64 = v1, 128 = v2 layout)
+ 
+ // Pin used as the FR1 streamer's private frame-start mark (side-set) in the emu
+ // build: GP25 = Pico 2 on-board LED, not on any header pin.
+ #define DDE_EMU_MARK_PIN 25u
+ 
+-#define DDE_EMU_STATS_VERSION 2u
++#define DDE_EMU_STATS_VERSION 3u
+ enum {
+     DDE_EMU_ST_DISABLED = 0,   // host has not enabled TX (boot state)
+     DDE_EMU_ST_NO_LOCK  = 1,   // enabled, waiting for 8 good reference cycles
+@@ -89,8 +91,25 @@ typedef struct __attribute__((packed)) {
+     uint32_t last_fault_us;
+     uint32_t now_us;                 // TIMER0 when these stats were taken
+     uint32_t reserved;
++    // ---- v3 (bytes 128..191): v1c dynamic frames. A host asking for 128 bytes gets v2.
++    // PDU order: 0xE6 L9, 0xFB L5, 0xFB L7, 0xFB L9, 0xE8 L9, 0xE8 L5
++    uint32_t dyn_sent[DDE_DYN_N_PDU];
++    uint16_t dyn_skip[DDE_DYN_N_PDU];      // due but not sent in that cycle (retried 8 cycles later)
++    uint16_t dyn_skip_reason[DDE_SKIP_N - 1];   // DDE_SKIP_* 1..7: noanchor, mark, passed, len, grid, limit, late
++    uint16_t dyn_defer;              // final check found an unexplained frame start: not sent (re-planned if possible)
++    uint16_t dyn_last_ms[DDE_DYN_N_SLOT];   // minislot of the last TX: 0xE6, 0xE8, 0xFB
++    uint8_t ign;                     // bit0 0x103 seen since wake, bit1 ign-on content, bit2 0xE8 L5 allowed,
++                                     // bit3 0x103 seen within 500 ms
++    uint8_t dyn_flags;               // build: bit0 EMU_DYN_E6, bit1 EMU_DYN_FB, bit2 EMU_DYN_E8, bit3 EMU_PREIGN
++    uint16_t dyn_parks;              // TX SM restarts after 14-byte frames (expected, one per 0xFB L7)
++    uint16_t reserved3;
+ } dde_emu_stats_t;
+-_Static_assert(sizeof(dde_emu_stats_t) == 128, "emu stats size");
++_Static_assert(sizeof(dde_emu_stats_t) == 192, "emu stats size");
++_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_sent) == 128, "v3 layout");
++_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_skip) == 152, "v3 layout");
++_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_skip_reason) == 164, "v3 layout");
++_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_defer) == 178, "v3 layout");
++_Static_assert(__builtin_offsetof(dde_emu_stats_t, ign) == 186, "v3 layout");
+ // offsets used by tools/ts_capture/frts.py (EMU_STATS_V2_STRUCT)
+ _Static_assert(__builtin_offsetof(dde_emu_stats_t, ff_code) == 64, "v2 layout");
+ _Static_assert(__builtin_offsetof(dde_emu_stats_t, ff_detail) == 92, "v2 layout");
+@@ -99,6 +118,7 @@ _Static_assert(__builtin_offsetof(dde_emu_stats_t, late_reason) == 100, "v2 layo
+ _Static_assert(__builtin_offsetof(dde_emu_stats_t, last_late_r) == 112, "v2 layout");
+ _Static_assert(__builtin_offsetof(dde_emu_stats_t, now_us) == 120, "v2 layout");
+ #define DDE_EMU_STATS_V1_SIZE 64u
++#define DDE_EMU_STATS_V2_SIZE 128u
+ 
+ void dde_emu_early_pins(void);   // core0 setup_pins: all TXD/TXEN of FR1/FR2 = SIO output high
+ void dde_emu_init_core1(void);   // core1, after setup_stream(): PIO0 TX + fire SMs, alarm IRQ
+diff --git a/src/dde_emu_core.c b/src/dde_emu_core.c
+index 99da1f6..6b9e5ca 100644
+--- a/src/dde_emu_core.c
++++ b/src/dde_emu_core.c
+@@ -95,11 +95,23 @@ uint8_t DDE_RAM(dde_core_emu_indicators)(unsigned target, unsigned cycle, bool k
+ }
+ 
+ unsigned DDE_RAM(dde_core_build_static)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync, uint8_t *out)
++{
++    return dde_core_build_static_ex(target, cycle, counter, keep_sync, false, out);
++}
++
++// Pre-ign content of the real DDE (run 4, Fred f11_emu2_dsc.md section 2):
++// 0x28 c%4==1 b3-b5 c1 17 7c (ign-on a7 79 9a), 0x29 c%4==3 b8 80 (ign-on 10).
++unsigned DDE_RAM(dde_core_build_static_ex)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
++                                           bool preign, uint8_t *out)
+ {
+     const unsigned plen = DDE_EMU_STATIC_PAYLOAD_BYTES;
+     uint8_t ind = dde_core_emu_indicators(target, cycle, keep_sync);
+     dde_core_header(ind, dde_emu_static_id[target], plen / 2u, cycle, out);
+     memcpy(out + 5, dde_emu_static_payload[target][cycle & 63u], plen);
++    if (preign && (ind & 0x04u)) {
++        if (target == 1 && (cycle & 3u) == 1) { out[5 + 2] = 0xC1; out[5 + 3] = 0x17; out[5 + 4] = 0x7C; }
++        if (target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0x80;
++    }
+     if (ind & 0x04u) dde_core_e2e_apply(out + 5, target, cycle, counter);
+     uint32_t c = dde_core_frame_crc(out, 5u + plen);
+     out[5 + plen] = (uint8_t)(c >> 16);
+@@ -127,15 +139,19 @@ unsigned DDE_RAM(dde_core_build_dyn)(unsigned cycle, uint8_t *out)
+ 
+ unsigned DDE_RAM(dde_core_pack)(const uint8_t *frame, unsigned nbytes, unsigned tss_bits, unsigned dts_bits, uint32_t *words)
+ {
+-    if (nbytes == 0 || (nbytes & 3u) || nbytes > DDE_MAX_FRAME_BYTES) return 0;
++    // nbytes % 4 == 2 is allowed (6-byte payload frames): the last word is
++    // padded; the TX SM then parks at idle+1 after the frame and the firmware
++    // restarts it (see tx_sm_idle_or_parked in dde_emu.c).
++    if (nbytes < 4 || (nbytes & 1u) || nbytes > DDE_MAX_FRAME_BYTES) return 0;
+     if (tss_bits < 3 || tss_bits > 15) return 0;
+     if (dts_bits != 0 && dts_bits < 3) return 0;
+     words[0] = ((uint32_t)(tss_bits - 2u) << 16) | (nbytes - 1u);
+     words[1] = dts_bits ? dts_bits - 2u : 0u;
+     unsigned w = 2;
+     for (unsigned i = 0; i < nbytes; i += 4) {
+-        words[w++] = ((uint32_t)frame[i] << 24) | ((uint32_t)frame[i + 1] << 16) |
+-                     ((uint32_t)frame[i + 2] << 8) | frame[i + 3];
++        uint32_t v = ((uint32_t)frame[i] << 24) | ((uint32_t)frame[i + 1] << 16);
++        if (i + 2 < nbytes) v |= ((uint32_t)frame[i + 2] << 8) | frame[i + 3];
++        words[w++] = v;
+     }
+     return w;
+ }
+@@ -243,3 +259,147 @@ bool DDE_RAM(dde_lock_poll)(dde_lock_t *l, uint32_t now_us)
+     }
+     return false;
+ }
++
++// ---------------------------------------------------------------------------
++// v1c dynamic PDUs. Content from run 4/5 real DDE ign-on (engine off), Fred's
++// dde_dynamic_ignon_template.csv (v1c_rank_after_emu2 1..6).
++const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT] = {0xE6, 0xE8, 0xFB};
++
++const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU] = {
++    // Content = Fred's v1c spec (f11_emu2_dsc.md). Pre-ign: the real DDE (runs 4 and 5) sends
++    // the same layout before ign after a ~0.3 s start-up, except 0xFB L9 = 1f 00 ff 7f 00 f3 ff ff.
++    // id   slot           plen %8 kind               k     hi    hi_pre ign  period
++    {0xE6, DDE_DSLOT_E6, 8, 2, DDE_DYN_KIND_E2E,   0x04, 0x10, 0x10, 0, 200,
++     {0x00, 0x10, 0x80, 0x64, 0x45, 0x44, 0x23, 0x47}, {0x00, 0x10, 0x80, 0x64, 0x45, 0x44, 0x23, 0x47}, "E6"},
++    {0xFB, DDE_DSLOT_FB, 4, 5, DDE_DYN_KIND_CTR,   0x00, 0x40, 0x40, 0, 1000,
++     {0x40, 0x60, 0xF1, 0xFF}, {0x40, 0x60, 0xF1, 0xFF}, "FB5"},
++    {0xFB, DDE_DSLOT_FB, 6, 6, DDE_DYN_KIND_CTR,   0x00, 0xF0, 0xF0, 0, 40,
++     {0xF0, 0xFF, 0x47, 0x32, 0x00, 0xF0}, {0xF0, 0xFF, 0x47, 0x32, 0x00, 0xF0}, "FB7"},
++    {0xFB, DDE_DSLOT_FB, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 1000,
++     {0x1F, 0x00, 0x04, 0x00, 0x00, 0xF3, 0xFF, 0xFF}, {0x1F, 0x00, 0xFF, 0x7F, 0x00, 0xF3, 0xFF, 0xFF}, "FB9"},
++    {0xE8, DDE_DSLOT_E8, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 200,
++     {0x00, 0x00, 0x00, 0x9A, 0x29, 0xF3, 0x56, 0xF0}, {0x00, 0x00, 0x00, 0x9A, 0x29, 0xF3, 0x56, 0xF0}, "E89"},
++    {0xE8, DDE_DSLOT_E8, 4, 0, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 1, 1000,
++     {0x86, 0x78, 0xFE, 0xFE}, {0x86, 0x78, 0xFE, 0xFE}, "E85"},
++};
++
++int DDE_RAM(dde_core_dyn_pdu_for)(unsigned dslot, unsigned cycle)
++{
++    for (int p = 0; p < DDE_DYN_N_PDU; p++)
++        if (dde_dyn_pdu[p].dslot == dslot && dde_dyn_pdu[p].cyc_mod8 == (cycle & 7u)) return p;
++    return -1;
++}
++
++int DDE_RAM(dde_core_dyn_slot_of_id)(unsigned id)
++{
++    for (int s = 0; s < DDE_DYN_N_SLOT; s++) if (dde_dyn_slot_id[s] == id) return s;
++    return -1;
++}
++
++unsigned DDE_RAM(dde_core_build_dyn_pdu)(unsigned p, unsigned cycle, unsigned counter, bool preign, uint8_t *out)
++{
++    const dde_dyn_pdu_t *d = &dde_dyn_pdu[p];
++    const unsigned plen = d->plen;
++    dde_core_header(0x04u, d->id, plen / 2u, cycle, out);
++    uint8_t *pl = out + 5;
++    memcpy(pl, preign ? d->payload_pre : d->payload, plen);
++    uint8_t hi = preign ? d->hi_pre : d->hi;
++    if (d->kind == DDE_DYN_KIND_E2E) {
++        pl[1] = (uint8_t)(hi | (counter & 0x0Fu));
++        pl[0] = (uint8_t)(dde_core_crc8(&pl[1], plen - 1u) ^ d->k);
++    } else if (d->kind == DDE_DYN_KIND_CTR) {
++        pl[0] = (uint8_t)(hi | (counter & 0x0Fu));
++    }
++    uint32_t c = dde_core_frame_crc(out, 5u + plen);
++    out[5 + plen] = (uint8_t)(c >> 16);
++    out[6 + plen] = (uint8_t)(c >> 8);
++    out[7 + plen] = (uint8_t)c;
++    return 8u + plen;
++}
++
++// Run 5 fit (all senders): payload bytes -> minislots from the frame's AP to
++// the next frame's AP (frame end + idle detection, rounded up, + 2).
++unsigned DDE_RAM(dde_core_dyn_ms_used)(unsigned payload_bytes)
++{
++    switch (payload_bytes) {
++    case 2: case 4: return 4;
++    case 6: case 8: return 5;
++    case 14: return 6;
++    default: return 0;
++    }
++}
++
++unsigned dde_core_dyn_dts_bits(unsigned nbytes, unsigned tss_bits)
++{
++    // frame bits: TSS + FSS + 10 per byte + FES(2); 10 ticks per bit
++    uint32_t frame_q8 = (uint32_t)(tss_bits + 1u + 10u * nbytes + 2u) * 10u * 256u;
++    uint32_t m = (frame_q8 + 20u * 256u + DDE_DYN_MS_Q8 - 1u) / DDE_DYN_MS_Q8;   // >= 0.2 us DTS
++    uint32_t dts_q8 = m * DDE_DYN_MS_Q8 - frame_q8;
++    return dts_q8 / (10u * 256u);
++}
++
++int32_t DDE_RAM(dde_core_elapsed_ticks)(uint32_t us0, uint16_t fine0, uint32_t us1, uint16_t fine1)
++{
++    int32_t dus = (int32_t)(us1 - us0);
++    int32_t approx = dus * 100;                      // coarse ticks (+-100)
++    int32_t lo = (int32_t)(int16_t)(uint16_t)((uint32_t)fine1 - (uint32_t)fine0 - (uint32_t)approx);
++    return approx + lo;                              // exact mod 65536 near approx
++}
++
++void DDE_RAM(dde_dyn_track_start)(dde_dyn_track_t *t, unsigned cycle, bool mark_ok, uint8_t seq)
++{
++    t->active = true;
++    t->cycle = (uint8_t)cycle;
++    t->anchor_ok = mark_ok;
++    t->why = mark_ok ? DDE_DYN_OK : DDE_SKIP_NOANCHOR;
++    t->acc_seq = seq;
++    t->have_dyn = false;
++    t->last_k = 0;
++    t->last_id = 0;
++    t->last_ms = 0;
++    t->max_id = 0;
++}
++
++void DDE_RAM(dde_dyn_track_header)(dde_dyn_track_t *t, unsigned id, unsigned payload_bytes, bool mark_ok,
++                                   uint8_t seq, int64_t x_q8)
++{
++    if (!t->active) return;
++    if (id < DDE_DYN_FIRST_ID) {
++        // static frame: only extends the explained marks
++        if (mark_ok) {
++            if (!t->have_dyn && !t->anchor_ok && t->why == DDE_SKIP_NOANCHOR) { t->anchor_ok = true; t->why = 0; }
++            if (t->anchor_ok) t->acc_seq = seq;
++        } else if (t->anchor_ok) {
++            t->anchor_ok = false; t->why = DDE_SKIP_NOANCHOR;
++        }
++        return;
++    }
++    if (id > t->max_id) t->max_id = (uint16_t)id;
++    if (!mark_ok) { t->anchor_ok = false; t->why = DDE_SKIP_NOANCHOR; return; }
++    int64_t rel = x_q8 - DDE_DYN_BASE_Q8;
++    int64_t n = rel >= 0 ? (rel + DDE_DYN_MS_Q8 / 2) / DDE_DYN_MS_Q8 : -1;
++    int64_t frac = rel - n * DDE_DYN_MS_Q8;
++    if (n < (int64_t)(id - DDE_DYN_FIRST_ID) || n > 1000 || frac > DDE_DYN_GRID_TOL_Q8 || frac < -DDE_DYN_GRID_TOL_Q8) {
++        t->anchor_ok = false; t->why = DDE_SKIP_GRID; return;
++    }
++    unsigned k = dde_core_dyn_ms_used(payload_bytes);
++    if (!k) { t->anchor_ok = false; t->why = DDE_SKIP_LEN; return; }
++    t->have_dyn = true;
++    t->anchor_ok = true;
++    t->why = DDE_DYN_OK;
++    t->last_id = (uint16_t)id;
++    t->last_ms = (uint16_t)n;
++    t->last_k = (uint8_t)k;
++    t->acc_seq = seq;
++}
++
++int DDE_RAM(dde_dyn_predict)(const dde_dyn_track_t *t, unsigned id, unsigned *m_out)
++{
++    if (!t->active) return DDE_SKIP_NOANCHOR;
++    if (t->max_id >= id) return DDE_SKIP_PASSED;
++    if (!t->anchor_ok) return t->why ? t->why : DDE_SKIP_NOANCHOR;
++    unsigned m = t->have_dyn ? (unsigned)t->last_ms + t->last_k + (id - t->last_id - 1u) : id - DDE_DYN_FIRST_ID;
++    if (m > DDE_DYN_MS_LIMIT) return DDE_SKIP_LIMIT;
++    *m_out = m;
++    return DDE_DYN_OK;
++}
+diff --git a/src/dde_emu_core.h b/src/dde_emu_core.h
+index ea43565..b0d6f20 100644
+--- a/src/dde_emu_core.h
++++ b/src/dde_emu_core.h
+@@ -86,4 +86,87 @@ int dde_lock_on_ref(dde_lock_t *l, unsigned cycle, uint32_t cs_us);
+ // Time-based check without references; returns true when the lock was just lost.
+ bool dde_lock_poll(dde_lock_t *l, uint32_t now_us);
+ 
++
++// ---------------------------------------------------------------------------
++// v1c: DDE dynamic-segment PDUs (0xE6, 0xE8, 0xFB). Hand-written (the
++// generated dde_emu_tables.h stays byte-identical to gen_dde_tables.py).
++// Minislot grid fitted on the run 5 real DDE (16039 on-grid DDE frames):
++//   AP(m) = cycle start + DDE_DYN_BASE_Q8 + m * DDE_DYN_MS_Q8, residual +-0.26 us.
++#define DDE_DYN_MS_Q8 176017            // 6.87567 us per minislot, 1/256 ticks (10 ns)
++#define DDE_DYN_BASE_Q8 76879874        // minislot 0 (id 0x5C) = 0x07 ref + 2805.127 us
++#define DDE_DYN_FIRST_ID 0x5Cu
++#define DDE_DYN_MS_LIMIT 260u           // never TX beyond this minislot (run 5: DDE 0x142 30 B up to 275)
++#define DDE_DYN_GRID_TOL_Q8 (150 * 256) // a dynamic header must sit within 1.5 us of the grid
++
++enum { DDE_DYN_KIND_CONST = 0, DDE_DYN_KIND_E2E = 1, DDE_DYN_KIND_CTR = 2 };
++// PDU index order (also the stats order): E6, FB L5, FB L7, FB L9, E8 L9, E8 L5
++enum { DDE_PDU_E6 = 0, DDE_PDU_FB5, DDE_PDU_FB7, DDE_PDU_FB9, DDE_PDU_E89, DDE_PDU_E85, DDE_DYN_N_PDU };
++// Dynamic emulator slots (one frame ID each)
++enum { DDE_DSLOT_E6 = 0, DDE_DSLOT_E8, DDE_DSLOT_FB, DDE_DYN_N_SLOT };
++
++typedef struct {
++    uint16_t id;
++    uint8_t dslot;        // DDE_DSLOT_*
++    uint8_t plen;         // payload bytes (4, 6, 8)
++    uint8_t cyc_mod8;     // TX only in cycles with cycle % 8 == cyc_mod8
++    uint8_t kind;         // DDE_DYN_KIND_*
++    uint8_t k;            // E2E: crc8 xor constant (b1 = crc8(b2..bn) ^ k)
++    uint8_t hi;           // counter byte high nibble (ign-on)
++    uint8_t hi_pre;       // counter byte high nibble (pre-ign)
++    uint8_t ign_only;     // 1 = only after ign-on (+DDE_IGN_E8L5_CYCLES)
++    uint16_t period;      // cycles between transmissions
++    uint8_t payload[8];       // ign-on content (counter/crc bytes are overwritten)
++    uint8_t payload_pre[8];   // pre-ign content
++    const char *name;
++} dde_dyn_pdu_t;
++extern const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU];
++extern const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT];
++
++#define DDE_IGN_STATIC_CYCLES 12u       // switch to ign-on content 60 ms after the first 0x103 (DDE: 37-87 ms)
++#define DDE_IGN_E8L5_CYCLES 45u         // 0xE8 L5 starts 225 ms after the first 0x103
++
++// PDU of dynamic slot `dslot` due in `cycle` (by cycle % 8), -1 = none.
++int dde_core_dyn_pdu_for(unsigned dslot, unsigned cycle);
++int dde_core_dyn_slot_of_id(unsigned id);
++// Build the full frame (5 + plen + 3 bytes) of PDU p. counter 0..14. Returns bytes.
++unsigned dde_core_build_dyn_pdu(unsigned p, unsigned cycle, unsigned counter, bool preign, uint8_t *out);
++// Static frame with optional pre-ign content (0x28 c%4==1 b3-b5, 0x29 c%4==3 b8).
++unsigned dde_core_build_static_ex(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
++                                  bool preign, uint8_t *out);
++// Minislots a dynamic frame of `payload_bytes` occupies (0 = unknown length).
++unsigned dde_core_dyn_ms_used(unsigned payload_bytes);
++// DTS low bits so that the frame (TSS + bytes) plus DTS ends on a minislot action point.
++unsigned dde_core_dyn_dts_bits(unsigned nbytes, unsigned tss_bits);
++// Expected first-bit time of minislot m relative to cycle start (q8 ticks).
++static inline int32_t dde_core_dyn_ap_q8(unsigned m) { return DDE_DYN_BASE_Q8 + (int32_t)m * DDE_DYN_MS_Q8; }
++// Elapsed ticks from (us0, fine0) to (us1, fine1); us gives the coarse value,
++// fine (10 ns, u16) the exact one. Valid for |dt| < 300 ms.
++int32_t dde_core_elapsed_ticks(uint32_t us0, uint16_t fine0, uint32_t us1, uint16_t fine1);
++
++// Skip reasons (stats order: index reason-1)
++enum { DDE_DYN_OK = 0, DDE_SKIP_NOANCHOR = 1, DDE_SKIP_MARK, DDE_SKIP_PASSED, DDE_SKIP_LEN,
++       DDE_SKIP_GRID, DDE_SKIP_LIMIT, DDE_SKIP_LATE, DDE_SKIP_N = 8 };
++
++// Per-cycle dynamic-segment tracker. Fed with every FR1 header of the
++// current cycle (after the cycle's first reference). Certain = every frame
++// start (side-0 mark) since the anchor is explained by a decoded header.
++typedef struct {
++    bool active;
++    bool anchor_ok;
++    bool have_dyn;       // a dynamic frame anchors the prediction
++    uint8_t why;         // reason when !anchor_ok
++    uint8_t cycle;
++    uint8_t acc_seq;     // side-0 mark seq of the last explained frame
++    uint8_t last_k;
++    uint16_t last_id, last_ms;
++    uint16_t max_id;     // highest dynamic id seen this cycle (0 = none)
++} dde_dyn_track_t;
++void dde_dyn_track_start(dde_dyn_track_t *t, unsigned cycle, bool mark_ok, uint8_t seq);
++// x_q8 = mark time of this header relative to cycle start (q8 ticks), only
++// used for dynamic ids. mark_ok = this header's own side-0 mark was found.
++void dde_dyn_track_header(dde_dyn_track_t *t, unsigned id, unsigned payload_bytes, bool mark_ok,
++                          uint8_t seq, int64_t x_q8);
++// Predict the minislot for our frame id X. Returns DDE_DYN_OK or a skip reason.
++int dde_dyn_predict(const dde_dyn_track_t *t, unsigned id, unsigned *m_out);
++
+ #endif
+diff --git a/src/panda_usb.c b/src/panda_usb.c
+index 069413a..de03904 100644
+--- a/src/panda_usb.c
++++ b/src/panda_usb.c
+@@ -275,9 +275,10 @@ static bool handle_control_read(uint8_t rhport, tusb_control_request_t const *re
+ #if PICO_FLEXRAY_DDE_EMU
+     case PICOFLEX_GET_EMU:
+         {
+-            // 128 bytes (v2) do not fit response_data[64] and a multi-packet control IN
++            // 192 bytes (v3) do not fit response_data[64] and a multi-packet control IN
+             // reads its buffer after this function returns: use a static buffer. TinyUSB
+-            // sends min(wLength, 128), so a v1 host asking for 64 gets the v1 layout.
++            // sends min(wLength, 192), so a v1 host asking for 64 gets the v1 layout and
++            // a v2 host asking for 128 the v2 layout.
+             static dde_emu_stats_t es;
+             dde_emu_fill_stats(&es);
+             return tud_control_xfer(rhport, request, &es, sizeof(es));
+-- 
+2.47.3
+
