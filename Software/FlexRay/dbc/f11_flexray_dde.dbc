@@ -1,0 +1,229 @@
+VERSION "F11 DDE FlexRay (generated from f11_flexray_dde_signals.csv)"
+
+
+NS_ :
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+
+BS_:
+
+BU_: DDE VEHICLE
+
+
+BO_ 38 DDE_FR_026: 17 DDE
+ SG_ CycleMod4 M : 0|2@1+ (1,0) [0|3] "" VEHICLE
+ SG_ CRC_group1 m1 : 8|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group1 m1 : 16|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group1 m1 : 20|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ TurbineSpeed m1 : 24|16@1+ (1,-2000) [-2000|63535] "rpm" VEHICLE
+ SG_ Unused_0 m1 : 40|64@1+ (1,0) [0|1.84467e+19] "" VEHICLE
+ SG_ Unused_1 m1 : 104|32@1+ (1,0) [0|4.29497e+09] "" VEHICLE
+
+BO_ 40 DDE_FR_028: 17 DDE
+ SG_ CycleMod4 M : 0|2@1+ (1,0) [0|3] "" VEHICLE
+ SG_ CRC_group1_c1 m1 : 8|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group1_c1 m1 : 16|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group1_c1 m1 : 20|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ EngineTorque1_c1 m1 : 24|12@1+ (0.5,-1023.5) [-1023.5|1024] "Nm" VEHICLE
+ SG_ EngineTorque2_c1 m1 : 36|12@1+ (0.5,-1023.5) [-1023.5|1024] "Nm" VEHICLE
+ SG_ EngineSpeed_c1 m1 : 48|16@1+ (0.25,0) [0|16383.8] "rpm" VEHICLE
+ SG_ Byte7_const_c1 m1 : 64|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ CRC_group2_c1 m1 : 72|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group2_c1 m1 : 80|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group2_c1 m1 : 84|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ AccelPedal_c1 m1 : 88|12@1+ (0.025,0) [0|102.375] "%" VEHICLE
+ SG_ AccelPedal2_c1 m1 : 104|12@1+ (0.025,0) [0|102.375] "%" VEHICLE
+ SG_ Raw_14_15_c1 m1 : 120|16@1+ (1,0) [0|65535] "" VEHICLE
+ SG_ CRC_group1_c3 m3 : 8|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group1_c3 m3 : 16|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group1_c3 m3 : 20|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Raw_2_drift_c3 m3 : 24|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Raw_3_5_c3 m3 : 32|24@1+ (1,0) [0|1.67772e+07] "" VEHICLE
+ SG_ Byte6_const_c3 m3 : 56|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Byte7_unprotected_c3 m3 : 64|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ CRC_group2_c3 m3 : 72|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group2_c3 m3 : 80|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group2_c3 m3 : 84|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ GearEngagedCode_c3 m3 : 88|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ SpeedLike_c3 m3 : 96|16@1+ (1,-2000) [-2000|63535] "" VEHICLE
+ SG_ GearRelated_13_c3 m3 : 112|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Unprotected_FF_c3 m3 : 120|16@1+ (1,0) [0|65535] "" VEHICLE
+
+BO_ 41 DDE_FR_029: 17 DDE
+ SG_ CycleMod4 M : 0|2@1+ (1,0) [0|3] "" VEHICLE
+ SG_ CRC_group1 m3 : 8|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group1 m3 : 16|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group1 m3 : 20|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Raw_2_6 m3 : 24|40@1+ (1,0) [0|1.09951e+12] "" VEHICLE
+ SG_ StateEnum_7 m3 : 64|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ CRC_group2 m3 : 72|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group2 m3 : 80|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group2 m3 : 84|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Raw_10_15 m3 : 88|48@1+ (1,0) [0|2.81475e+14] "" VEHICLE
+
+BO_ 61 DDE_FR_03D_Sync: 17 DDE
+ SG_ CycleMod4 M : 0|2@1+ (1,0) [0|3] "" VEHICLE
+ SG_ CRC_group1 m3 : 8|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group1 m3 : 16|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group1 m3 : 20|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Raw_2_7 m3 : 24|48@1+ (1,0) [0|2.81475e+14] "" VEHICLE
+ SG_ CRC_group2 m3 : 72|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group2 m3 : 80|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group2 m3 : 84|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Raw_10_11 m3 : 88|16@1+ (1,0) [0|65535] "" VEHICLE
+ SG_ Unprotected_FF m3 : 104|32@1+ (1,0) [0|4.29497e+09] "" VEHICLE
+
+BO_ 230 DDE_FR_0E6: 9 DDE
+ SG_ CRC_group1 : 8|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Counter_group1 : 16|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_group1 : 20|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Raw_2 : 24|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ Raw_3 : 32|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ CoolantTemp : 40|8@1+ (1,-48) [-48|207] "degC" VEHICLE
+ SG_ Temp2_Candidate : 48|8@1+ (1,-48) [-48|207] "degC" VEHICLE
+ SG_ GearCode : 56|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ EngineStateNibble : 60|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Byte7 : 64|8@1+ (1,0) [0|255] "" VEHICLE
+
+BO_ 232 DDE_FR_0E8: 9 DDE
+ SG_ CycleParity M : 0|1@1+ (1,0) [0|1] "" VEHICLE
+ SG_ Raw_L9 m1 : 8|64@1+ (1,0) [0|1.84467e+19] "" VEHICLE
+ SG_ Const_L5 m0 : 8|32@1+ (1,0) [0|4.29497e+09] "" VEHICLE
+
+BO_ 251 DDE_FR_0FB: 9 DDE
+ SG_ CycleMod4 M : 0|2@1+ (1,0) [0|3] "" VEHICLE
+ SG_ Counter_L7 m2 : 8|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_L7 m2 : 12|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Byte1_const_L7 m2 : 16|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ SupplyVoltage_L7 m2 : 24|16@1+ (0.001,0) [0|65.535] "V" VEHICLE
+ SG_ Bytes4_5_const_L7 m2 : 40|16@1+ (1,0) [0|65535] "" VEHICLE
+ SG_ Counter_L5 m1 : 8|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ CounterHi_L5 m1 : 12|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ Const_L5 m1 : 16|24@1+ (1,0) [0|1.67772e+07] "" VEHICLE
+ SG_ Raw_L9 m3 : 8|64@1+ (1,0) [0|1.84467e+19] "" VEHICLE
+
+BO_ 322 DDE_FR_142: 31 DDE
+ SG_ Counter : 8|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ MonotonicCount_1 : 16|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ GearLike_3 : 32|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ MonotonicCount_5 : 48|8@1+ (1,0) [0|255] "" VEHICLE
+ SG_ PedalLike : 80|12@1+ (1,0) [0|4095] "" VEHICLE
+ SG_ GearAmbiguous_11 : 96|8@1+ (1,0) [0|255] "" VEHICLE
+
+BO_ 92 DDE_FR_05C_NM: 9 DDE
+ SG_ CycleMod16 M : 0|4@1+ (1,0) [0|15] "" VEHICLE
+ SG_ NM_Raw m1 : 8|56@1+ (1,0) [0|7.20576e+16] "" VEHICLE
+ SG_ NM_NodeAddress m1 : 64|8@1+ (1,0) [0|255] "" VEHICLE
+
+BO_ 266 DDE_FR_10A: 5 DDE
+ SG_ Const : 8|32@1+ (1,0) [0|4.29497e+09] "" VEHICLE
+
+BO_ 104 DDE_FR_068: 3 DDE
+ SG_ Const : 8|16@1+ (1,0) [0|65535] "" VEHICLE
+
+BO_ 190 DDE_FR_0BE_DiagResp: 33 DDE
+ SG_ DiagTransport_Raw : 8|8@1+ (1,0) [0|255] "" VEHICLE
+
+
+CM_ "BMW F11 520d DDE FlexRay frames, reverse engineered (Fred's analysis). Message ID = FlexRay slot ID. Byte 0 = cycle count, bytes 1.. = payload, as SavvyCAN decodes FlexRay frames. E2E: CRC8 poly 0x1D init 0 xorout 0 XOR per-group K, see f11_dde_e2e.md. Generated by make_flexray_dbc.py; edit the CSV, not this file.";
+CM_ BU_ DDE "Engine ECU, FlexRay node 0x12, coldstart sync node (sync frame 0x3D).";
+CM_ BU_ VEHICLE "Rest of the FlexRay cluster.";
+CM_ BO_ 190 "DDE FlexRay slot 0xbe. payload 4/10/16/32 B in sporadic. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 104 "DDE FlexRay slot 0x68. payload 2 B in c0/c3/c7 mod 8; ~0.2/s. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 266 "DDE FlexRay slot 0x10a. payload 4 B in base2/rep8; ~1 s. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 92 "DDE FlexRay slot 0x5c. payload 8 B in base1/rep16 (DDE share). DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 322 "DDE FlexRay slot 0x142. payload 30 B in c0/c1/c2 mod 4; ~47/s. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 251 "DDE FlexRay slot 0xfb. payload 6 B in L7: c2/c6 mod 8; 200 ms; payload 4 B in L5: c5 mod 8; ~5 s; payload 8 B in L9: c3/c7 mod 8; ~5 s + event. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 232 "DDE FlexRay slot 0xe8. payload 8 B in L9: odd cycles; ~1 s, ~15/s while running; payload 4 B in L5: c0 mod 8; ~5 s. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 230 "DDE FlexRay slot 0xe6. payload 8 B in mostly c2 mod 4; ~1 s + on change. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 61 "DDE FlexRay slot 0x3d. payload 16 B in c3 (base3/rep4); 0x3D is a sync frame. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 41 "DDE FlexRay slot 0x29. payload 16 B in c3 (base3/rep4). DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 40 "DDE FlexRay slot 0x28. payload 16 B in c1 (cycle mod 4 = 1); payload 16 B in c3 (cycle mod 4 = 3). DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ BO_ 38 "DDE FlexRay slot 0x26. payload 16 B in c1 (base1/rep4); nulls in other cycles. DLC = largest payload + 1 (byte 0 = cycle).";
+CM_ SG_ 38 CRC_group1 "Confidence: confirmed. Cycles: c1 (base1/rep4); nulls in other cycles. E2E CRC8 poly 0x1D init 0 xorout 0 over payload 1..3, XOR K=0xA8. SavvyCAN data[1]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 38 Counter_group1 "Confidence: confirmed. Cycles: c1 (base1/rep4); nulls in other cycles. Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[2]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 38 CounterHi_group1 "Confidence: confirmed. Cycles: c1 (base1/rep4); nulls in other cycles. Fixed high nibble 0xF; inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 38 TurbineSpeed "Confidence: medium-high. Cycles: c1 (base1/rep4); nulls in other cycles. SavvyCAN data[3..4]. raw-2000; 2000 (=0) when stopped. Turbine meaning inferred from behaviour (~rpm in P, ~150 R / ~350 D at creep with brake). EGS data re-packed by the DDE. Evidence: ptcan1: equal to EGS PT-CAN2 0x1AF d3..4 (r 1.000, 0x1AF leads ~8 ms); obd1/obd2: rpm-related, NOT equal to PID 0x0C (idle bias -56 rpm); R/D test";
+CM_ SG_ 38 Unused_0 "Confidence: confirmed. Cycles: c1 (base1/rep4); nulls in other cycles. SavvyCAN data[5..16]. Always FF; not in CRC span. Evidence: all logs";
+CM_ SG_ 38 Unused_1 "Confidence: confirmed. Cycles: c1 (base1/rep4); nulls in other cycles. SavvyCAN data[5..16]. Always FF; not in CRC span. Evidence: all logs";
+CM_ SG_ 40 CRC_group1_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). E2E CRC8 poly 0x1D init 0 xorout 0 over payload 1..7, XOR K=0x6A. SavvyCAN data[1]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 Counter_group1_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[2]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 CounterHi_group1_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). Fixed high nibble 0xF; inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 EngineTorque1_c1 "Confidence: high (field) / hint (unit). Cycles: c1 (cycle mod 4 = 1). SavvyCAN data[3] + low nibble data[4]. Scale/offset from a public hint; ~232 at crank, 25..50 idle, about -35 engine off. Evidence: ptcan1: equal to CAN 0x0A5 bits16..27 (r 0.999 slope 1.0, same PDU)";
+CM_ SG_ 40 EngineTorque2_c1 "Confidence: medium. Cycles: c1 (cycle mod 4 = 1). SavvyCAN high nibble data[4] + data[5]. Same format as torque 1; role unknown. Evidence: ptcan1: equal to CAN 0x0A5 bits28..39";
+CM_ SG_ 40 EngineSpeed_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). SavvyCAN data[6..7]. FR 25..145 ms behind OBD reply. Evidence: obd1 + obd2: OBD PID 0x0C r 0.9998 (88..92 % exact in request window); ptcan1: = CAN 0x0A5 d5..6";
+CM_ SG_ 40 Byte7_const_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). SavvyCAN data[8]. Constant 0xF1; inside CRC span. Evidence: all logs";
+CM_ SG_ 40 CRC_group2_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). E2E CRC8 poly 0x1D init 0 xorout 0 over payload 9..15, XOR K=0xD7. SavvyCAN data[9]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 Counter_group2_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[10]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 CounterHi_group2_c1 "Confidence: confirmed. Cycles: c1 (cycle mod 4 = 1). Fixed high nibble 0x1 (0x3 for ~60..80 ms at crank); inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 AccelPedal_c1 "Confidence: high (field) / hint (scale). Cycles: c1 (cycle mod 4 = 1). SavvyCAN data[11] + low nibble data[12]. 0 throughout the drive (refutes earlier brake idea). No OBD pedal PID logged. Evidence: ptcan1 3krev: = CAN 0x0D9 bits16..27 (r 0.9998 slope 1.001)";
+CM_ SG_ 40 AccelPedal2_c1 "Confidence: medium. Cycles: c1 (cycle mod 4 = 1). SavvyCAN data[13] + low nibble data[14]. Second pedal/throttle-like value. Evidence: ptcan1 3krev vs 0x0D9 (r 0.989)";
+CM_ SG_ 40 Raw_14_15_c1 "Confidence: undecoded. Cycles: c1 (cycle mod 4 = 1). SavvyCAN data[15..16]. Inside CRC span. Evidence: ign-on constant 7F C0";
+CM_ SG_ 40 CRC_group1_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). E2E CRC8 poly 0x1D init 0 xorout 0 over payload 1..6, XOR K=0xE4. SavvyCAN data[1]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 Counter_group1_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[2]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 CounterHi_group1_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). Fixed high nibble 0x1 (0x3 briefly at crank); inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 Raw_2_drift_c3 "Confidence: undecoded. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[3]. Slow drift at ign-on (0x97 -> 0x88), full range when running. Evidence: dde_e2e.md";
+CM_ SG_ 40 Raw_3_5_c3 "Confidence: undecoded. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[4..6]. Ign-on 7C E0 E0, vary when running. Evidence: dde_e2e.md";
+CM_ SG_ 40 Byte6_const_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[7]. FF, inside CRC span. Evidence: dde_e2e.md";
+CM_ SG_ 40 Byte7_unprotected_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[8]. FF, NOT in CRC span (including it breaks the fit). Evidence: dde_e2e.md";
+CM_ SG_ 40 CRC_group2_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). E2E CRC8 poly 0x1D init 0 xorout 0 over payload 9..13, XOR K=0x0F. SavvyCAN data[9]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 Counter_group2_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[10]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 CounterHi_group2_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). Fixed high nibble 0x1; inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 40 GearEngagedCode_c3 "Confidence: high. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[11]. 0x22 P, 0x25 R, 0x24 D; wake 0x80 -> 0x20 -> 0x22. Evidence: ptcan1 drive vs EGS 0x3FD; = CAN 0x0DC d2";
+CM_ SG_ 40 SpeedLike_c3 "Confidence: medium-high. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[12..13]. raw-2000, ~7.67 raw per km/h (fit), positive in R; physical unit unknown. Evidence: ptcan1 drive vs 0x1A1 (r 0.998, FR ~80 ms behind); = CAN 0x0DC d3..4";
+CM_ SG_ 40 GearRelated_13_c3 "Confidence: medium. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[14]. 0xFE P, 0xF4 R/D, 0xFC during park request. Evidence: ptcan1 drive; = CAN 0x0DC d5";
+CM_ SG_ 40 Unprotected_FF_c3 "Confidence: confirmed. Cycles: c3 (cycle mod 4 = 3). SavvyCAN data[15..16]. FF, NOT in CRC span. Evidence: dde_e2e.md";
+CM_ SG_ 41 CRC_group1 "Confidence: confirmed. Cycles: c3 (base3/rep4). E2E CRC8 poly 0x1D init 0 xorout 0 over payload 1..7, XOR K=0x3C. SavvyCAN data[1]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 41 Counter_group1 "Confidence: confirmed. Cycles: c3 (base3/rep4). Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[2]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 41 CounterHi_group1 "Confidence: confirmed. Cycles: c3 (base3/rep4). Fixed high nibble 0x1 (0x3 briefly at crank); inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 41 Raw_2_6 "Confidence: undecoded / low. Cycles: c3 (base3/rep4). SavvyCAN data[3..7]. LE pairs ~0x7D00 / 0x7CF9 in P, ~0x7F00..0x8000 in gear; |r|<0.7 vs rpm, torque, turbine, brake, speed. Evidence: ptcan1: = CAN 0x08F d2..6; changes only with R/D engaged";
+CM_ SG_ 41 StateEnum_7 "Confidence: low. Cycles: c3 (base3/rep4). SavvyCAN data[8]. Quasi-static enum 0x80 / 0x10 / 0xC0; meaning unknown. Evidence: dde_e2e.md; ts run 4";
+CM_ SG_ 41 CRC_group2 "Confidence: confirmed. Cycles: c3 (base3/rep4). E2E CRC8 poly 0x1D init 0 xorout 0 over payload 9..15, XOR K=0x69. SavvyCAN data[9]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 41 Counter_group2 "Confidence: confirmed. Cycles: c3 (base3/rep4). Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[10]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 41 CounterHi_group2 "Confidence: confirmed. Cycles: c3 (base3/rep4). Fixed high nibble 0x1; inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 41 Raw_10_15 "Confidence: undecoded / low. Cycles: c3 (base3/rep4). SavvyCAN data[11..16]. LE pairs 00 7D <-> F9 7C; payload byte 11 changes only with R/D engaged. Evidence: ptcan1";
+CM_ SG_ 61 CRC_group1 "Confidence: confirmed. Cycles: c3 (base3/rep4); 0x3D is a sync frame. E2E CRC8 poly 0x1D init 0 xorout 0 over payload 1..7, XOR K=0x0C. SavvyCAN data[1]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 61 Counter_group1 "Confidence: confirmed. Cycles: c3 (base3/rep4); 0x3D is a sync frame. Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[2]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 61 CounterHi_group1 "Confidence: confirmed. Cycles: c3 (base3/rep4); 0x3D is a sync frame. Fixed high nibble 0x1 (0x3 briefly at crank); inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 61 Raw_2_7 "Confidence: undecoded. Cycles: c3 (base3/rep4); 0x3D is a sync frame. SavvyCAN data[3..8]. FF FF then pairs 00 7D (off) / F9 7C (running). Evidence: ptcan1: = CAN 0x145 d2..7";
+CM_ SG_ 61 CRC_group2 "Confidence: confirmed. Cycles: c3 (base3/rep4); 0x3D is a sync frame. E2E CRC8 poly 0x1D init 0 xorout 0 over payload 9..11, XOR K=0x5C. SavvyCAN data[9]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 61 Counter_group2 "Confidence: confirmed. Cycles: c3 (base3/rep4); 0x3D is a sync frame. Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[10]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 61 CounterHi_group2 "Confidence: confirmed. Cycles: c3 (base3/rep4); 0x3D is a sync frame. Fixed high nibble 0x1; inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 61 Raw_10_11 "Confidence: undecoded. Cycles: c3 (base3/rep4); 0x3D is a sync frame. SavvyCAN data[11..12]. 00 7D. Evidence: dde_e2e.md";
+CM_ SG_ 61 Unprotected_FF "Confidence: confirmed. Cycles: c3 (base3/rep4); 0x3D is a sync frame. SavvyCAN data[13..16]. FF, NOT in CRC span. Evidence: dde_e2e.md";
+CM_ SG_ 230 CRC_group1 "Confidence: confirmed. Cycles: mostly c2 mod 4; ~1 s + on change. E2E CRC8 poly 0x1D init 0 xorout 0 over payload 1..7, XOR K=0x04. SavvyCAN data[1]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 230 Counter_group1 "Confidence: confirmed. Cycles: mostly c2 mod 4; ~1 s + on change. Low nibble 0..14 (15 never used), +1 per transmission, starts at 1 each wake. SavvyCAN data[2]. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 230 CounterHi_group1 "Confidence: confirmed. Cycles: mostly c2 mod 4; ~1 s + on change. Fixed high nibble 0x1 (0x3 briefly at crank); counter steps per transmission; inside the CRC span. Evidence: dde_e2e.md: 5 MITM logs + non-MITM ignon, 100 %; ptcan1 3 logs 100 %; ts run 4 100 %";
+CM_ SG_ 230 Raw_2 "Confidence: undecoded. Cycles: mostly c2 mod 4; ~1 s + on change. SavvyCAN data[3]. 0x80 / 0x82 seen. Evidence: ptcan1 (= CAN 0x3F9 d2)";
+CM_ SG_ 230 Raw_3 "Confidence: undecoded. Cycles: mostly c2 mod 4; ~1 s + on change. SavvyCAN data[4]. Init 34 -> 74 -> 64, varies when running. Evidence: dde_e2e.md";
+CM_ SG_ 230 CoolantTemp "Confidence: confirmed. Cycles: mostly c2 mod 4; ~1 s + on change. SavvyCAN data[5]. obd2 plausible 21..41 C (PID 0x05 not polled in run 2). Evidence: obd1: PID 0x05 r 0.9968, 89.5 % exact (run 1); = CAN 0x3F9 d4";
+CM_ SG_ 230 Temp2_Candidate "Confidence: candidate. Cycles: mostly c2 mod 4; ~1 s + on change. SavvyCAN data[6]. No independent label. Evidence: obd1: NOT coolant (lags, x1.09-53 fit r 0.992); public hint says oil temp (CAN 0x3F9 d5)";
+CM_ SG_ 230 GearCode "Confidence: high. Cycles: mostly c2 mod 4; ~1 s + on change. SavvyCAN data[7] low nibble. 3 P, 2 R, 5 D, 1 park requested while in D. N not captured. Evidence: ptcan1 drive vs EGS 0x3FD; = CAN 0x3F9 d6 and EGS 0x39A d3";
+CM_ SG_ 230 EngineStateNibble "Confidence: medium. Cycles: mostly c2 mod 4; ~1 s + on change. SavvyCAN data[7] high nibble. 2 ign-on pre-crank, 1 crank/after stop, 0 running (inference from timing). Evidence: ts run 4 (0x23 -> 0x13 crank -> 0x03 running -> 0x13 after stop); ptcan1";
+CM_ SG_ 230 Byte7 "Confidence: confirmed constant. Cycles: mostly c2 mod 4; ~1 s + on change. SavvyCAN data[8]. 0x47 steady (00 -> 10 -> 20 -> 23 -> 47 during init); inside CRC span. Evidence: all logs";
+CM_ SG_ 232 Raw_L9 "Confidence: undecoded. Cycles: L9: odd cycles; ~1 s, ~15/s while running. SavvyCAN data[1..8]. No CRC/counter. Payload bytes 3..4 LE16 vary continuously after ~5 s; 0..2 vary when running; 5 F3, 7 F0. Evidence: dde_e2e.md; ptcan1: payload identical to CAN 0x1BA (PT-CAN2)";
+CM_ SG_ 232 Const_L5 "Confidence: confirmed constant. Cycles: L5: c0 mod 8; ~5 s. SavvyCAN data[1..4]. 86 78 FE FE (first frame differs). Only ign-on to engine stop in ts run 4. Evidence: dde_e2e.md; = CAN 0x33D";
+CM_ SG_ 251 Counter_L7 "Confidence: confirmed. Cycles: L7: c2/c6 mod 8; 200 ms. SavvyCAN data[1] low nibble, 0..14, starts at 1; no CRC found. Evidence: dde_e2e.md; ts run 4";
+CM_ SG_ 251 CounterHi_L7 "Confidence: confirmed. Cycles: L7: c2/c6 mod 8; 200 ms. Fixed 0xF. Evidence: dde_e2e.md";
+CM_ SG_ 251 Byte1_const_L7 "Confidence: confirmed constant. Cycles: L7: c2/c6 mod 8; 200 ms. SavvyCAN data[2]. FF. Evidence: dde_e2e.md";
+CM_ SG_ 251 SupplyVoltage_L7 "Confidence: confirmed. Cycles: L7: c2/c6 mod 8; 200 ms. SavvyCAN data[3..4]. Crank dip ~11.3 V, ~14.7 V charging. Evidence: obd2: PID 0x42 r 0.9961 (fixed x0.001, OBD 48 mV lower, FR lags ~0.5 s); ptcan1: tracks CAN 0x281";
+CM_ SG_ 251 Bytes4_5_const_L7 "Confidence: confirmed constant. Cycles: L7: c2/c6 mod 8; 200 ms. SavvyCAN data[5..6]. 00 F0. Evidence: dde_e2e.md";
+CM_ SG_ 251 Counter_L5 "Confidence: confirmed. Cycles: L5: c5 mod 8; ~5 s. SavvyCAN data[1] low nibble 0..14; first frame per wake 01 00 F1 FF, then 0x4x. Evidence: dde_e2e.md; ts run 4";
+CM_ SG_ 251 CounterHi_L5 "Confidence: confirmed. Cycles: L5: c5 mod 8; ~5 s. Fixed 0x4 after the first frame (0x0 in the first). Evidence: dde_e2e.md";
+CM_ SG_ 251 Const_L5 "Confidence: confirmed constant. Cycles: L5: c5 mod 8; ~5 s. SavvyCAN data[2..4]. 60 F1 FF. Evidence: dde_e2e.md";
+CM_ SG_ 251 Raw_L9 "Confidence: undecoded. Cycles: L9: c3/c7 mod 8; ~5 s + event. SavvyCAN data[1..8]. No CRC/counter. Byte 0 1F (first 0F); byte 1 0x00..0xC8 while running; bytes 2..3 quasi-static FF 7F / 04 00; rest constant. Evidence: dde_e2e.md; ts run 4";
+CM_ SG_ 322 Counter "Confidence: confirmed. Cycles: c0/c1/c2 mod 4; ~47/s. SavvyCAN data[1]. Full byte 0..254 (255 never used), +1 per transmission, starts at 1. No CRC found. Evidence: dde_e2e.md; ts run 4";
+CM_ SG_ 322 MonotonicCount_1 "Confidence: undecoded. Cycles: c0/c1/c2 mod 4; ~47/s. SavvyCAN data[2]. Monotonic, irregular steps. Evidence: dde_e2e.md";
+CM_ SG_ 322 GearLike_3 "Confidence: low. Cycles: c0/c1/c2 mod 4; ~47/s. SavvyCAN data[4]. 2 / 3 / 4 in P / R / D. Evidence: ptcan1 drive";
+CM_ SG_ 322 MonotonicCount_5 "Confidence: undecoded. Cycles: c0/c1/c2 mod 4; ~47/s. SavvyCAN data[6]. Monotonic count (with byte 4 a BE16 count in door wake). Evidence: dde_e2e.md";
+CM_ SG_ 322 PedalLike "Confidence: low-medium. Cycles: c0/c1/c2 mod 4; ~47/s. SavvyCAN data[10] + low nibble data[11]. Scale not established. Evidence: ptcan1 3krev vs CAN 0x0D9 (r 0.937)";
+CM_ SG_ 322 GearAmbiguous_11 "Confidence: low. Cycles: c0/c1/c2 mod 4; ~47/s. SavvyCAN data[12]. 0x80 P, 0x84 R, 0x88/0x98 D, but back to 0x80 at brake release in D. Evidence: ptcan1 drive";
+CM_ SG_ 92 NM_Raw "Confidence: confirmed constant. Cycles: base1/rep16 (DDE share). SavvyCAN data[1..7]. 00 00 00 00 FF FF 00. Evidence: dde_e2e.md; ptcan1: = CAN 0x512";
+CM_ SG_ 92 NM_NodeAddress "Confidence: confirmed. Cycles: base1/rep16 (DDE share). SavvyCAN data[8]. 0x12 = DDE. Other cycles of 0x5C belong to other nodes (NM). Evidence: all logs";
+CM_ SG_ 266 Const "Confidence: confirmed constant. Cycles: base2/rep8; ~1 s. SavvyCAN data[1..4]. 00 FF FF FF. Sent only from ~5 s after ign-on until engine stop request. Evidence: dde_e2e.md; ts run 4";
+CM_ SG_ 104 Const "Confidence: confirmed constant. Cycles: c0/c3/c7 mod 8; ~0.2/s. SavvyCAN data[1..2]. C0 FF. Evidence: dde_e2e.md; ts run 4";
+CM_ SG_ 190 DiagTransport_Raw "Confidence: medium (role) / undecoded (content). Cycles: sporadic. Variable length. Frames starting 62 17 04 carry codes 290D00 and 241800 (meaning unknown). Not periodic. Evidence: ptcan1: DDE answers UDS 22 F101 here after request on vehicle FR 0x9A; ts run 4";
+VAL_ 40 GearEngagedCode_c3 34 "P" 37 "R" 36 "D" ;
+VAL_ 230 GearCode 3 "P" 2 "R" 5 "D" 1 "Park requested while in D" ;
