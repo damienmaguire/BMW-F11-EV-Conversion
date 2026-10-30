@@ -1,0 +1,32 @@
+; flexray_tsmark_txen: hardware frame-start timestamp trigger for the FIXED
+; ts-capture build (pass-through repeater of commit 9a9ddcc, unchanged).
+;
+; The stock flexray_bss_streamer program is NOT modified: its instruction words,
+; clock divider and pin mapping stay byte-identical to the known-good
+; pass-through UF2 (c5fa46a8...). Instead, one extra SM per direction watches the
+; TXEN pin that the streamer drives by side-set. The streamer pulls that TXEN low
+; exactly once per frame it decodes (after the >=11-bit idle check, the TSS
+; falling edge and the irq-7 pair mutex), so the falling edge of TXEN is a
+; per-captured-frame start mark with a fixed offset (~4 PIO cycles + 2-cycle
+; input synchroniser after the TSS falling edge at the Pico RXD pin).
+;
+; Reading a pin never affects its output, so the bus behaviour is unchanged.
+; 3 instructions: streamer (29) + tsmark (3) = 32 = the whole pio1 memory.
+
+.program flexray_tsmark_txen
+.wrap_target
+    wait 0 pin 0             ; TXEN asserted by the streamer = frame start
+    push noblock             ; ISR is always empty -> pushes 0; the DMA chain pops it
+    wait 1 pin 0             ; TXEN released at frame end -> re-arm
+.wrap
+
+% c-sdk {
+static inline void flexray_tsmark_txen_program_init(PIO pio, uint sm, uint offset, uint txen_pin) {
+    pio_sm_config c = flexray_tsmark_txen_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, txen_pin);   // read-only: no pindirs, no pio_gpio_init
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(pio, sm, offset, &c);
+    // enabled by the caller once the DMA chain is armed
+}
+%}
