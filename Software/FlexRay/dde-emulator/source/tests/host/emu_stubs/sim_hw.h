@@ -12,6 +12,12 @@ typedef unsigned int uint;
 #define __not_in_flash_func(f) f
 
 uint32_t time_us_32(void);
+// busy-wait step inside an ISR (dde_emu.c DDE_EMU_SPIN_HOOK): the sim advances the
+// clock by a few ticks and delivers the frame-start marks that happen meanwhile.
+void sim_spin(void);
+#define DDE_EMU_SPIN_HOOK() sim_spin()
+static inline void tight_loop_contents(void) {}
+#define DDE_EMU_TEST_HOOKS 1
 static inline void hw_set_bits(volatile uint32_t *a, uint32_t m) { *a |= m; }
 static inline void hw_clear_bits(volatile uint32_t *a, uint32_t m) { *a &= ~m; }
 

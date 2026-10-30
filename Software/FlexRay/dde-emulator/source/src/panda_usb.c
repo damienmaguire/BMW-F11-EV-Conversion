@@ -275,9 +275,10 @@ static bool handle_control_read(uint8_t rhport, tusb_control_request_t const *re
 #if PICO_FLEXRAY_DDE_EMU
     case PICOFLEX_GET_EMU:
         {
-            // 128 bytes (v2) do not fit response_data[64] and a multi-packet control IN
+            // 192 bytes (v3) do not fit response_data[64] and a multi-packet control IN
             // reads its buffer after this function returns: use a static buffer. TinyUSB
-            // sends min(wLength, 128), so a v1 host asking for 64 gets the v1 layout.
+            // sends min(wLength, 192), so a v1 host asking for 64 gets the v1 layout and
+            // a v2 host asking for 128 the v2 layout.
             static dde_emu_stats_t es;
             dde_emu_fill_stats(&es);
             return tud_control_xfer(rhport, request, &es, sizeof(es));
