@@ -2,6 +2,15 @@
 #include <string.h>
 #include "dde_emu_tables.h"
 
+// v1b: everything the header ISR / alarm ISR calls runs from RAM on the target
+// (no XIP cache misses with interrupts disabled). Host builds: plain functions.
+#if defined(__arm__)
+#include "pico.h"
+#define DDE_RAM(f) __time_critical_func(f)
+#else
+#define DDE_RAM(f) f
+#endif
+
 _Static_assert(5u + DDE_EMU_STATIC_PAYLOAD_BYTES + 3u == DDE_STATIC_FRAME_BYTES, "static frame size");
 _Static_assert(DDE_STATIC_FRAME_BYTES % 4u == 0, "PIO packs whole words");
 _Static_assert((5u + DDE_EMU_DYN_PAYLOAD_BYTES + 3u) % 4u == 0, "PIO packs whole words");
@@ -24,7 +33,7 @@ void dde_core_init(void)
     tables_ready = true;
 }
 
-uint16_t dde_core_header_crc(unsigned sync, unsigned startup, unsigned frame_id, unsigned len_words)
+uint16_t DDE_RAM(dde_core_header_crc)(unsigned sync, unsigned startup, unsigned frame_id, unsigned len_words)
 {
     uint32_t data = ((uint32_t)(sync & 1u) << 19) | ((uint32_t)(startup & 1u) << 18) |
                     ((uint32_t)(frame_id & 0x7FFu) << 7) | (len_words & 0x7Fu);
@@ -37,7 +46,7 @@ uint16_t dde_core_header_crc(unsigned sync, unsigned startup, unsigned frame_id,
     return (uint16_t)crc;
 }
 
-uint32_t dde_core_frame_crc(const uint8_t *p, unsigned n)
+uint32_t DDE_RAM(dde_core_frame_crc)(const uint8_t *p, unsigned n)
 {
     if (!tables_ready) dde_core_init();
     uint32_t crc = 0xFEDCBAu;
@@ -45,7 +54,7 @@ uint32_t dde_core_frame_crc(const uint8_t *p, unsigned n)
     return crc;
 }
 
-uint8_t dde_core_crc8(const uint8_t *p, unsigned n)
+uint8_t DDE_RAM(dde_core_crc8)(const uint8_t *p, unsigned n)
 {
     if (!tables_ready) dde_core_init();
     uint8_t c = 0;
@@ -53,7 +62,7 @@ uint8_t dde_core_crc8(const uint8_t *p, unsigned n)
     return c;
 }
 
-void dde_core_header(uint8_t ind, unsigned id, unsigned len_words, unsigned cycle, uint8_t h[5])
+void DDE_RAM(dde_core_header)(uint8_t ind, unsigned id, unsigned len_words, unsigned cycle, uint8_t h[5])
 {
     uint16_t hc = dde_core_header_crc((ind >> 1) & 1u, ind & 1u, id, len_words);
     h[0] = (uint8_t)(((ind & 0x1Fu) << 3) | ((id >> 8) & 7u));
@@ -63,7 +72,7 @@ void dde_core_header(uint8_t ind, unsigned id, unsigned len_words, unsigned cycl
     h[4] = (uint8_t)(((hc & 3u) << 6) | (cycle & 0x3Fu));
 }
 
-unsigned dde_core_e2e_apply(uint8_t *payload, unsigned target, unsigned cycle, unsigned counter)
+unsigned DDE_RAM(dde_core_e2e_apply)(uint8_t *payload, unsigned target, unsigned cycle, unsigned counter)
 {
     unsigned n = 0;
     for (unsigned g = 0; g < DDE_EMU_N_E2E; g++) {
@@ -77,7 +86,7 @@ unsigned dde_core_e2e_apply(uint8_t *payload, unsigned target, unsigned cycle, u
     return n;
 }
 
-uint8_t dde_core_emu_indicators(unsigned target, unsigned cycle, bool keep_sync)
+uint8_t DDE_RAM(dde_core_emu_indicators)(unsigned target, unsigned cycle, bool keep_sync)
 {
     uint8_t cap = dde_emu_static_ind[target][cycle & 63u];
     uint8_t ind = (uint8_t)(cap & 0x1Cu);       // reserved, preamble, null-frame indicator
@@ -85,7 +94,7 @@ uint8_t dde_core_emu_indicators(unsigned target, unsigned cycle, bool keep_sync)
     return ind;
 }
 
-unsigned dde_core_build_static(unsigned target, unsigned cycle, unsigned counter, bool keep_sync, uint8_t *out)
+unsigned DDE_RAM(dde_core_build_static)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync, uint8_t *out)
 {
     const unsigned plen = DDE_EMU_STATIC_PAYLOAD_BYTES;
     uint8_t ind = dde_core_emu_indicators(target, cycle, keep_sync);
@@ -99,12 +108,12 @@ unsigned dde_core_build_static(unsigned target, unsigned cycle, unsigned counter
     return 8u + plen;
 }
 
-bool dde_core_dyn_cycle(unsigned cycle)
+bool DDE_RAM(dde_core_dyn_cycle)(unsigned cycle)
 {
     return (cycle & DDE_EMU_DYN_CYCLE_MASK) == DDE_EMU_DYN_CYCLE_BASE;
 }
 
-unsigned dde_core_build_dyn(unsigned cycle, uint8_t *out)
+unsigned DDE_RAM(dde_core_build_dyn)(unsigned cycle, uint8_t *out)
 {
     const unsigned plen = DDE_EMU_DYN_PAYLOAD_BYTES;
     dde_core_header((uint8_t)(DDE_EMU_DYN_IND & 0x1Cu), DDE_EMU_DYN_ID, plen / 2u, cycle, out);
@@ -116,7 +125,7 @@ unsigned dde_core_build_dyn(unsigned cycle, uint8_t *out)
     return 8u + plen;
 }
 
-unsigned dde_core_pack(const uint8_t *frame, unsigned nbytes, unsigned tss_bits, unsigned dts_bits, uint32_t *words)
+unsigned DDE_RAM(dde_core_pack)(const uint8_t *frame, unsigned nbytes, unsigned tss_bits, unsigned dts_bits, uint32_t *words)
 {
     if (nbytes == 0 || (nbytes & 3u) || nbytes > DDE_MAX_FRAME_BYTES) return 0;
     if (tss_bits < 3 || tss_bits > 15) return 0;
@@ -131,19 +140,19 @@ unsigned dde_core_pack(const uint8_t *frame, unsigned nbytes, unsigned tss_bits,
     return w;
 }
 
-int dde_core_ref_index(unsigned id)
+int DDE_RAM(dde_core_ref_index)(unsigned id)
 {
     for (int i = 0; i < DDE_EMU_N_REFS; i++) if (dde_emu_ref_id[i] == id) return i;
     return -1;
 }
 
-int dde_core_target_index(unsigned id)
+int DDE_RAM(dde_core_target_index)(unsigned id)
 {
     for (int i = 0; i < DDE_EMU_N_STATIC; i++) if (dde_emu_static_id[i] == id) return i;
     return -1;
 }
 
-void dde_core_schedule(uint16_t ref_fine, uint32_t ref_us, int32_t delta_q8,
+void DDE_RAM(dde_core_schedule)(uint16_t ref_fine, uint32_t ref_us, int32_t delta_q8,
                        int32_t loop_ticks, uint32_t lead_us, dde_sched_t *out)
 {
     int32_t delta_ticks = (delta_q8 + 128) >> 8;   // round to 10 ns
@@ -159,7 +168,7 @@ void dde_lock_reset(dde_lock_t *l)
     memset(l, 0, sizeof(*l));
 }
 
-int dde_lock_on_ref(dde_lock_t *l, unsigned cycle, uint32_t cs_us)
+int DDE_RAM(dde_lock_on_ref)(dde_lock_t *l, unsigned cycle, uint32_t cs_us)
 {
     cycle &= 63u;
     if (!l->have) {
@@ -221,7 +230,7 @@ int dde_lock_on_ref(dde_lock_t *l, unsigned cycle, uint32_t cs_us)
     return DDE_LOCK_NEW_CYCLE;
 }
 
-bool dde_lock_poll(dde_lock_t *l, uint32_t now_us)
+bool DDE_RAM(dde_lock_poll)(dde_lock_t *l, uint32_t now_us)
 {
     if (!l->have || !l->locked) return false;
     // the last good cycle started at last_cs_us; cycles last_cycle+1 .. +GAP may be missed,
