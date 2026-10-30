@@ -5,7 +5,7 @@
 | Upstream | https://github.com/dynm/pico-flexray, branch `feature/frame-blocker` | `5c77833ea0b1f9337de2973e54bc3378c0533d34` |
 | Local, not on any remote | pass-through build (the known-good firmware) | `9a9ddcc` |
 | Local, not on any remote | `ts-capture-fixed` (FIXED timestamped capture build) | `acf675e5693eadddcd28ed0d1cda9be54f53aaa5` |
-| Local, not on any remote | `dde-emulator` (this work) | `954110e28797604ba3129f63c42597ce1e855b84` |
+| Local, not on any remote | `dde-emulator` (this work, v1b) | `f120e10a4009ac597e1dbc5f2ca4aa8ea36aff30` (v1 was `954110e`) |
 
 History, oldest first:
 
@@ -19,10 +19,15 @@ acf675e ts-capture: crc_fail counter in TS info (was uncounted), PICO_FR_USB_FAS
 854bbe3 dde-emu: table generator and bit-level model from run 5 capture
 4530346 dde-emu: host-compilable core (frame build, CRC/E2E, schedule, lock FSM) + host test
 5698464 dde-emu: firmware (PICO_FLEXRAY_DDE_EMU=ON): transmit DDE static frames on FR1
-954110e dde-emu: logger --emulate, emulator stats, Python validation tests
+954110e dde-emu: logger --emulate, emulator stats, Python validation tests   (= v1)
+ab10e9c dde-emu v1b: fix false 'TX SM stuck' fault that dropped 0x3D; first-fault record, stats v2
+9a7c938 tests: replay car run 1 (f11_emu1.csv) through dde_emu.c on the host
+f120e10 logger: read emu stats v2 (128 bytes), show first fault, print EMU FAULT once
 ```
 
-`patches/` is `git format-patch ts-capture-fixed..dde-emulator`. These are 4 patches.
+`patches/` is the series ts-capture-fixed..dde-emulator. These are 7 patches:
+0001–0004 = v1 (`git format-patch ts-capture-fixed..954110e`, unchanged), and
+0005–0007 = v1b (`git format-patch --start-number 5 954110e..dde-emulator`).
 Apply them with `git am patches/*.patch` on a checkout of `ts-capture-fixed`.
 
 `ts-capture-fixed` is not on any remote, so `source/` holds the full source

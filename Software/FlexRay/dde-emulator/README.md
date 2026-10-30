@@ -1,11 +1,74 @@
 # DDE emulator for the F11 EV conversion (pico-flexray V1)
 
-> **Status: UNTESTED ON THE CAR.** It builds, and every offline test against the
-> run 5 capture passes. It has never been flashed or put on a bus. Do the first
-> test exactly as described under [Test procedure](#test-procedure-in-the-car).
+> **Status: v1b, not yet tested on the car.** v1 was tested once (car test 1):
+> it locked and sent in the right slots, but a false "TX state machine stuck"
+> fault stopped it in cycle 53 and 0x3D never reached the bus (see
+> [Changelog](#changelog)). v1b fixes that. It builds, and every offline test,
+> including a replay of the car test 1 capture, passes. Do the next test exactly as
+> described under [Test procedure](#test-procedure-in-the-car).
 
-Firmware: `firmware/pico_flexray_dde_emu_v1_ignon.uf2` (V1 board, Pico 2 / RP2350).
-SHA-256 is in `firmware/SHA256SUMS`.
+Firmware: `firmware/pico_flexray_dde_emu_v1b_ignon.uf2` (V1 board, Pico 2 / RP2350).
+SHA-256 is in `firmware/SHA256SUMS`. `pico_flexray_dde_emu_v1_ignon.uf2` is the
+old v1 and is kept only for reference: do not use it.
+
+## Changelog
+
+### v1b (after car test 1)
+
+**What went wrong in car test 1.** The console showed
+`FAULT 1 "TX state machine stuck"`, `sent[0x26=2 0x28=2 0x29=2 0x3D=1]`, `late=1`,
+`echo ok=6`, and 0x3D was never seen on the bus. The fault was false: the
+state machine was fine.
+
+- v1 started a "busy since" timer when it loaded 0x26 (~1215 µs into the cycle).
+- It only cleared that timer when it found the state machine idle. It only looked
+  right after loading 0x28 and 0x29, when the state machine was busy each time.
+- At the 0x3D alarm (~1974 µs) the timer read ~759 µs, more than the 200 µs
+  limit. So it raised FAULT 1, switched the pins off and stopped the state
+  machines just before 0x3D went out. 0x3D was counted as sent but never left
+  the pin.
+- In cycle 52, 0x3D had been skipped as "late" (an alarm a few µs late), so the
+  first 0x3D load, and the fault, came in cycle 53. v1 did not record why a slot
+  was late, so the cause of that one late alarm is not known. v1b records it.
+
+**Evidence.** `tests/host/test_dde_emu_replay.c` runs the real `dde_emu.c` on
+the PC against the FR1 frame timing captured in car test 1:
+
+- The v1 source faults at the first 0x3D.
+- v1 with one alarm delayed by 4 µs reproduces the car console exactly: sent
+  2/2/2/1, late 1, echo ok 6, miss 0, foreign 0, FAULT 1, K=34, max echo error
+  0.181 µs (console: 180 ns).
+- v1b sends all four frames in every cycle of the replay and of the full 60 s
+  capture (48 000 frames, all within 0.181 µs of their slot), with no fault.
+
+v1 also matched echoes only within 200 µs. A late-reported echo of our own frame
+would have counted as "foreign" (FAULT 2).
+
+**Changes in v1b:**
+
+- **Stuck check.** Each frame gets a deadline: its start, plus its length, plus
+  20 µs. FAULT 1 is raised only if the state machine is still busy after that.
+  Busy with nothing sent needs 200 µs of continuous busy.
+- **Own echo is never foreign.** Echoes are matched per slot and cycle within
+  1 ms. A second report of the same frame is counted as `echo_dup`, not foreign.
+  FAULT 2 is otherwise as strict as before.
+- **FAULT 3 (no echo)** only after at least 8 misses in a row, spread over at
+  least 2 cycles, while locked (references present).
+- **Faults re-arm by themselves** after 2 s with no new sign of the fault. After
+  that, TX needs 8 quiet cycles again. On the 3rd fault it stays latched until
+  the laptop clears it (logger restart, or `0xa3` wValue 0).
+- **Late check.** The pre-check before a slot was tightened from 2.5 µs to
+  1.2 µs, because the margin is checked again after loading. A short ISR delay
+  like the one in car test 1 no longer skips a slot.
+- **First-fault record.** It holds the fault code, slot, cycle, time and the
+  counters at the moment of the fault. It also counts late slots by reason
+  (busy / fire / short / window / missed). It is in the `0xa4` stats (v2, 128
+  bytes; the first 64 bytes keep the v1 layout), on the logger's `emu:` line, and
+  printed once as `EMU FAULT ...`. The pico's own USB console also prints it
+  once.
+- The time-critical core code now runs from RAM.
+- Frame content is unchanged from v1 (it matches run 5).
+
 
 ## What it does
 
@@ -87,13 +150,17 @@ The firmware only transmits when **all** of the following are true:
   reference, and it re-arms only after 8 good cycles in a row;
 - 8 quiet cycles have passed since TX was enabled. During that time it checks
   that nobody else is using the DDE slots;
-- there is no latched fault. A fault stops TX until the pico is power-cycled or
-  re-enabled. The faults are:
-  - **FAULT 1** – the TX state machine got stuck. The pins are forced to "off".
+- there is no active fault. A fault stops TX at once. If there is no new sign of
+  it for 2 s, TX re-arms (after 8 quiet cycles). The 3rd fault stays latched
+  until the logger is restarted (it sends `0xa3` wValue 0) or the pico is
+  power-cycled. The faults are:
+  - **FAULT 1** – the TX state machine is still busy 20 µs after the frame
+    should have ended. The pins are forced to "off" until re-arm.
   - **FAULT 2** – a frame in a DDE slot that we did not send. The real DDE is
-    probably still connected.
-  - **FAULT 3** – 8 of our own frames in a row were not seen coming back. Check
-    the wiring or the transceiver.
+    probably still connected. While it keeps sending, the fault keeps
+    refreshing and never re-arms.
+  - **FAULT 3** – 8 or more of our own frames in a row, over at least 2 cycles,
+    were not seen coming back while locked. Check the wiring or the transceiver.
 
 Counters on the logger's `emu:` line:
 
@@ -104,11 +171,27 @@ Counters on the logger's `emu:` line:
 | `lock_losses` | times the lock was lost |
 | `rearms` | times the lock came back |
 | `late` | slots skipped because we would have been late (nothing sent) |
+| `late[busy fire short win missed]` | v1b: late slots by reason, plus the last one (`last=0x3D/short r=...`, r = margin in 10 ns ticks) |
+| `faults`, `auto_clears` | v1b: faults since the last clear, and how many re-armed by themselves |
+| `first FAULT ...` | v1b: the first fault since the last clear: code, slot, cycle, how long ago, detail, counters at the fault, `locked` / `tx-in-flight` |
 | `echo ok`, `echo miss` | our frames seen / not seen back on RX |
 | `foreign` | frames in our slots that were not ours |
 | `echo_err` | timing error of our frames, ns |
 | `fire_err`, `loop`, `K` | calibration values |
 | `tss` | TSS length in bits |
+
+When a first fault appears, the logger prints it once, for example:
+
+```
+EMU FAULT 1 "TX state machine stuck" slot=0x3D cycle=53 0.412 s ago detail=21 | at the fault: sent=7 late=1 echo ok=6 miss=0 foreign=0 locked tx-in-flight (logger t=+14.2s)
+```
+
+`detail` means:
+- FAULT 1: µs past the frame's deadline. A negative value is the µs the state
+  machine was busy with nothing sent.
+- FAULT 2: µs between our frame and the other one. −1 means we sent nothing in
+  that slot in that cycle.
+- FAULT 3: the number of misses in a row.
 
 Unplugging the pico's USB cable removes power, and the transceiver then goes
 silent.
@@ -116,12 +199,14 @@ silent.
 ## Files
 
 ```
-firmware/                 the UF2 + SHA256SUMS
+firmware/                 v1b UF2 (use this), old v1 UF2, SHA256SUMS
 tools/                    laptop tools: fr_ts_logger.py (with --emulate), frts.py, reset_to_bootloader.py
 source/                   complete firmware source tree (dde-emulator branch) incl. tests and generator
   src/dde_emu*.{c,h,pio}  emulator firmware (dde_emu_tables.h is generated)
   tools/dde_emu/          table generator, Python model, test_dde_emu.py, test_logger_emulate.py
   tests/host/             C host tests (run.sh), incl. test_dde_emu_core.c + captured vectors
+                          test_dde_emu_replay.c: dde_emu.c replayed against car test 1 timing (emu_stubs/, emu_run1_fr1_1600ms.txt)
+  tools/dde_emu/extract_replay.py  makes the replay vectors from a logger CSV
 patches/                  git format-patch series: ts-capture-fixed -> dde-emulator
 BASE.md                   which upstream commit / local branch this is based on
 ```
@@ -130,8 +215,9 @@ BASE.md                   which upstream commit / local branch this is based on
 
 The commands assume the tools live in `~/Downloads/FlexRay/fr-ts`. Copy
 `tools/fr_ts_logger.py`, `tools/frts.py`, `tools/reset_to_bootloader.py` and
-`firmware/pico_flexray_dde_emu_v1_ignon.uf2` there. The new `fr_ts_logger.py`
-and `frts.py` replace the old ones; they still work with the capture firmware.
+`firmware/pico_flexray_dde_emu_v1b_ignon.uf2` there. The new `fr_ts_logger.py`
+and `frts.py` replace the old ones. They still work with the capture firmware
+and with v1. Copy them again for v1b: the old ones do not show the first fault.
 
 ```
 sudo apt install python3-usb
@@ -159,7 +245,7 @@ cd ~/Downloads/FlexRay/fr-ts
 ```
 
 ```
-sha256sum pico_flexray_dde_emu_v1_ignon.uf2
+sha256sum pico_flexray_dde_emu_v1b_ignon.uf2
 ```
 
 It must match the line in `firmware/SHA256SUMS`.
@@ -185,7 +271,7 @@ Do **not** start the engine during this test.
    release.)
 
    ```
-   cp ~/Downloads/FlexRay/fr-ts/pico_flexray_dde_emu_v1_ignon.uf2 /media/$USER/RP2350/
+   cp ~/Downloads/FlexRay/fr-ts/pico_flexray_dde_emu_v1b_ignon.uf2 /media/$USER/RP2350/
    ```
 
    The pico reboots by itself, and the GP20 LED blinks once per second. TX is
@@ -194,7 +280,7 @@ Do **not** start the engine during this test.
 5. **Start the logger with `--emulate`:**
 
    ```
-   python3 ~/Downloads/FlexRay/fr-ts/fr_ts_logger.py -o ~/Downloads/FlexRay/fr-ts/f11_emu1.csv --emulate
+   python3 ~/Downloads/FlexRay/fr-ts/fr_ts_logger.py -o ~/Downloads/FlexRay/fr-ts/f11_emu2.csv --emulate
    ```
 
    You should see `EMULATOR TX ENABLED`, then every 5 s a status line plus an
@@ -211,9 +297,15 @@ Do **not** start the engine during this test.
      error of the very first frame (up to a few hundred ns), but it should
      not keep growing.
 
-   If it shows `FAULT`, the firmware has already stopped sending. Read the fault
-   text and go to step 9. In the status line, frames from FR1 now include ours
+   If it shows `FAULT` or the console prints `EMU FAULT ...`, the firmware has
+   stopped sending. It re-arms by itself after 2 s if the cause is gone, and
+   stays off after the 3rd fault. Note the `EMU FAULT` line and go to step 9. In the status line, frames from FR1 now include ours
    (0x26/0x28/0x29/0x3D).
+
+   **Pass check (in the capture, afterwards):** the car's 0x2F byte 4 goes
+   0e→02 and byte 5 goes 30→20 about 1.05 s after ign on. Without a working
+   DDE (or with v1) byte 4 goes to 06 about 5.76 s after wake, and byte 5 stays
+   30.
 
 7. **Watch the dash and the console** for a minute or two. Note any warnings or
    messages on the dash, for comparison with "DDE unplugged, no pico".
@@ -225,9 +317,9 @@ Do **not** start the engine during this test.
 
 9. **Stop the logger** with Ctrl-C. It prints `EMULATOR TX DISABLED`, then
    `emu at stop: ...`. Keep these three files, from `~/Downloads/FlexRay/fr-ts/`:
-   - `f11_emu1.csv`
-   - `f11_emu1.csv.bin`
-   - `f11_emu1.csv.console.log`
+   - `f11_emu2.csv`
+   - `f11_emu2.csv.bin`
+   - `f11_emu2.csv.console.log`
 
 If anything looks wrong (dash goes mad, the car will not sleep, a FAULT
 appears), press Ctrl-C in the logger first. TX is switched off at once.
@@ -243,12 +335,25 @@ from the fr-ts folder, the same way as in step 4.
 
 ## Known risks / open points
 
-- **Never tested on the car or on a bench bus.**
+- **v1b is not yet tested on the car.** v1 ran on the car once (car test 1,
+  stopped by the false fault). The traction control failure seen then
+  (0x3D, which carries WMOM_DRV/TORQ_CRSH, never reached the bus) should be
+  checked again with v1b.
 - **TSS length.** We send a 7-bit TSS. If the car's receivers expect a longer
   one, our frames are dropped: `echo ok` would rise but the dash would act as
   if the DDE were missing. If so, rebuild with `-DEMU_TSS_BITS=<n>`.
 - **No dynamic frames** (see above). Anything the car reads from 0xE6, 0xE8,
   0xFB, 0x142, 0x68, 0x10A, 0xBE or 0x5C will be missing.
+  - Planned next, **not in v1b: 0xE6.** Track dynamic-segment activity per
+    cycle, as worked out from car test 1 (`f11_emu_run1.md`), and only send in
+    cycles where the minislot count is known to be safe. Content from Fred's
+    template: K=04, b2 = 0x10 | counter, 1 Hz, in cycles ≡ 2 (mod 8).
+- **Late alarms.** Car test 1 had one slot skipped as late in cycle 52, cause
+  unknown. v1b tolerates a delay like that one. If it happens again, the
+  `late[...]` reasons and `last=` show which slot and why.
+- **Pre-ign values.** Before ign on, the real DDE sends 0x28 c1 = `c1 17 7c` and
+  0x29 b8 = 80. The emulator always sends its ign-on content. This was not
+  changed in v1b (small, optional follow-up).
 - **Fixed state.** The replay is one 64-cycle window (run 5, ign on, engine off).
   Nothing changes with the pedal, temperatures and so on.
 - **Network management / sleep.** The replayed frames may contain "stay awake"
