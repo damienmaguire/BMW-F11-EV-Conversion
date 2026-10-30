@@ -42,8 +42,12 @@ CSV_COLUMNS = [
 CAN_CSV_COLUMNS = ["t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s"]
 
 
-EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h
+EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h (v1 layout = first 64 bytes of v2)
 assert EMU_STATS_STRUCT.size == 64
+EMU_STATS_V2_STRUCT = struct.Struct("<4B6Ii4B5H2BhH3I")  # bytes 64..127 (v2, firmware v1b)
+assert EMU_STATS_V2_STRUCT.size == 64
+EMU_STATS_LEN = 128   # request this many; a v1 firmware answers 64
+EMU_LATE_REASONS = ("busy", "fire", "short", "win", "missed")
 EMU_STATES = {0: "disabled", 1: "no-lock", 2: "arming", 3: "ACTIVE", 4: "FAULT"}
 EMU_FAULTS = {0: "none", 1: "TX state machine stuck", 2: "DDE frame seen that we did not send (DDE still connected?)",
               3: "own frames not seen on FR1 RX (wiring / transceiver?)"}
@@ -57,7 +61,28 @@ def parse_emu_stats(raw):
              echo_err_avg_ns=v[15], echo_err_maxabs_ns=v[16], fire_err_avg_ns=v[17], loop_delay_ns=v[18],
              fire_k_ticks=v[19], tss_bits=v[20], flags=v[21], rearms=v[22])
     d["locked"] = bool(d["flags"] & 4)
+    d["v2"] = False
+    if d["version"] >= 2 and len(raw) >= 128:
+        w = EMU_STATS_V2_STRUCT.unpack(bytes(raw[64:128]))
+        d.update(v2=True, ff_code=w[0], ff_slot=w[1], ff_cycle=w[2], ff_flags=w[3], ff_us=w[4],
+                 ff_sent_total=w[5], ff_late=w[6], ff_echo_ok=w[7], ff_echo_miss=w[8], ff_foreign=w[9],
+                 ff_detail=w[10], fault_count=w[11], auto_clears=w[12], latched=w[13], last_fault=w[14],
+                 late_reason=list(w[15:20]), last_late_slot=w[20], last_late_reason=w[21], last_late_r=w[22],
+                 echo_dup=w[23], last_fault_us=w[24], now_us=w[25])
+        d["ff_age_s"] = ((d["now_us"] - d["ff_us"]) & 0xFFFFFFFF) / 1e6
     return d
+
+
+def fmt_emu_first_fault(d):
+    """One-line first-fault record (v2 stats), '' when there is none."""
+    if not d.get("v2") or not d["ff_code"]:
+        return ""
+    return ("FAULT %d \"%s\" slot=0x%02X cycle=%d %.3f s ago detail=%d | at the fault: sent=%d late=%d "
+            "echo ok=%d miss=%d foreign=%d%s%s" % (
+                d["ff_code"], EMU_FAULTS.get(d["ff_code"], "?"), d["ff_slot"], d["ff_cycle"], d["ff_age_s"],
+                d["ff_detail"], d["ff_sent_total"], d["ff_late"], d["ff_echo_ok"], d["ff_echo_miss"],
+                d["ff_foreign"], " locked" if d["ff_flags"] & 1 else " not-locked",
+                " tx-in-flight" if d["ff_flags"] & 2 else ""))
 
 
 def fmt_emu(d):
@@ -70,6 +95,19 @@ def fmt_emu(d):
             d["fire_k_ticks"], d["tss_bits"], " SYNC_BITS" if d["flags"] & 1 else "", " DYN_5C" if d["flags"] & 2 else "")
     if d["fault"]:
         s += " | FAULT %d: %s" % (d["fault"], EMU_FAULTS.get(d["fault"], "?"))
+        if d.get("v2"):
+            s += " (%s)" % ("LATCHED until restart" if d["latched"] else "auto re-arm after 2 s quiet")
+    if d.get("v2"):
+        if any(d["late_reason"]):
+            s += " | late[%s] last=0x%02X/%s r=%d" % (
+                " ".join("%s=%d" % (n, c) for n, c in zip(EMU_LATE_REASONS, d["late_reason"])),
+                d["last_late_slot"], EMU_LATE_REASONS[d["last_late_reason"] - 1] if 1 <= d["last_late_reason"] <= 5
+                else d["last_late_reason"], d["last_late_r"])
+        if d["fault_count"] or d["auto_clears"]:
+            s += " | faults=%d auto_clears=%d" % (d["fault_count"], d["auto_clears"])
+        ff = fmt_emu_first_fault(d)
+        if ff:
+            s += " | first " + ff
     return s
 
 
