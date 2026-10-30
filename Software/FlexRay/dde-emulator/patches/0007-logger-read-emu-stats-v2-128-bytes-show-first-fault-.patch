@@ -1,0 +1,239 @@
+From f120e10a4009ac597e1dbc5f2ca4aa8ea36aff30 Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Fri, 30 Oct 2026 16:30:31 +0000
+Subject: [PATCH 7/7] logger: read emu stats v2 (128 bytes), show first fault,
+ print EMU FAULT once
+
+Backward compatible with v1 firmware (64-byte answer).
+---
+ tools/dde_emu/test_logger_emulate.py | 56 ++++++++++++++++++++++------
+ tools/ts_capture/fr_ts_logger.py     | 17 +++++++--
+ tools/ts_capture/frts.py             | 40 +++++++++++++++++++-
+ 3 files changed, 98 insertions(+), 15 deletions(-)
+
+diff --git a/tools/dde_emu/test_logger_emulate.py b/tools/dde_emu/test_logger_emulate.py
+index f7acd5d..5221912 100644
+--- a/tools/dde_emu/test_logger_emulate.py
++++ b/tools/dde_emu/test_logger_emulate.py
+@@ -2,8 +2,10 @@
+ """Checks fr_ts_logger.py --emulate against a fake USB device (no hardware):
+ TX is enabled only after the capture started (0xa3: 0 then 1), kept alive,
+ the emulator counters are printed, and TX is disabled on exit, also when the
+-run is stopped by Ctrl-C (SIGINT) and before the record format is reset."""
+-import os, signal, struct, sys, tempfile, threading, time, types
++run is stopped by Ctrl-C (SIGINT) and before the record format is reset.
++v1b: the 0xa4 stats are read with 128 bytes (v2); a first fault in them is printed
++exactly once as "EMU FAULT ..."; a v1 device (64 bytes) still works."""
++import contextlib, io, os, signal, struct, sys, tempfile, threading, time, types
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, os.path.join(HERE, "..", "ts_capture"))
+@@ -17,20 +19,36 @@ class USBTimeoutError(USBError):
+     pass
+ 
+ 
++V1_FMT = "<4B5I6I3h2H2BI"
++V2_FMT = "<4B6Ii4B5H2BhH3I"
++
++
+ class FakeDev:
+-    def __init__(self):
++    def __init__(self, v2=True):
+         self.log = []
++        self.v2 = v2
++        self.n_stats = 0
+ 
+     def set_configuration(self):
+         pass
+ 
+     def ctrl_transfer(self, rt, req, val, idx, data_or_len, timeout=0):
+-        self.log.append((time.time(), rt, req, val))
++        self.log.append((time.time(), rt, req, val, data_or_len))
+         if rt == 0xC0 and req == 0xA2:
+             return bytes(struct.pack("<4B14I4x", 1, 3, 16, 1, 100_000_000, *([0] * 13)))
+         if rt == 0xC0 and req == 0xA4:
+-            return bytes(struct.pack("<4B5I6I3h2H2BI", 1, 3, 1, 0, 10, 20, 10, 10, 0,
+-                                     0, 0, 50, 0, 0, 400, -5, 30, 2, 180, 31, 7, 4, 1))
++            self.n_stats += 1
++            if not self.v2:
++                return bytes(struct.pack(V1_FMT, 1, 3, 1, 0, 10, 20, 10, 10, 0,
++                                         0, 0, 50, 0, 0, 400, -5, 30, 2, 180, 31, 7, 4, 1))[:data_or_len]
++            fault = 1 if self.n_stats >= 2 else 0          # a fault appears from the 2nd read on
++            head = struct.pack(V1_FMT, 2, 4 if fault else 3, 1, fault, 2, 2, 2, 1, 0,
++                               0, 1, 6, 0, 0, 400, 15, 180, 4, 338, 34, 7, 4, 1)
++            tail = struct.pack(V2_FMT, fault, 0x3D if fault else 0, 53 if fault else 0, 3 if fault else 0,
++                               1000000 if fault else 0, 7, 1, 6, 0, 0, 759 if fault else 0,
++                               fault, 0, 0, fault, 0, 0, 1, 0, 0, 0x3D, 3, 140, 0,
++                               1000000 if fault else 0, 3000000, 0)
++            return bytes(head + tail)[:data_or_len]
+         return None
+ 
+     def read(self, ep, n, timeout=0):
+@@ -38,8 +56,8 @@ class FakeDev:
+         raise USBTimeoutError("timeout")
+ 
+ 
+-def run(stop_by_sigint):
+-    dev = FakeDev()
++def run(stop_by_sigint, v2=True):
++    dev = FakeDev(v2)
+     core = types.ModuleType("usb.core")
+     core.USBError, core.USBTimeoutError = USBError, USBTimeoutError
+     core.find = lambda **kw: dev
+@@ -54,7 +72,10 @@ def run(stop_by_sigint):
+     else:
+         threading.Timer(4.0, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+     t0 = time.time()
+-    rc = fr_ts_logger.main(argv)
++    buf = io.StringIO()
++    with contextlib.redirect_stdout(buf):
++        rc = fr_ts_logger.main(argv)
++    text = buf.getvalue()
+     reqs = [(r[2], r[3]) for r in dev.log if r[1] == 0x40]
+     print("rc", rc, "out-requests:", reqs)
+     ok = True
+@@ -67,11 +88,24 @@ def run(stop_by_sigint):
+     ok &= all(r != (0xA3, 1) for r in reqs[last_off:])                    # nothing re-enables
+     ok &= any(r[1] == 0xC0 and r[2] == 0xA4 for r in dev.log)             # stats read
+     ok &= time.time() - t0 < 10
++    lens = [r[4] for r in dev.log if r[1] == 0xC0 and r[2] == 0xA4]
++    ok &= all(n == 128 for n in lens)                                     # v2 request length
++    n_ff = text.count("EMU FAULT ")
++    if v2:
++        ok &= n_ff == 1 and dev.n_stats >= 3                              # printed once, not per read
++        line = [l for l in text.splitlines() if l.startswith("EMU FAULT ")][0]
++        ok &= "slot=0x3D cycle=53" in line and "detail=759" in line and "sent=7" in line
++        ok &= "first FAULT 1" in text and "late[busy=0 fire=0 short=1" in text
++        print(line)
++    else:
++        ok &= n_ff == 0 and "state=ACTIVE" in text
+     return ok
+ 
+ 
+ if __name__ == "__main__":
+     a = run(False)
+     b = run(True)
+-    print("test_logger_emulate: %s" % ("all OK" if a and b else "FAIL (duration %s, sigint %s)" % (a, b)))
+-    sys.exit(0 if a and b else 1)
++    c = run(False, v2=False)
++    print("test_logger_emulate: %s" % ("all OK" if a and b and c else
++                                       "FAIL (duration %s, sigint %s, v1 device %s)" % (a, b, c)))
++    sys.exit(0 if a and b and c else 1)
+diff --git a/tools/ts_capture/fr_ts_logger.py b/tools/ts_capture/fr_ts_logger.py
+index 5a94870..50bc8fb 100644
+--- a/tools/ts_capture/fr_ts_logger.py
++++ b/tools/ts_capture/fr_ts_logger.py
+@@ -23,7 +23,9 @@ emulator's FR1 transmitter is enabled (vendor request 0xa3: 0 = clear, then 1).
+ The enable is repeated every couple of seconds as a keepalive (the firmware
+ switches TX off by itself if it hears nothing for 20 s), the emulator counters
+ (vendor request 0xa4) are printed with every status line as "emu: ...", and TX
+-is disabled again on exit, Ctrl-C or any error.
++is disabled again on exit, Ctrl-C or any error. With the v1b firmware the 0xa4
++stats also carry the first fault (code, slot, cycle, time, counters at the fault)
++and per-reason late counters; the first fault is printed once as "EMU FAULT ...".
+ """
+ import argparse
+ import csv
+@@ -244,12 +246,20 @@ def live(args):
+     def emu_set(v):
+         ctrl_out(frts.REQ_SET_EMU, v)
+ 
++    emu_fault_seen = {"key": None}
++
+     def emu_line():
+         try:
+-            return frts.fmt_emu(frts.parse_emu_stats(
+-                dev.ctrl_transfer(0xC0, frts.REQ_GET_EMU, 0, 0, 64, timeout=1000)))
++            d = frts.parse_emu_stats(dev.ctrl_transfer(0xC0, frts.REQ_GET_EMU, 0, 0, frts.EMU_STATS_LEN, timeout=1000))
+         except usb.core.USBError:
+             return "(emu stats read failed)"
++        ff = frts.fmt_emu_first_fault(d)
++        if ff:   # printed once per first-fault record
++            key = (d["ff_code"], d["ff_us"])
++            if key != emu_fault_seen["key"]:
++                emu_fault_seen["key"] = key
++                print("EMU %s (logger t=%+.1fs)" % (ff, time.time() - t_start - d["ff_age_s"]))
++        return frts.fmt_emu(d)
+ 
+     emu_on = False
+     next_keepalive = 0.0
+@@ -292,6 +302,7 @@ def live(args):
+                     emu_set(1)
+                 except usb.core.USBError:
+                     print("emu: keepalive failed (USB)", file=sys.stderr)
++                emu_line()   # prints "EMU FAULT ..." as soon as a first fault appears
+             if now >= next_status:
+                 rate = (lg.n_fr - last_n) / max(1e-6, now - last_t)
+                 last_n, last_t = lg.n_fr, now
+diff --git a/tools/ts_capture/frts.py b/tools/ts_capture/frts.py
+index db04dc6..1749c66 100644
+--- a/tools/ts_capture/frts.py
++++ b/tools/ts_capture/frts.py
+@@ -42,8 +42,12 @@ CSV_COLUMNS = [
+ CAN_CSV_COLUMNS = ["t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s"]
+ 
+ 
+-EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h
++EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h (v1 layout = first 64 bytes of v2)
+ assert EMU_STATS_STRUCT.size == 64
++EMU_STATS_V2_STRUCT = struct.Struct("<4B6Ii4B5H2BhH3I")  # bytes 64..127 (v2, firmware v1b)
++assert EMU_STATS_V2_STRUCT.size == 64
++EMU_STATS_LEN = 128   # request this many; a v1 firmware answers 64
++EMU_LATE_REASONS = ("busy", "fire", "short", "win", "missed")
+ EMU_STATES = {0: "disabled", 1: "no-lock", 2: "arming", 3: "ACTIVE", 4: "FAULT"}
+ EMU_FAULTS = {0: "none", 1: "TX state machine stuck", 2: "DDE frame seen that we did not send (DDE still connected?)",
+               3: "own frames not seen on FR1 RX (wiring / transceiver?)"}
+@@ -57,9 +61,30 @@ def parse_emu_stats(raw):
+              echo_err_avg_ns=v[15], echo_err_maxabs_ns=v[16], fire_err_avg_ns=v[17], loop_delay_ns=v[18],
+              fire_k_ticks=v[19], tss_bits=v[20], flags=v[21], rearms=v[22])
+     d["locked"] = bool(d["flags"] & 4)
++    d["v2"] = False
++    if d["version"] >= 2 and len(raw) >= 128:
++        w = EMU_STATS_V2_STRUCT.unpack(bytes(raw[64:128]))
++        d.update(v2=True, ff_code=w[0], ff_slot=w[1], ff_cycle=w[2], ff_flags=w[3], ff_us=w[4],
++                 ff_sent_total=w[5], ff_late=w[6], ff_echo_ok=w[7], ff_echo_miss=w[8], ff_foreign=w[9],
++                 ff_detail=w[10], fault_count=w[11], auto_clears=w[12], latched=w[13], last_fault=w[14],
++                 late_reason=list(w[15:20]), last_late_slot=w[20], last_late_reason=w[21], last_late_r=w[22],
++                 echo_dup=w[23], last_fault_us=w[24], now_us=w[25])
++        d["ff_age_s"] = ((d["now_us"] - d["ff_us"]) & 0xFFFFFFFF) / 1e6
+     return d
+ 
+ 
++def fmt_emu_first_fault(d):
++    """One-line first-fault record (v2 stats), '' when there is none."""
++    if not d.get("v2") or not d["ff_code"]:
++        return ""
++    return ("FAULT %d \"%s\" slot=0x%02X cycle=%d %.3f s ago detail=%d | at the fault: sent=%d late=%d "
++            "echo ok=%d miss=%d foreign=%d%s%s" % (
++                d["ff_code"], EMU_FAULTS.get(d["ff_code"], "?"), d["ff_slot"], d["ff_cycle"], d["ff_age_s"],
++                d["ff_detail"], d["ff_sent_total"], d["ff_late"], d["ff_echo_ok"], d["ff_echo_miss"],
++                d["ff_foreign"], " locked" if d["ff_flags"] & 1 else " not-locked",
++                " tx-in-flight" if d["ff_flags"] & 2 else ""))
++
++
+ def fmt_emu(d):
+     s = "state=%s%s sent[%s] lock_losses=%d rearms=%d late=%d echo ok=%d miss=%d foreign=%d " \
+         "echo_err avg=%+dns max=%dns fire_err=%+dns loop=%dns K=%d tss=%d%s%s" % (
+@@ -70,6 +95,19 @@ def fmt_emu(d):
+             d["fire_k_ticks"], d["tss_bits"], " SYNC_BITS" if d["flags"] & 1 else "", " DYN_5C" if d["flags"] & 2 else "")
+     if d["fault"]:
+         s += " | FAULT %d: %s" % (d["fault"], EMU_FAULTS.get(d["fault"], "?"))
++        if d.get("v2"):
++            s += " (%s)" % ("LATCHED until restart" if d["latched"] else "auto re-arm after 2 s quiet")
++    if d.get("v2"):
++        if any(d["late_reason"]):
++            s += " | late[%s] last=0x%02X/%s r=%d" % (
++                " ".join("%s=%d" % (n, c) for n, c in zip(EMU_LATE_REASONS, d["late_reason"])),
++                d["last_late_slot"], EMU_LATE_REASONS[d["last_late_reason"] - 1] if 1 <= d["last_late_reason"] <= 5
++                else d["last_late_reason"], d["last_late_r"])
++        if d["fault_count"] or d["auto_clears"]:
++            s += " | faults=%d auto_clears=%d" % (d["fault_count"], d["auto_clears"])
++        ff = fmt_emu_first_fault(d)
++        if ff:
++            s += " | first " + ff
+     return s
+ 
+ 
+-- 
+2.47.3
+
