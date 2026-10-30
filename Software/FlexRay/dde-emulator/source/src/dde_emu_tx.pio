@@ -1,0 +1,56 @@
+; DDE emulator transmitter (pio0, 100 MHz = 10 PIO cycles per FlexRay bit).
+;
+; dde_emu_tx drives FR1 TXEN (set pin 0 = GP27) and TXD (set pin 1 / out pin = GP28).
+; The CPU preloads a whole frame into the joined 8-word TX FIFO:
+;   w0 = (tss_bits - 2) << 16 | (nbytes - 1)
+;   w1 = DTS low bits - 2 (0 = static frame, no DTS; dynamic needs >= 3 bits)
+;   w2.. = frame bytes (header, payload, frame CRC), MSB first, 4 per word
+; then the program waits for PIO irq 5, which dde_emu_fire raises at the exact
+; requested 10 ns tick. Idle: TXEN = 1 (transmitter off), TXD = 1.
+; Frame on the wire: TSS | FSS | (BSS + 8 data bits) x nbytes | FES [| DTS].
+
+.program dde_emu_tx
+.out 1 left auto 32
+.set 2
+.wrap_target
+public idle:
+    out x, 16               ; TSS bits - 2          (blocks here while the FIFO is empty)
+    out y, 16               ; byte count - 1
+    out isr, 32             ; DTS word, kept in ISR
+    wait 1 irq 5            ; fire (flag is cleared on proceed)
+    set pins, 0b00 [9]      ; TSS bit 1: TXEN low, TXD low
+tss:
+    jmp x-- tss [9]         ; TSS bits 2 .. tss_bits
+    set pins, 0b10 [9]      ; FSS
+byte:
+    set pins, 0b10 [9]      ; BSS high
+    set pins, 0b00 [8]      ; BSS low (9 + 1 cycles with the next set)
+    set x, 6
+bit:
+    out pins, 1 [8]         ; data bits 1..7
+    jmp x-- bit
+    out pins, 1 [8]         ; data bit 8 (9 + 1 cycles with the jmp)
+    jmp y-- byte
+    set pins, 0b00 [9]      ; FES low
+    set pins, 0b10 [7]      ; FES high (8 + 2 cycles with mov/jmp)
+    mov x, isr              ; x = DTS low bits - 2 (0 = static frame)
+    jmp !x done
+    set pins, 0b00 [9]      ; DTS low bit 1
+dts:
+    jmp x-- dts [9]         ; DTS low bits 2 .. n
+    set pins, 0b10 [9]      ; DTS high bit
+done:
+    set pins, 0b11          ; TXEN high: transmitter off
+.wrap
+
+; Fire timer: the CPU pushes a delay count read against the 100 MHz PWM counter;
+; the SM burns exactly count + 1 cycles and raises irq 5. Moves all fine timing
+; out of the CPU (no spin loop, no interrupt latency in the result).
+.program dde_emu_fire
+.out 32 left auto 32
+.wrap_target
+    out x, 32
+dly:
+    jmp x-- dly
+    irq set 5
+.wrap
