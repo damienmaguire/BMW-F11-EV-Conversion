@@ -23,7 +23,9 @@ emulator's FR1 transmitter is enabled (vendor request 0xa3: 0 = clear, then 1).
 The enable is repeated every couple of seconds as a keepalive (the firmware
 switches TX off by itself if it hears nothing for 20 s), the emulator counters
 (vendor request 0xa4) are printed with every status line as "emu: ...", and TX
-is disabled again on exit, Ctrl-C or any error.
+is disabled again on exit, Ctrl-C or any error. With the v1b firmware the 0xa4
+stats also carry the first fault (code, slot, cycle, time, counters at the fault)
+and per-reason late counters; the first fault is printed once as "EMU FAULT ...".
 """
 import argparse
 import csv
@@ -244,12 +246,20 @@ def live(args):
     def emu_set(v):
         ctrl_out(frts.REQ_SET_EMU, v)
 
+    emu_fault_seen = {"key": None}
+
     def emu_line():
         try:
-            return frts.fmt_emu(frts.parse_emu_stats(
-                dev.ctrl_transfer(0xC0, frts.REQ_GET_EMU, 0, 0, 64, timeout=1000)))
+            d = frts.parse_emu_stats(dev.ctrl_transfer(0xC0, frts.REQ_GET_EMU, 0, 0, frts.EMU_STATS_LEN, timeout=1000))
         except usb.core.USBError:
             return "(emu stats read failed)"
+        ff = frts.fmt_emu_first_fault(d)
+        if ff:   # printed once per first-fault record
+            key = (d["ff_code"], d["ff_us"])
+            if key != emu_fault_seen["key"]:
+                emu_fault_seen["key"] = key
+                print("EMU %s (logger t=%+.1fs)" % (ff, time.time() - t_start - d["ff_age_s"]))
+        return frts.fmt_emu(d)
 
     emu_on = False
     next_keepalive = 0.0
@@ -292,6 +302,7 @@ def live(args):
                     emu_set(1)
                 except usb.core.USBError:
                     print("emu: keepalive failed (USB)", file=sys.stderr)
+                emu_line()   # prints "EMU FAULT ..." as soon as a first fault appears
             if now >= next_status:
                 rate = (lg.n_fr - last_n) / max(1e-6, now - last_t)
                 last_n, last_t = lg.n_fr, now
