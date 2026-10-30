@@ -96,10 +96,22 @@ uint8_t DDE_RAM(dde_core_emu_indicators)(unsigned target, unsigned cycle, bool k
 
 unsigned DDE_RAM(dde_core_build_static)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync, uint8_t *out)
 {
+    return dde_core_build_static_ex(target, cycle, counter, keep_sync, false, out);
+}
+
+// Pre-ign content of the real DDE (run 4, Fred f11_emu2_dsc.md section 2):
+// 0x28 c%4==1 b3-b5 c1 17 7c (ign-on a7 79 9a), 0x29 c%4==3 b8 80 (ign-on 10).
+unsigned DDE_RAM(dde_core_build_static_ex)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
+                                           bool preign, uint8_t *out)
+{
     const unsigned plen = DDE_EMU_STATIC_PAYLOAD_BYTES;
     uint8_t ind = dde_core_emu_indicators(target, cycle, keep_sync);
     dde_core_header(ind, dde_emu_static_id[target], plen / 2u, cycle, out);
     memcpy(out + 5, dde_emu_static_payload[target][cycle & 63u], plen);
+    if (preign && (ind & 0x04u)) {
+        if (target == 1 && (cycle & 3u) == 1) { out[5 + 2] = 0xC1; out[5 + 3] = 0x17; out[5 + 4] = 0x7C; }
+        if (target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0x80;
+    }
     if (ind & 0x04u) dde_core_e2e_apply(out + 5, target, cycle, counter);
     uint32_t c = dde_core_frame_crc(out, 5u + plen);
     out[5 + plen] = (uint8_t)(c >> 16);
@@ -127,15 +139,19 @@ unsigned DDE_RAM(dde_core_build_dyn)(unsigned cycle, uint8_t *out)
 
 unsigned DDE_RAM(dde_core_pack)(const uint8_t *frame, unsigned nbytes, unsigned tss_bits, unsigned dts_bits, uint32_t *words)
 {
-    if (nbytes == 0 || (nbytes & 3u) || nbytes > DDE_MAX_FRAME_BYTES) return 0;
+    // nbytes % 4 == 2 is allowed (6-byte payload frames): the last word is
+    // padded; the TX SM then parks at idle+1 after the frame and the firmware
+    // restarts it (see tx_sm_idle_or_parked in dde_emu.c).
+    if (nbytes < 4 || (nbytes & 1u) || nbytes > DDE_MAX_FRAME_BYTES) return 0;
     if (tss_bits < 3 || tss_bits > 15) return 0;
     if (dts_bits != 0 && dts_bits < 3) return 0;
     words[0] = ((uint32_t)(tss_bits - 2u) << 16) | (nbytes - 1u);
     words[1] = dts_bits ? dts_bits - 2u : 0u;
     unsigned w = 2;
     for (unsigned i = 0; i < nbytes; i += 4) {
-        words[w++] = ((uint32_t)frame[i] << 24) | ((uint32_t)frame[i + 1] << 16) |
-                     ((uint32_t)frame[i + 2] << 8) | frame[i + 3];
+        uint32_t v = ((uint32_t)frame[i] << 24) | ((uint32_t)frame[i + 1] << 16);
+        if (i + 2 < nbytes) v |= ((uint32_t)frame[i + 2] << 8) | frame[i + 3];
+        words[w++] = v;
     }
     return w;
 }
@@ -242,4 +258,148 @@ bool DDE_RAM(dde_lock_poll)(dde_lock_t *l, uint32_t now_us)
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// v1c dynamic PDUs. Content from run 4/5 real DDE ign-on (engine off), Fred's
+// dde_dynamic_ignon_template.csv (v1c_rank_after_emu2 1..6).
+const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT] = {0xE6, 0xE8, 0xFB};
+
+const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU] = {
+    // Content = Fred's v1c spec (f11_emu2_dsc.md). Pre-ign: the real DDE (runs 4 and 5) sends
+    // the same layout before ign after a ~0.3 s start-up, except 0xFB L9 = 1f 00 ff 7f 00 f3 ff ff.
+    // id   slot           plen %8 kind               k     hi    hi_pre ign  period
+    {0xE6, DDE_DSLOT_E6, 8, 2, DDE_DYN_KIND_E2E,   0x04, 0x10, 0x10, 0, 200,
+     {0x00, 0x10, 0x80, 0x64, 0x45, 0x44, 0x23, 0x47}, {0x00, 0x10, 0x80, 0x64, 0x45, 0x44, 0x23, 0x47}, "E6"},
+    {0xFB, DDE_DSLOT_FB, 4, 5, DDE_DYN_KIND_CTR,   0x00, 0x40, 0x40, 0, 1000,
+     {0x40, 0x60, 0xF1, 0xFF}, {0x40, 0x60, 0xF1, 0xFF}, "FB5"},
+    {0xFB, DDE_DSLOT_FB, 6, 6, DDE_DYN_KIND_CTR,   0x00, 0xF0, 0xF0, 0, 40,
+     {0xF0, 0xFF, 0x47, 0x32, 0x00, 0xF0}, {0xF0, 0xFF, 0x47, 0x32, 0x00, 0xF0}, "FB7"},
+    {0xFB, DDE_DSLOT_FB, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 1000,
+     {0x1F, 0x00, 0x04, 0x00, 0x00, 0xF3, 0xFF, 0xFF}, {0x1F, 0x00, 0xFF, 0x7F, 0x00, 0xF3, 0xFF, 0xFF}, "FB9"},
+    {0xE8, DDE_DSLOT_E8, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 200,
+     {0x00, 0x00, 0x00, 0x9A, 0x29, 0xF3, 0x56, 0xF0}, {0x00, 0x00, 0x00, 0x9A, 0x29, 0xF3, 0x56, 0xF0}, "E89"},
+    {0xE8, DDE_DSLOT_E8, 4, 0, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 1, 1000,
+     {0x86, 0x78, 0xFE, 0xFE}, {0x86, 0x78, 0xFE, 0xFE}, "E85"},
+};
+
+int DDE_RAM(dde_core_dyn_pdu_for)(unsigned dslot, unsigned cycle)
+{
+    for (int p = 0; p < DDE_DYN_N_PDU; p++)
+        if (dde_dyn_pdu[p].dslot == dslot && dde_dyn_pdu[p].cyc_mod8 == (cycle & 7u)) return p;
+    return -1;
+}
+
+int DDE_RAM(dde_core_dyn_slot_of_id)(unsigned id)
+{
+    for (int s = 0; s < DDE_DYN_N_SLOT; s++) if (dde_dyn_slot_id[s] == id) return s;
+    return -1;
+}
+
+unsigned DDE_RAM(dde_core_build_dyn_pdu)(unsigned p, unsigned cycle, unsigned counter, bool preign, uint8_t *out)
+{
+    const dde_dyn_pdu_t *d = &dde_dyn_pdu[p];
+    const unsigned plen = d->plen;
+    dde_core_header(0x04u, d->id, plen / 2u, cycle, out);
+    uint8_t *pl = out + 5;
+    memcpy(pl, preign ? d->payload_pre : d->payload, plen);
+    uint8_t hi = preign ? d->hi_pre : d->hi;
+    if (d->kind == DDE_DYN_KIND_E2E) {
+        pl[1] = (uint8_t)(hi | (counter & 0x0Fu));
+        pl[0] = (uint8_t)(dde_core_crc8(&pl[1], plen - 1u) ^ d->k);
+    } else if (d->kind == DDE_DYN_KIND_CTR) {
+        pl[0] = (uint8_t)(hi | (counter & 0x0Fu));
+    }
+    uint32_t c = dde_core_frame_crc(out, 5u + plen);
+    out[5 + plen] = (uint8_t)(c >> 16);
+    out[6 + plen] = (uint8_t)(c >> 8);
+    out[7 + plen] = (uint8_t)c;
+    return 8u + plen;
+}
+
+// Run 5 fit (all senders): payload bytes -> minislots from the frame's AP to
+// the next frame's AP (frame end + idle detection, rounded up, + 2).
+unsigned DDE_RAM(dde_core_dyn_ms_used)(unsigned payload_bytes)
+{
+    switch (payload_bytes) {
+    case 2: case 4: return 4;
+    case 6: case 8: return 5;
+    case 14: return 6;
+    default: return 0;
+    }
+}
+
+unsigned dde_core_dyn_dts_bits(unsigned nbytes, unsigned tss_bits)
+{
+    // frame bits: TSS + FSS + 10 per byte + FES(2); 10 ticks per bit
+    uint32_t frame_q8 = (uint32_t)(tss_bits + 1u + 10u * nbytes + 2u) * 10u * 256u;
+    uint32_t m = (frame_q8 + 20u * 256u + DDE_DYN_MS_Q8 - 1u) / DDE_DYN_MS_Q8;   // >= 0.2 us DTS
+    uint32_t dts_q8 = m * DDE_DYN_MS_Q8 - frame_q8;
+    return dts_q8 / (10u * 256u);
+}
+
+int32_t DDE_RAM(dde_core_elapsed_ticks)(uint32_t us0, uint16_t fine0, uint32_t us1, uint16_t fine1)
+{
+    int32_t dus = (int32_t)(us1 - us0);
+    int32_t approx = dus * 100;                      // coarse ticks (+-100)
+    int32_t lo = (int32_t)(int16_t)(uint16_t)((uint32_t)fine1 - (uint32_t)fine0 - (uint32_t)approx);
+    return approx + lo;                              // exact mod 65536 near approx
+}
+
+void DDE_RAM(dde_dyn_track_start)(dde_dyn_track_t *t, unsigned cycle, bool mark_ok, uint8_t seq)
+{
+    t->active = true;
+    t->cycle = (uint8_t)cycle;
+    t->anchor_ok = mark_ok;
+    t->why = mark_ok ? DDE_DYN_OK : DDE_SKIP_NOANCHOR;
+    t->acc_seq = seq;
+    t->have_dyn = false;
+    t->last_k = 0;
+    t->last_id = 0;
+    t->last_ms = 0;
+    t->max_id = 0;
+}
+
+void DDE_RAM(dde_dyn_track_header)(dde_dyn_track_t *t, unsigned id, unsigned payload_bytes, bool mark_ok,
+                                   uint8_t seq, int64_t x_q8)
+{
+    if (!t->active) return;
+    if (id < DDE_DYN_FIRST_ID) {
+        // static frame: only extends the explained marks
+        if (mark_ok) {
+            if (!t->have_dyn && !t->anchor_ok && t->why == DDE_SKIP_NOANCHOR) { t->anchor_ok = true; t->why = 0; }
+            if (t->anchor_ok) t->acc_seq = seq;
+        } else if (t->anchor_ok) {
+            t->anchor_ok = false; t->why = DDE_SKIP_NOANCHOR;
+        }
+        return;
+    }
+    if (id > t->max_id) t->max_id = (uint16_t)id;
+    if (!mark_ok) { t->anchor_ok = false; t->why = DDE_SKIP_NOANCHOR; return; }
+    int64_t rel = x_q8 - DDE_DYN_BASE_Q8;
+    int64_t n = rel >= 0 ? (rel + DDE_DYN_MS_Q8 / 2) / DDE_DYN_MS_Q8 : -1;
+    int64_t frac = rel - n * DDE_DYN_MS_Q8;
+    if (n < (int64_t)(id - DDE_DYN_FIRST_ID) || n > 1000 || frac > DDE_DYN_GRID_TOL_Q8 || frac < -DDE_DYN_GRID_TOL_Q8) {
+        t->anchor_ok = false; t->why = DDE_SKIP_GRID; return;
+    }
+    unsigned k = dde_core_dyn_ms_used(payload_bytes);
+    if (!k) { t->anchor_ok = false; t->why = DDE_SKIP_LEN; return; }
+    t->have_dyn = true;
+    t->anchor_ok = true;
+    t->why = DDE_DYN_OK;
+    t->last_id = (uint16_t)id;
+    t->last_ms = (uint16_t)n;
+    t->last_k = (uint8_t)k;
+    t->acc_seq = seq;
+}
+
+int DDE_RAM(dde_dyn_predict)(const dde_dyn_track_t *t, unsigned id, unsigned *m_out)
+{
+    if (!t->active) return DDE_SKIP_NOANCHOR;
+    if (t->max_id >= id) return DDE_SKIP_PASSED;
+    if (!t->anchor_ok) return t->why ? t->why : DDE_SKIP_NOANCHOR;
+    unsigned m = t->have_dyn ? (unsigned)t->last_ms + t->last_k + (id - t->last_id - 1u) : id - DDE_DYN_FIRST_ID;
+    if (m > DDE_DYN_MS_LIMIT) return DDE_SKIP_LIMIT;
+    *m_out = m;
+    return DDE_DYN_OK;
 }

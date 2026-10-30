@@ -86,4 +86,87 @@ int dde_lock_on_ref(dde_lock_t *l, unsigned cycle, uint32_t cs_us);
 // Time-based check without references; returns true when the lock was just lost.
 bool dde_lock_poll(dde_lock_t *l, uint32_t now_us);
 
+
+// ---------------------------------------------------------------------------
+// v1c: DDE dynamic-segment PDUs (0xE6, 0xE8, 0xFB). Hand-written (the
+// generated dde_emu_tables.h stays byte-identical to gen_dde_tables.py).
+// Minislot grid fitted on the run 5 real DDE (16039 on-grid DDE frames):
+//   AP(m) = cycle start + DDE_DYN_BASE_Q8 + m * DDE_DYN_MS_Q8, residual +-0.26 us.
+#define DDE_DYN_MS_Q8 176017            // 6.87567 us per minislot, 1/256 ticks (10 ns)
+#define DDE_DYN_BASE_Q8 76879874        // minislot 0 (id 0x5C) = 0x07 ref + 2805.127 us
+#define DDE_DYN_FIRST_ID 0x5Cu
+#define DDE_DYN_MS_LIMIT 260u           // never TX beyond this minislot (run 5: DDE 0x142 30 B up to 275)
+#define DDE_DYN_GRID_TOL_Q8 (150 * 256) // a dynamic header must sit within 1.5 us of the grid
+
+enum { DDE_DYN_KIND_CONST = 0, DDE_DYN_KIND_E2E = 1, DDE_DYN_KIND_CTR = 2 };
+// PDU index order (also the stats order): E6, FB L5, FB L7, FB L9, E8 L9, E8 L5
+enum { DDE_PDU_E6 = 0, DDE_PDU_FB5, DDE_PDU_FB7, DDE_PDU_FB9, DDE_PDU_E89, DDE_PDU_E85, DDE_DYN_N_PDU };
+// Dynamic emulator slots (one frame ID each)
+enum { DDE_DSLOT_E6 = 0, DDE_DSLOT_E8, DDE_DSLOT_FB, DDE_DYN_N_SLOT };
+
+typedef struct {
+    uint16_t id;
+    uint8_t dslot;        // DDE_DSLOT_*
+    uint8_t plen;         // payload bytes (4, 6, 8)
+    uint8_t cyc_mod8;     // TX only in cycles with cycle % 8 == cyc_mod8
+    uint8_t kind;         // DDE_DYN_KIND_*
+    uint8_t k;            // E2E: crc8 xor constant (b1 = crc8(b2..bn) ^ k)
+    uint8_t hi;           // counter byte high nibble (ign-on)
+    uint8_t hi_pre;       // counter byte high nibble (pre-ign)
+    uint8_t ign_only;     // 1 = only after ign-on (+DDE_IGN_E8L5_CYCLES)
+    uint16_t period;      // cycles between transmissions
+    uint8_t payload[8];       // ign-on content (counter/crc bytes are overwritten)
+    uint8_t payload_pre[8];   // pre-ign content
+    const char *name;
+} dde_dyn_pdu_t;
+extern const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU];
+extern const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT];
+
+#define DDE_IGN_STATIC_CYCLES 12u       // switch to ign-on content 60 ms after the first 0x103 (DDE: 37-87 ms)
+#define DDE_IGN_E8L5_CYCLES 45u         // 0xE8 L5 starts 225 ms after the first 0x103
+
+// PDU of dynamic slot `dslot` due in `cycle` (by cycle % 8), -1 = none.
+int dde_core_dyn_pdu_for(unsigned dslot, unsigned cycle);
+int dde_core_dyn_slot_of_id(unsigned id);
+// Build the full frame (5 + plen + 3 bytes) of PDU p. counter 0..14. Returns bytes.
+unsigned dde_core_build_dyn_pdu(unsigned p, unsigned cycle, unsigned counter, bool preign, uint8_t *out);
+// Static frame with optional pre-ign content (0x28 c%4==1 b3-b5, 0x29 c%4==3 b8).
+unsigned dde_core_build_static_ex(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
+                                  bool preign, uint8_t *out);
+// Minislots a dynamic frame of `payload_bytes` occupies (0 = unknown length).
+unsigned dde_core_dyn_ms_used(unsigned payload_bytes);
+// DTS low bits so that the frame (TSS + bytes) plus DTS ends on a minislot action point.
+unsigned dde_core_dyn_dts_bits(unsigned nbytes, unsigned tss_bits);
+// Expected first-bit time of minislot m relative to cycle start (q8 ticks).
+static inline int32_t dde_core_dyn_ap_q8(unsigned m) { return DDE_DYN_BASE_Q8 + (int32_t)m * DDE_DYN_MS_Q8; }
+// Elapsed ticks from (us0, fine0) to (us1, fine1); us gives the coarse value,
+// fine (10 ns, u16) the exact one. Valid for |dt| < 300 ms.
+int32_t dde_core_elapsed_ticks(uint32_t us0, uint16_t fine0, uint32_t us1, uint16_t fine1);
+
+// Skip reasons (stats order: index reason-1)
+enum { DDE_DYN_OK = 0, DDE_SKIP_NOANCHOR = 1, DDE_SKIP_MARK, DDE_SKIP_PASSED, DDE_SKIP_LEN,
+       DDE_SKIP_GRID, DDE_SKIP_LIMIT, DDE_SKIP_LATE, DDE_SKIP_N = 8 };
+
+// Per-cycle dynamic-segment tracker. Fed with every FR1 header of the
+// current cycle (after the cycle's first reference). Certain = every frame
+// start (side-0 mark) since the anchor is explained by a decoded header.
+typedef struct {
+    bool active;
+    bool anchor_ok;
+    bool have_dyn;       // a dynamic frame anchors the prediction
+    uint8_t why;         // reason when !anchor_ok
+    uint8_t cycle;
+    uint8_t acc_seq;     // side-0 mark seq of the last explained frame
+    uint8_t last_k;
+    uint16_t last_id, last_ms;
+    uint16_t max_id;     // highest dynamic id seen this cycle (0 = none)
+} dde_dyn_track_t;
+void dde_dyn_track_start(dde_dyn_track_t *t, unsigned cycle, bool mark_ok, uint8_t seq);
+// x_q8 = mark time of this header relative to cycle start (q8 ticks), only
+// used for dynamic ids. mark_ok = this header's own side-0 mark was found.
+void dde_dyn_track_header(dde_dyn_track_t *t, unsigned id, unsigned payload_bytes, bool mark_ok,
+                          uint8_t seq, int64_t x_q8);
+// Predict the minislot for our frame id X. Returns DDE_DYN_OK or a skip reason.
+int dde_dyn_predict(const dde_dyn_track_t *t, unsigned id, unsigned *m_out);
+
 #endif

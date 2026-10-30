@@ -1,5 +1,7 @@
 // DDE emulator (PICO_FLEXRAY_DDE_EMU build): transmits the DDE's static frames
-// 0x26/0x28/0x29/0x3D on FR1 in the DDE's slots, timed from the car's own frames.
+// 0x26/0x28/0x29/0x3D on FR1 in the DDE's slots, timed from the car's own frames,
+// and (v1c) the dynamic frames 0xE6, 0xFB (L5/L7/L9) and 0xE8 (L9/L5) in their
+// minislots when the minislot is certain.
 // See Software/FlexRay/dde-emulator/README.md.
 #ifndef DDE_EMU_H
 #define DDE_EMU_H
@@ -7,13 +9,13 @@
 #include "dde_emu_core.h"
 
 #define PICOFLEX_SET_EMU   0xa3u   // vendor OUT, wValue 1 = enable/keepalive, 0 = disable + clear fault
-#define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 128 bytes: dde_emu_stats_t (first 64 = v1 layout)
+#define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 192 bytes: dde_emu_stats_t (first 64 = v1, 128 = v2 layout)
 
 // Pin used as the FR1 streamer's private frame-start mark (side-set) in the emu
 // build: GP25 = Pico 2 on-board LED, not on any header pin.
 #define DDE_EMU_MARK_PIN 25u
 
-#define DDE_EMU_STATS_VERSION 2u
+#define DDE_EMU_STATS_VERSION 3u
 enum {
     DDE_EMU_ST_DISABLED = 0,   // host has not enabled TX (boot state)
     DDE_EMU_ST_NO_LOCK  = 1,   // enabled, waiting for 8 good reference cycles
@@ -89,8 +91,25 @@ typedef struct __attribute__((packed)) {
     uint32_t last_fault_us;
     uint32_t now_us;                 // TIMER0 when these stats were taken
     uint32_t reserved;
+    // ---- v3 (bytes 128..191): v1c dynamic frames. A host asking for 128 bytes gets v2.
+    // PDU order: 0xE6 L9, 0xFB L5, 0xFB L7, 0xFB L9, 0xE8 L9, 0xE8 L5
+    uint32_t dyn_sent[DDE_DYN_N_PDU];
+    uint16_t dyn_skip[DDE_DYN_N_PDU];      // due but not sent in that cycle (retried 8 cycles later)
+    uint16_t dyn_skip_reason[DDE_SKIP_N - 1];   // DDE_SKIP_* 1..7: noanchor, mark, passed, len, grid, limit, late
+    uint16_t dyn_defer;              // final check found an unexplained frame start: not sent (re-planned if possible)
+    uint16_t dyn_last_ms[DDE_DYN_N_SLOT];   // minislot of the last TX: 0xE6, 0xE8, 0xFB
+    uint8_t ign;                     // bit0 0x103 seen since wake, bit1 ign-on content, bit2 0xE8 L5 allowed,
+                                     // bit3 0x103 seen within 500 ms
+    uint8_t dyn_flags;               // build: bit0 EMU_DYN_E6, bit1 EMU_DYN_FB, bit2 EMU_DYN_E8, bit3 EMU_PREIGN
+    uint16_t dyn_parks;              // TX SM restarts after 14-byte frames (expected, one per 0xFB L7)
+    uint16_t reserved3;
 } dde_emu_stats_t;
-_Static_assert(sizeof(dde_emu_stats_t) == 128, "emu stats size");
+_Static_assert(sizeof(dde_emu_stats_t) == 192, "emu stats size");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_sent) == 128, "v3 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_skip) == 152, "v3 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_skip_reason) == 164, "v3 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_defer) == 178, "v3 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, ign) == 186, "v3 layout");
 // offsets used by tools/ts_capture/frts.py (EMU_STATS_V2_STRUCT)
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, ff_code) == 64, "v2 layout");
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, ff_detail) == 92, "v2 layout");
@@ -99,6 +118,7 @@ _Static_assert(__builtin_offsetof(dde_emu_stats_t, late_reason) == 100, "v2 layo
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, last_late_r) == 112, "v2 layout");
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, now_us) == 120, "v2 layout");
 #define DDE_EMU_STATS_V1_SIZE 64u
+#define DDE_EMU_STATS_V2_SIZE 128u
 
 void dde_emu_early_pins(void);   // core0 setup_pins: all TXD/TXEN of FR1/FR2 = SIO output high
 void dde_emu_init_core1(void);   // core1, after setup_stream(): PIO0 TX + fire SMs, alarm IRQ
