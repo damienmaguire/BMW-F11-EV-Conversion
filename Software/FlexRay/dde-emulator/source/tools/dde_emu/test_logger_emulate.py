@@ -21,12 +21,14 @@ class USBTimeoutError(USBError):
 
 V1_FMT = "<4B5I6I3h2H2BI"
 V2_FMT = "<4B6Ii4B5H2BhH3I"
+V3_FMT = "<6I6H7HH3H2BHH"
 
 
 class FakeDev:
-    def __init__(self, v2=True):
+    def __init__(self, v2=True, v3=False):
         self.log = []
         self.v2 = v2
+        self.v3 = v3
         self.n_stats = 0
 
     def set_configuration(self):
@@ -42,13 +44,19 @@ class FakeDev:
                 return bytes(struct.pack(V1_FMT, 1, 3, 1, 0, 10, 20, 10, 10, 0,
                                          0, 0, 50, 0, 0, 400, -5, 30, 2, 180, 31, 7, 4, 1))[:data_or_len]
             fault = 1 if self.n_stats >= 2 else 0          # a fault appears from the 2nd read on
-            head = struct.pack(V1_FMT, 2, 4 if fault else 3, 1, fault, 2, 2, 2, 1, 0,
+            if self.v3:
+                fault = 0
+            head = struct.pack(V1_FMT, 3 if self.v3 else 2, 4 if fault else 3, 1, fault, 2, 2, 2, 1, 0,
                                0, 1, 6, 0, 0, 400, 15, 180, 4, 338, 34, 7, 4, 1)
             tail = struct.pack(V2_FMT, fault, 0x3D if fault else 0, 53 if fault else 0, 3 if fault else 0,
                                1000000 if fault else 0, 7, 1, 6, 0, 0, 759 if fault else 0,
                                fault, 0, 0, fault, 0, 0, 1, 0, 0, 0x3D, 3, 140, 0,
                                1000000 if fault else 0, 3000000, 0)
-            return bytes(head + tail)[:data_or_len]
+            if self.v3:   # v1c firmware: 192 bytes
+                dyn = struct.pack(V3_FMT, 50, 11, 250, 10, 50, 10, 0, 0, 0, 0, 0, 0, *([0] * 7), 0,
+                                  138, 148, 163, 7, 15, 250, 0)
+                return bytes(head + tail + dyn)[:data_or_len]
+            return bytes(head + tail)[:min(data_or_len, 128)]   # v1b firmware: 128 bytes max
         return None
 
     def read(self, ep, n, timeout=0):
@@ -56,8 +64,8 @@ class FakeDev:
         raise USBTimeoutError("timeout")
 
 
-def run(stop_by_sigint, v2=True):
-    dev = FakeDev(v2)
+def run(stop_by_sigint, v2=True, v3=False):
+    dev = FakeDev(v2, v3)
     core = types.ModuleType("usb.core")
     core.USBError, core.USBTimeoutError = USBError, USBTimeoutError
     core.find = lambda **kw: dev
@@ -89,9 +97,13 @@ def run(stop_by_sigint, v2=True):
     ok &= any(r[1] == 0xC0 and r[2] == 0xA4 for r in dev.log)             # stats read
     ok &= time.time() - t0 < 10
     lens = [r[4] for r in dev.log if r[1] == 0xC0 and r[2] == 0xA4]
-    ok &= all(n == 128 for n in lens)                                     # v2 request length
+    ok &= all(n == 192 for n in lens)                                     # v3 request length
     n_ff = text.count("EMU FAULT ")
-    if v2:
+    if v3:
+        ok &= n_ff == 0 and "dyn[E6=50 FB5=11 FB7=250 FB9=10 E8L9=50 E8L5=10] ms[E6=138 E8=148 FB=163] ign=on" in text
+        ok &= "skip[" not in text and "parks=" not in text
+        print([l for l in text.splitlines() if "dyn[" in l][0])
+    elif v2:
         ok &= n_ff == 1 and dev.n_stats >= 3                              # printed once, not per read
         line = [l for l in text.splitlines() if l.startswith("EMU FAULT ")][0]
         ok &= "slot=0x3D cycle=53" in line and "detail=759" in line and "sent=7" in line
@@ -106,6 +118,7 @@ if __name__ == "__main__":
     a = run(False)
     b = run(True)
     c = run(False, v2=False)
-    print("test_logger_emulate: %s" % ("all OK" if a and b and c else
-                                       "FAIL (duration %s, sigint %s, v1 device %s)" % (a, b, c)))
-    sys.exit(0 if a and b and c else 1)
+    d = run(False, v3=True)
+    print("test_logger_emulate: %s" % ("all OK" if a and b and c and d else
+                                       "FAIL (duration %s, sigint %s, v1 device %s, v1c device %s)" % (a, b, c, d)))
+    sys.exit(0 if a and b and c and d else 1)
