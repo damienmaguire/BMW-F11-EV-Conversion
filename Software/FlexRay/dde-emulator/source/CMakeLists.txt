@@ -70,11 +70,16 @@ option(PICO_FLEXRAY_DDE_EMU "Build the DDE emulator: transmit the DDE static fra
 set(EMU_SYNC_BITS 0 CACHE STRING "1 = keep the DDE sync/startup bits on 0x3D (UNSAFE, UNTESTED)")
 set(EMU_DYN_5C 0 CACHE STRING "1 = also send the dynamic frame 0x5C (minislot 0, cycles 1 mod 16; UNTESTED)")
 set(EMU_TSS_BITS 7 CACHE STRING "Transmitted TSS length in bits (3..15)")
+set(EMU_DYN_E6 1 CACHE STRING "1 = send dynamic 0xE6 L9 (DT_PT_2, every 200 cycles, cycle%8==2)")
+set(EMU_DYN_FB 1 CACHE STRING "1 = send dynamic 0xFB L5/L7/L9 (cycle%8 5/6/3, every 1000/40/1000 cycles)")
+set(EMU_DYN_E8 1 CACHE STRING "1 = send dynamic 0xE8 L9/L5 (cycle%8 3/0, every 200/1000 cycles, L5 after ign)")
+set(EMU_PREIGN 1 CACHE STRING "1 = pre-ign content until 60 ms after the first 0x103")
 if (PICO_FLEXRAY_DDE_EMU)
     target_sources(pico_flexray PRIVATE src/dde_emu.c src/dde_emu_core.c)
     pico_generate_pio_header(pico_flexray ${CMAKE_CURRENT_LIST_DIR}/src/dde_emu_tx.pio)
     target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_DDE_EMU=1
-        EMU_SYNC_BITS=${EMU_SYNC_BITS} EMU_DYN_5C=${EMU_DYN_5C} EMU_TSS_BITS=${EMU_TSS_BITS})
+        EMU_SYNC_BITS=${EMU_SYNC_BITS} EMU_DYN_5C=${EMU_DYN_5C} EMU_TSS_BITS=${EMU_TSS_BITS}
+        EMU_DYN_E6=${EMU_DYN_E6} EMU_DYN_FB=${EMU_DYN_FB} EMU_DYN_E8=${EMU_DYN_E8} EMU_PREIGN=${EMU_PREIGN})
     if (EMU_SYNC_BITS)
         message(WARNING "EMU_SYNC_BITS=1: the emulator will claim to be a sync/startup node. UNSAFE, UNTESTED.")
     endif()

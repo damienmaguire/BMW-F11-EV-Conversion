@@ -1,17 +1,144 @@
 # DDE emulator for the F11 EV conversion (pico-flexray V1)
 
-> **Status: v1b, not yet tested on the car.** v1 was tested once (car test 1):
-> it locked and sent in the right slots, but a false "TX state machine stuck"
-> fault stopped it in cycle 53 and 0x3D never reached the bus (see
-> [Changelog](#changelog)). v1b fixes that. It builds, and every offline test,
-> including a replay of the car test 1 capture, passes. Do the next test exactly as
-> described under [Test procedure](#test-procedure-in-the-car).
+> **Status: v1c, not yet tested on the car.** Car test 2 (v1b) showed the
+> static frames are now right: their DTCs are gone and there was no emulator
+> fault. But the DSC still degraded at ign + 1.15 s, and the remaining DTCs
+> name the DDE's **dynamic** frames 0xE6, 0xFB and 0xE8. v1c adds those three
+> frames and the pre-ign static values. It builds, and every offline test passes,
+> including replays of car tests 1 and 2 and a byte/timing comparison with the
+> real DDE in run 5. Do the next test exactly as described under
+> [Test procedure](#test-procedure-in-the-car).
 
-Firmware: `firmware/pico_flexray_dde_emu_v1b_ignon.uf2` (V1 board, Pico 2 / RP2350).
-SHA-256 is in `firmware/SHA256SUMS`. `pico_flexray_dde_emu_v1_ignon.uf2` is the
-old v1 and is kept only for reference: do not use it.
+Firmware: `firmware/pico_flexray_dde_emu_v1c_ignon.uf2` (V1 board, Pico 2 / RP2350).
+SHA-256 is in `firmware/SHA256SUMS`. The v1b and v1 UF2s are kept only for
+reference: do not use them.
 
 ## Changelog
+
+### v1c (after car test 2)
+
+**What car test 2 (v1b) showed** (full report: `flexray-re-notes/analysis/f11_emu_run2.md`):
+
+- **The statics are fixed.** 0x26/0x28/0x29/0x3D went out every cycle from
+  0.18 s after wake, with correct E2E and counters. The pico reported
+  `echo ok=40028 miss=0 foreign=0 late=0`, no fault. All of car test 1's
+  static-frame DTCs (TORQ_CRSH_1, WMOM_DRV_*) are gone, and 0x107 b3 goes to 03 as
+  with the real DDE.
+- **DSC still degraded.** 0x2F b4 went 0e→06 at ign + 1.15 s, and b5 stayed 30.
+  With the real DDE, b4 = 02 and b5 = 20 at ign + 1.05 s.
+- **The remaining DTCs** (DSC, ICM, EPS) all name dynamic DDE frames:
+  - DT_PT_2 (0xE6), first at ign + 1.53 s;
+  - DT_PT_3 and voltage (0xFB);
+  - ST_ENERG_GEN and SPEC_PWR_EL (0xE8).
+- **Two limits of the run:**
+  - It was not a fully cold wake.
+  - The log stopped 15 s after ign off, so bus sleep could not be checked.
+
+**Changes in v1c:**
+
+- **Dynamic frames on FR1.** They use the same transmitter, pins and safety
+  rules as the statics. Content is the real DDE's (Fred's v1c spec, from runs 4
+  and 5); periods and cycle filters are listed below.
+
+  | Frame | Payload sent | Every | Cycle |
+  |---|---|---|---|
+  | 0xE6 DT_PT_2 | `CRC 1c 80 64 45 44 23 47` (E2E, K=04) | 1 s (200 cycles) | %8 = 2 |
+  | 0xFB L5 DT_PT_3 | `4c 60 f1 ff` | 5 s | %8 = 5 |
+  | 0xFB L7 voltage | `Fc ff 47 32 00 f0` | 200 ms | %8 = 6 |
+  | 0xFB L9 | `1f 00 04 00 00 f3 ff ff` (pre-ign `1f 00 ff 7f 00 f3 ff ff`) | 5 s | %8 = 3 |
+  | 0xE8 L9 ST_ENERG_GEN | `00 00 00 9a 29 f3 56 f0` | 1 s | %8 = 3 |
+  | 0xE8 L5 SPEC_PWR_EL | `86 78 fe fe`, only from 225 ms after ign on | 5 s | %8 = 0 |
+
+  `c` is a counter that runs 0..14 (never 15). It starts at 1 after each wake.
+
+  Not sent: 0x5C, 0x142, 0x10A, 0x68, 0x88, and the second 0xE6 buffer (base 1).
+- **Dynamic-segment tracking, and skip when unsure.** In the dynamic segment, a
+  frame's position depends on which other ECUs sent before it in that cycle.
+  - Every FR1 header is placed on the minislot grid (6.876 µs per minislot,
+    fitted on run 5). The firmware then predicts the minislot for 0xE6/0xE8/0xFB.
+  - It sends **only** if every frame before ours in that cycle is explained,
+    with a known length and on the grid, and the minislot is ≤ 260.
+  - This is checked again about 4 µs before TX. If anything is unexplained (an
+    undecoded frame, a missed header, an unknown length), the frame is skipped
+    for that cycle, the reason is counted, and it is retried 8 cycles later.
+- **Pre-ign statics.** 0x28 c1 b3–b5 = `c1 17 7c` and 0x29 c3 b8 = `80` until
+  60 ms after the first 0x103 (ign on), then the ign-on values, as the real DDE
+  does (40–90 ms).
+- **Stats v3** (`0xa4`, 192 bytes; the first 128 bytes are the v2 layout) add sent
+  and skip counts per dynamic frame, skip reasons, the last minislots and the
+  ign state. They are shown on the logger's `emu:` line (see the table below).
+  The old logger still works with v1c but does not show them.
+- **Build switches** `EMU_DYN_E6`, `EMU_DYN_FB`, `EMU_DYN_E8` and `EMU_PREIGN`
+  (all on).
+- **Unchanged from v1b:**
+  - the fault behaviour;
+  - static timing and content after ign on.
+
+**Cycle filters: capture versus DDE flash.** Three sources were compared, and
+they agree:
+
+- **The DDE flash** (Ian's decode, `dde_flash_eray_config.md`) gives base/rep
+  filters:
+  - 0xE6 0/2;
+  - 0xE8 L9 1/2, L5 0/2;
+  - 0xFB L5 1/4, L7 2/4, L9 3/4.
+- **Fred's template** gives cycle%8 values. Each one lies inside the flash's
+  base/rep class.
+- **The run 5 real-DDE capture** shows these cycle%8 values:
+  - 0xE6 0, 2, 4, 6 (even);
+  - 0xE8 L9 3, 5, 7 (odd) and L5 0, 2, 6 (even);
+  - 0xFB L5 1, 5, L7 2, L9 3, 7.
+
+  All of them fit the flash filters.
+
+There was nothing to correct, so v1c keeps the template values. The %8 phase
+is only where the DDE's period happens to fall; the flash allows any cycle of
+the class. The emulator retries a skipped frame 8 cycles later, so it never leaves
+its class.
+
+**Cross-check with the DDE flash** (Ian's decode; host test `test_dyn_flash`):
+
+- **E2E.** 0xE6 is the only dynamic frame with a CRC. It uses data ID 0x37,
+  CRC8 poly 0x1D, init 0 and xorout 0. The K=04 the emulator uses equals the
+  CRC of (ID 0x37 + zeros). Every 0xE6 we can send carries exactly the DDE's
+  CRC. The same check against the flash data IDs and CRC lengths passes for all
+  nine static E2E groups.
+- **No CRC on 0xE8 or 0xFB.**
+- **Unused bits are 1** in every frame we send (0xFF fill, LSB-first).
+- **Substitute values.** The 0xFB L7 12-bit field stays at its substitute
+  0xFFF. The high nibble of 0xFB L5 b1 is part of a 12-bit value (0x604), not
+  part of the counter.
+- **Periods** are 1 s, 5 s and 200 ms, as in the flash.
+- **No init images in flash.** Replaying capture payloads is the right model.
+
+**Channel.** The DDE is configured for FlexRay channel A only. The "FR1/FR2" in
+the captures are the pico's two ports, not FlexRay channels A/B. In run 5 the
+real DDE sat on the pico's FR2 port and the car on FR1. The emulator sends the
+dynamic frames through the same state machine and the same FR1 pins (TXD/TXEN
+FR_1) as the statics, which car test 2 proved reach the car.
+
+**Evidence (offline, `tests/host/run.sh`):**
+
+- **Bytes against run 5's real-DDE frames.**
+  - E2E: 273/273 frames.
+  - Counters: 1506/1506.
+  - FB L5, FB L9 and E8 L5 match exactly.
+  - Cycle classes match.
+  - Fields that vary between runs (0xE6 temperatures, the 0xFB voltage, 0xE8
+    current) are frozen at the spec values.
+- **Tracker against the whole run 5 bus.** 63 400 minislot predictions:
+  - 98.6 % exact;
+  - the rest later than predicted, all capture gaps;
+  - **none earlier** (earlier would mean a collision).
+- **Replays.** v1c runs on the PC against the car-side timing of car tests 1
+  and 2 (460 and 381 dynamic frames):
+  - grid error ≤ 0.03 µs;
+  - no overlap;
+  - bytes, counters, periods and pre-ign statics correct.
+- **Unsure cases.** Car test 2 was replayed with injected unexplained frames,
+  unknown lengths and missing anchors. 0xE6 is never sent in those cycles.
+- **Timing against the real DDE (run 5).** 92 % of 2746 frames land at the same
+  minislot and time. The rest are FR2 or capture artefacts. None is off-grid.
 
 ### v1b (after car test 1)
 
@@ -78,9 +205,13 @@ the DDE:
 
 - On **FR1** (the car side), it sends the DDE's static frames **0x26, 0x28, 0x29
   and 0x3D** in the DDE's own slots, every cycle.
-- The content is a replay of the DDE's frames recorded in run 5 with **ignition on
-  and the engine off**. There is one recorded frame per slot and per cycle
-  (cycle 0..63).
+- **v1c:** it also sends the DDE's dynamic frames **0xE6, 0xE8 and 0xFB**
+  (see the v1c changelog for content and timing). It sends them only in cycles
+  where it is sure of their position. Otherwise it skips that cycle.
+- The static content is a replay of the DDE's frames recorded in run 5 with
+  **ignition on and the engine off**. There is one recorded frame per slot and
+  per cycle (cycle 0..63). Until 60 ms after ign on, 0x28 and 0x29 carry the
+  real DDE's pre-ign values.
 - Every frame gets the current cycle number, a live alive-counter, a recomputed
   E2E checksum and recomputed header and frame CRCs, so it looks freshly made.
 - It also keeps the timestamped capture, so `fr_ts_logger.py` records the whole
@@ -88,20 +219,19 @@ the DDE:
 
 What it does **not** do:
 
-- **No dynamic frames.** The DDE also sends 0x5C, 0xE6, 0xE8, 0xFB, 0x142, 0x68,
-  0x10A and 0xBE in the dynamic segment. Their position depends on counting
-  minislots, and the pico misses about 2 % of frames, which makes that count
-  unreliable. A wrong count means a collision with another ECU.
-  - Only 0x5C (minislot 0, the first dynamic slot) can be placed without
-    counting. It is behind a build option, `EMU_DYN_5C=1`, which is **off** in
-    the shipped UF2.
+- **Some dynamic frames are not sent:** 0x5C, 0x142, 0x10A, 0x68 and 0xBE.
+  - 0x5C (minislot 0) is behind a build option, `EMU_DYN_5C=1`, which is **off**
+    in the shipped UF2.
+  - The flash also configures 0x88 and a second 0xE6 buffer. Neither has ever been
+    seen on the bus, so neither is emulated.
 - It does not start the bus or keep it awake by itself. It only transmits while
   it hears the car's own frames.
 - It never transmits on FR2, and it does not forward FR1 to FR2 (this is not a
   repeater build).
 - It does not use relays or any 12 V logic. GP17/GP18 are set exactly as in the
   stock firmware.
-- It does not follow vehicle state: it always sends "ign on, engine off".
+- It does not follow vehicle state. It sends "ign on, engine off", apart from
+  the pre-ign values before the first 0x103.
 
 ## How it works
 
@@ -179,6 +309,12 @@ Counters on the logger's `emu:` line:
 | `echo_err` | timing error of our frames, ns |
 | `fire_err`, `loop`, `K` | calibration values |
 | `tss` | TSS length in bits |
+| `dyn[E6= FB5= FB7= FB9= E8L9= E8L5=]` | v1c: dynamic frames sent. Per 5 s line with ign on, expect about +5 / +1 / +25 / +1 / +5 / +1 |
+| `ms[E6= E8= FB=]` | v1c: minislot of the last dynamic frame sent (run 2: 138 / 148 / 163) |
+| `ign=` | v1c: `off` (no 0x103 yet), `seen`, or `on` (ign-on content) |
+| `skip[...] why[anchor mark passed len grid limit late] defer=` | v1c: dynamic frames held back because the position was not certain, by reason. A few are normal. Many in a row for one frame mean it is not reaching the car |
+| `parks` | v1c: only shown if it differs from the FB L7 count (each 6-byte FB L7 restarts the TX state machine, which is expected) |
+| `build=0x..` | v1c: only shown if a dynamic frame was switched off at build time |
 
 When a first fault appears, the logger prints it once, for example:
 
@@ -199,14 +335,15 @@ silent.
 ## Files
 
 ```
-firmware/                 v1b UF2 (use this), old v1 UF2, SHA256SUMS
-tools/                    laptop tools: fr_ts_logger.py (with --emulate), frts.py, reset_to_bootloader.py
+firmware/                 v1c UF2 (use this), old v1b and v1 UF2s, SHA256SUMS
+tools/                    laptop tools: fr_ts_logger.py (with --emulate), frts.py (v1c: reads stats v3), reset_to_bootloader.py
 source/                   complete firmware source tree (dde-emulator branch) incl. tests and generator
   src/dde_emu*.{c,h,pio}  emulator firmware (dde_emu_tables.h is generated)
   tools/dde_emu/          table generator, Python model, test_dde_emu.py, test_logger_emulate.py
+                          extract_replay.py (replay vectors from a logger CSV), extract_dyn.py (dynamic frames)
   tests/host/             C host tests (run.sh), incl. test_dde_emu_core.c + captured vectors
-                          test_dde_emu_replay.c: dde_emu.c replayed against car test 1 timing (emu_stubs/, emu_run1_fr1_1600ms.txt)
-  tools/dde_emu/extract_replay.py  makes the replay vectors from a logger CSV
+                          test_dde_emu_replay.c: dde_emu.c replayed against car tests 1/2 timing
+                          dde_dyn_run5.txt: the real DDE's dynamic frames from run 5
 patches/                  git format-patch series: ts-capture-fixed -> dde-emulator
 BASE.md                   which upstream commit / local branch this is based on
 ```
@@ -215,9 +352,11 @@ BASE.md                   which upstream commit / local branch this is based on
 
 The commands assume the tools live in `~/Downloads/FlexRay/fr-ts`. Copy
 `tools/fr_ts_logger.py`, `tools/frts.py`, `tools/reset_to_bootloader.py` and
-`firmware/pico_flexray_dde_emu_v1b_ignon.uf2` there. The new `fr_ts_logger.py`
-and `frts.py` replace the old ones. They still work with the capture firmware
-and with v1. Copy them again for v1b: the old ones do not show the first fault.
+`firmware/pico_flexray_dde_emu_v1c_ignon.uf2` there. The new `fr_ts_logger.py`
+and `frts.py` replace the old ones. **Copy both again for v1c.** `frts.py` is new;
+`fr_ts_logger.py` is the same as v1b's, but keep the pair together. The old tools
+still run v1c, but do not show the dynamic-frame counters. The new ones still
+work with the capture firmware, v1 and v1b.
 
 ```
 sudo apt install python3-usb
@@ -245,7 +384,7 @@ cd ~/Downloads/FlexRay/fr-ts
 ```
 
 ```
-sha256sum pico_flexray_dde_emu_v1b_ignon.uf2
+sha256sum pico_flexray_dde_emu_v1c_ignon.uf2
 ```
 
 It must match the line in `firmware/SHA256SUMS`.
@@ -254,7 +393,10 @@ It must match the line in `firmware/SHA256SUMS`.
 
 Do **not** start the engine during this test.
 
-1. **Car asleep.** Locked or left alone until the bus is quiet. Ignition off.
+1. **Cold wake.** The car must be fully asleep: locked or left alone, ignition
+   off, for **well over 60 s** after the bus went quiet (car test 2 was not a
+   cold wake, which makes the start-up hard to compare). Prepare steps 2–5
+   before that wait, or do them and then wait again.
 
 2. **Unplug the DDE** connector.
 
@@ -271,7 +413,7 @@ Do **not** start the engine during this test.
    release.)
 
    ```
-   cp ~/Downloads/FlexRay/fr-ts/pico_flexray_dde_emu_v1b_ignon.uf2 /media/$USER/RP2350/
+   cp ~/Downloads/FlexRay/fr-ts/pico_flexray_dde_emu_v1c_ignon.uf2 /media/$USER/RP2350/
    ```
 
    The pico reboots by itself, and the GP20 LED blinks once per second. TX is
@@ -280,46 +422,59 @@ Do **not** start the engine during this test.
 5. **Start the logger with `--emulate`:**
 
    ```
-   python3 ~/Downloads/FlexRay/fr-ts/fr_ts_logger.py -o ~/Downloads/FlexRay/fr-ts/f11_emu2.csv --emulate
+   python3 ~/Downloads/FlexRay/fr-ts/fr_ts_logger.py -o ~/Downloads/FlexRay/fr-ts/f11_emu3.csv --emulate
    ```
 
    You should see `EMULATOR TX ENABLED`, then every 5 s a status line plus an
    `emu:` line. While the bus is asleep it shows `state=no-lock` and
    `0 frames/s`. That is correct.
 
-6. **Ignition on (do NOT start the engine).** Within a fraction of a second the
-   `emu:` line should show:
+6. **Ignition on (do NOT start the engine). Keep it on for at least 60 s.**
+   Within a fraction of a second the `emu:` line should show:
    - `state=ACTIVE locked`;
    - the `sent[...]` counters rising by about 200 per second per slot;
    - `echo ok` rising, with `echo miss`, `foreign`, `late` and `lock_losses`
      staying at (or near) 0;
    - `echo_err avg` within about ±50 ns. The `max` value can show the
      error of the very first frame (up to a few hundred ns), but it should
-     not keep growing.
+     not keep growing;
+   - v1c: `ign=on`, and `dyn[...]` rising by about E6 +5, FB5 +1, FB7 +25,
+     FB9 +1, E8L9 +5, E8L5 +1 per 5 s line. A few `skip` counts are fine. If
+     `dyn[E6=...]` does not rise at all, note the `why[...]` reasons.
 
    If it shows `FAULT` or the console prints `EMU FAULT ...`, the firmware has
    stopped sending. It re-arms by itself after 2 s if the cause is gone, and
-   stays off after the 3rd fault. Note the `EMU FAULT` line and go to step 9. In the status line, frames from FR1 now include ours
-   (0x26/0x28/0x29/0x3D).
+   stays off after the 3rd fault. Note the `EMU FAULT` line and go to step 9.
+   In the status line, frames from FR1 now include ours
+   (0x26/0x28/0x29/0x3D, and 0xE6/0xE8/0xFB).
 
-   **Pass check (in the capture, afterwards):** the car's 0x2F byte 4 goes
-   0e→02 and byte 5 goes 30→20 about 1.05 s after ign on. Without a working
-   DDE (or with v1) byte 4 goes to 06 about 5.76 s after wake, and byte 5 stays
-   30.
+   **Pass check (in the capture, afterwards). All of these must hold:**
+   - the car's **0x2F b4 = 02 and b5 = 20** at about ign + 1.05 s. Without a
+     working DDE, b4 goes to 06 about 5.7 s after wake and b5 stays 30
+     (car test 2: ign + 1.15 s);
+   - **no DSC/ICM/EPS fault events.** These are frames
+     `01 f0 <src> … 62 17 04 <DTC>`, found with Fred's `events.py`. Car test 2
+     had DSC D35744/D35452, EPS D51414/D51744/D51C1B and ICM D01744/D01C1F;
+   - **no 0xB4/0xCF/0xB7 events within 60 s** of ign on;
+   - **0x3F c1 b4 = f3** (car test 2: f6);
+   - **0x2B c3 b11/b12 = e0/f8** (car test 2: 60/d8);
+   - **0x70 L9 = c8/20** (car test 2: d8/60).
 
 7. **Watch the dash and the console** for a minute or two. Note any warnings or
    messages on the dash, for comparison with "DDE unplugged, no pico".
 
-8. **Ignition off, wait 70 s.** The bus should go to sleep as it did in run 4
+8. **Ignition off, and keep logging for at least 90 s.** The bus should go to sleep as it did in run 4
    (about 61 s after ign off). The status line drops to `0 frames/s` and
-   `emu:` goes to `no-lock`. If the bus stays awake well past 70 s, the
-   emulator is keeping it awake: stop the logger (Ctrl-C) and note it.
+   `emu:` goes to `no-lock`. Do **not** stop the logger before 90 s after
+   ign off (car test 2 stopped at 15 s, so sleep could not be checked). If the
+   bus stays awake well past 90 s, the emulator is keeping it awake: stop the
+   logger (Ctrl-C) and note it.
 
 9. **Stop the logger** with Ctrl-C. It prints `EMULATOR TX DISABLED`, then
    `emu at stop: ...`. Keep these three files, from `~/Downloads/FlexRay/fr-ts/`:
-   - `f11_emu2.csv`
-   - `f11_emu2.csv.bin`
-   - `f11_emu2.csv.console.log`
+   - `f11_emu3.csv`
+   - `f11_emu3.csv.bin`
+   - `f11_emu3.csv.console.log`
 
 If anything looks wrong (dash goes mad, the car will not sleep, a FAULT
 appears), press Ctrl-C in the logger first. TX is switched off at once.
@@ -335,25 +490,28 @@ from the fr-ts folder, the same way as in step 4.
 
 ## Known risks / open points
 
-- **v1b is not yet tested on the car.** v1 ran on the car once (car test 1,
-  stopped by the false fault). The traction control failure seen then
-  (0x3D, which carries WMOM_DRV/TORQ_CRSH, never reached the bus) should be
-  checked again with v1b.
+- **v1c is not yet tested on the car.** v1b's statics worked in car test 2.
+  The new parts are the dynamic frames and the pre-ign values.
+- **Dynamic frames can collide in theory.** The position of our dynamic frames
+  depends on the other ECUs' frames before them in the same cycle. v1c sends
+  only when every one of them is explained. On the run 5 bus its prediction was
+  never earlier than the real frame. A FlexRay node the pico cannot decode at
+  all, or a bus-side length rule we have not seen, would still be a risk.
+  Watch for `foreign`, for `echo miss`, and for any new DTCs on other ECUs.
+- **Fixed dynamic values.** The 0xE6 temperatures, the 0xFB voltage (12.871 V)
+  and the 0xE8 current/temperature are frozen at the spec values (run 4). The
+  real DDE updates them.
+- **0xE8 L5 start.** The real DDE starts it at ign + 75–125 ms, first with
+  `86 78 00 f8`. v1c follows the spec: `86 78 fe fe` from ign + 225 ms.
+- **If the DSC still degrades with 0xE6 present**, the next candidate is
+  0x142 (not in v1c).
 - **TSS length.** We send a 7-bit TSS. If the car's receivers expect a longer
   one, our frames are dropped: `echo ok` would rise but the dash would act as
-  if the DDE were missing. If so, rebuild with `-DEMU_TSS_BITS=<n>`.
-- **No dynamic frames** (see above). Anything the car reads from 0xE6, 0xE8,
-  0xFB, 0x142, 0x68, 0x10A, 0xBE or 0x5C will be missing.
-  - Planned next, **not in v1b: 0xE6.** Track dynamic-segment activity per
-    cycle, as worked out from car test 1 (`f11_emu_run1.md`), and only send in
-    cycles where the minislot count is known to be safe. Content from Fred's
-    template: K=04, b2 = 0x10 | counter, 1 Hz, in cycles ≡ 2 (mod 8).
-- **Late alarms.** Car test 1 had one slot skipped as late in cycle 52, cause
-  unknown. v1b tolerates a delay like that one. If it happens again, the
-  `late[...]` reasons and `last=` show which slot and why.
-- **Pre-ign values.** Before ign on, the real DDE sends 0x28 c1 = `c1 17 7c` and
-  0x29 b8 = 80. The emulator always sends its ign-on content. This was not
-  changed in v1b (small, optional follow-up).
+  if the DDE were missing. If so, rebuild with `-DEMU_TSS_BITS=<n>`. Car test 2
+  shows the statics are received.
+- **Late alarms.** If one happens, the `late[...]` reasons and `last=` show
+  which slot and why. A dynamic frame whose time has already passed is skipped
+  (`why[late]`) instead.
 - **Fixed state.** The replay is one 64-cycle window (run 5, ign on, engine off).
   Nothing changes with the pedal, temperatures and so on.
 - **Network management / sleep.** The replayed frames may contain "stay awake"
@@ -392,13 +550,18 @@ The output is `pico_flexray.uf2`. Options (CMake `-D`):
 |---|---|---|
 | `PICO_FLEXRAY_DDE_EMU` | `OFF` | `OFF` builds the normal capture firmware (unchanged code) |
 | `EMU_TSS_BITS` | `7` | TSS length |
+| `EMU_DYN_E6` | `1` | v1c: send dynamic 0xE6 (DT_PT_2) |
+| `EMU_DYN_FB` | `1` | v1c: send dynamic 0xFB L5/L7/L9 |
+| `EMU_DYN_E8` | `1` | v1c: send dynamic 0xE8 L9/L5 |
+| `EMU_PREIGN` | `1` | v1c: pre-ign values in 0x28/0x29 (and 0xFB L9) until 60 ms after the first 0x103 |
 | `EMU_DYN_5C` | `0` | `1` = also send dynamic 0x5C (minislot 0, every 16th cycle); untested |
 | `EMU_SYNC_BITS` | `0` | `1` = keep the captured sync/startup bits; **unsafe, untested** |
 
 Tests (no hardware). `pioasm` comes from the pico-sdk build; pass it with
 `--pioasm` or `PIOASM=`. The full-run checks also need the run 5 capture
-(`--bin f11_run5.csv.bin`, or `DDE_RUN5_BIN=` for `run.sh`). Without the
-capture they are skipped.
+(`--bin f11_run5.csv.bin`, or `DDE_RUN5_BIN=` for `run.sh`). The run 2 and
+run 5 CSVs are needed for the v1c replay checks. Without a capture, the checks
+that need it are skipped.
 
 ```
 cd source/tests/host && sh run.sh
