@@ -1,0 +1,199 @@
+From 29eae7a35a26d2a9adeb13b4a76c6eba8012e883 Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Sat, 31 Oct 2026 15:59:07 +0000
+Subject: [PATCH 16/18] dde-emu v1e: FlexRay content follows KL15 after off
+
+- 0x29 c%4==3 b8 10 -> c0 at KL15 off + 6 cycles (30 ms), E2E CRC recomputed
+  (new dde_core_build_static_ph with a third content phase, after-off)
+- 0xFB L9 back to the pre-ign 1f 00 ff 7f at KL15 off + 46 cycles (0.23 s)
+- pre-ign content also ends 12 cycles after KL15 on (0xF1), not only after the
+  first 0x103 (the sticky ign_seen flag alone never followed KL15)
+- 0x142 b2 counter left as is: irregular in the captures, not trivially modelled
+- replay test: after-off expectations for 0x29 c3 and FB L9 (dyn-run1/2/3/5, mitm)
+---
+ src/dde_emu.c                    | 26 ++++++++++++++++++++++++--
+ src/dde_emu_core.c               |  9 ++++++++-
+ src/dde_emu_core.h               |  9 +++++++++
+ tests/host/test_dde_emu_replay.c | 30 ++++++++++++++++++++++++++----
+ 4 files changed, 67 insertions(+), 7 deletions(-)
+
+diff --git a/src/dde_emu.c b/src/dde_emu.c
+index 95adcb5..42ec8d7 100644
+--- a/src/dde_emu.c
++++ b/src/dde_emu.c
+@@ -626,9 +626,31 @@ static void __time_critical_func(alarm_isr)(void)
+ // Pre-ign content until DDE_IGN_STATIC_CYCLES after the first 0x103 since wake.
+ static inline bool preign_static(void)
+ {
++    // v1e: KL15 on (0xF1) also ends the pre-ign content, not only the first 0x103.
++    if (kl15.on && abs_cycle >= kl15.on_abs + DDE_IGN_STATIC_CYCLES) return false;
+     return EMU_PREIGN && (!ign_seen || abs_cycle < ign_abs + DDE_IGN_STATIC_CYCLES);
+ }
+ 
++// v1e: content follows KL15, not only the (sticky) "0x103 seen in this wake" flag:
++// after KL15 off the real DDE moves 0x29 c%4==3 b8 to c0 (+30 ms) and 0xFB L9 back to
++// 1f 00 ff 7f (+0.23 s); 0x142 already has its own after-off phase (ph142).
++static inline bool kl15_off_for(uint32_t cycles)
++{
++    return kl15.ever_on && !kl15.on && abs_cycle >= kl15.off_abs + cycles;
++}
++
++static inline unsigned static_phase(void)
++{
++    if (kl15_off_for(DDE_OFF_29_CYCLES)) return DDE_PH_OFF;
++    return preign_static() ? DDE_PH_PREIGN : DDE_PH_ON;
++}
++
++static inline unsigned dyn_phase(unsigned p)
++{
++    if (p == DDE_PDU_FB9 && kl15_off_for(DDE_OFF_FB9_CYCLES)) return 0u; // pre-ign content = ff 7f
++    return preign_static() ? 0u : 1u;
++}
++
+ static void __time_critical_func(prepare_slot)(unsigned i, unsigned cycle)
+ {
+     emu_slot_t *s = &slots[i];
+@@ -636,11 +658,11 @@ static void __time_critical_func(prepare_slot)(unsigned i, unsigned cycle)
+     unsigned n, dts = 0;
+     s->pdu = -1;
+     if (i < DDE_EMU_N_STATIC) {
+-        n = dde_core_build_static_ex(i, cycle, counter[i][cycle & 3u], EMU_SYNC_BITS != 0, preign_static(), frame);
++        n = dde_core_build_static_ph(i, cycle, counter[i][cycle & 3u], EMU_SYNC_BITS != 0, static_phase(), frame);
+         s->is_data = (dde_core_emu_indicators(i, cycle, false) & 0x04u) != 0;
+     } else if (i >= DDE_EMU_N_SLOTS) {
+         unsigned p = (unsigned)dyn_due[i - DDE_EMU_N_SLOTS];
+-        unsigned ph = p == DDE_PDU_142 ? ph142() : (preign_static() ? 0u : 1u);
++        unsigned ph = p == DDE_PDU_142 ? ph142() : dyn_phase(p);
+         n = dde_core_build_dyn_pdu_ph(p, cycle, pdu_ctr[p], ph, frame);
+         dts = dde_core_dyn_dts_bits(n, EMU_TSS_BITS);
+         s->is_data = 1;
+diff --git a/src/dde_emu_core.c b/src/dde_emu_core.c
+index 48f6822..8ac0fe5 100644
+--- a/src/dde_emu_core.c
++++ b/src/dde_emu_core.c
+@@ -114,15 +114,22 @@ unsigned DDE_RAM(dde_core_build_static)(unsigned target, unsigned cycle, unsigne
+ // 0x28 c%4==1 b3-b5 c1 17 7c (ign-on a7 79 9a), 0x29 c%4==3 b8 80 (ign-on 10).
+ unsigned DDE_RAM(dde_core_build_static_ex)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
+                                            bool preign, uint8_t *out)
++{
++    return dde_core_build_static_ph(target, cycle, counter, keep_sync, preign ? DDE_PH_PREIGN : DDE_PH_ON, out);
++}
++
++unsigned DDE_RAM(dde_core_build_static_ph)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
++                                           unsigned phase, uint8_t *out)
+ {
+     const unsigned plen = DDE_EMU_STATIC_PAYLOAD_BYTES;
+     uint8_t ind = dde_core_emu_indicators(target, cycle, keep_sync);
+     dde_core_header(ind, dde_emu_static_id[target], plen / 2u, cycle, out);
+     memcpy(out + 5, dde_emu_static_payload[target][cycle & 63u], plen);
+-    if (preign && (ind & 0x04u)) {
++    if (phase == DDE_PH_PREIGN && (ind & 0x04u)) {
+         if (target == 1 && (cycle & 3u) == 1) { out[5 + 2] = 0xC1; out[5 + 3] = 0x17; out[5 + 4] = 0x7C; }
+         if (target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0x80;
+     }
++    if (phase == DDE_PH_OFF && (ind & 0x04u) && target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0xC0;
+     if (ind & 0x04u) dde_core_e2e_apply(out + 5, target, cycle, counter);
+     uint32_t c = dde_core_frame_crc(out, 5u + plen);
+     out[5 + plen] = (uint8_t)(c >> 16);
+diff --git a/src/dde_emu_core.h b/src/dde_emu_core.h
+index e0d235d..6be054c 100644
+--- a/src/dde_emu_core.h
++++ b/src/dde_emu_core.h
+@@ -189,6 +189,15 @@ unsigned dde_core_build_dyn_pdu(unsigned p, unsigned cycle, unsigned counter, bo
+ // Static frame with optional pre-ign content (0x28 c%4==1 b3-b5, 0x29 c%4==3 b8).
+ unsigned dde_core_build_static_ex(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
+                                   bool preign, uint8_t *out);
++// v1e: content phase 0 = pre-ign, 1 = ign on, 2 = after KL15 off in this wake
++// (0x29 c%4==3 b8 = c0 instead of 10, E2E CRC recomputed).
++#define DDE_PH_PREIGN 0u
++#define DDE_PH_ON 1u
++#define DDE_PH_OFF 2u
++#define DDE_OFF_29_CYCLES 6u     // 0x29 c%4==3 b8 10 -> c0 at KL15 off + 30 ms (real DDE, ddecan run 4)
++#define DDE_OFF_FB9_CYCLES 46u   // 0xFB L9 back to 1f 00 ff 7f at KL15 off + 0.23 s (real DDE)
++unsigned dde_core_build_static_ph(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
++                                  unsigned phase, uint8_t *out);
+ // Minislots a dynamic frame of `payload_bytes` occupies (0 = unknown length).
+ // v1d: K = ceil((10 * (plen + 8) + o) bit times / minislot) + 2 with the frame overhead o
+ // (TSS/FSS/FES/idle detection) fitted on run 5 to 12.5 < o <= 17.5 bits for all 10 observed
+diff --git a/tests/host/test_dde_emu_replay.c b/tests/host/test_dde_emu_replay.c
+index d013b6f..53c95c5 100644
+--- a/tests/host/test_dde_emu_replay.c
++++ b/tests/host/test_dde_emu_replay.c
+@@ -530,7 +530,7 @@ static int pdu_of(unsigned id, unsigned plen)
+ }
+ 
+ typedef struct {
+-    unsigned n, noecho, offgrid, mexp_bad, order_bad, overlap, ctr_bad, bytes_bad, preign_bad, e85_early, cyc_bad, period_bad, spec_bad;
++    unsigned fb9_off, n, noecho, offgrid, mexp_bad, order_bad, overlap, ctr_bad, bytes_bad, preign_bad, e85_early, cyc_bad, period_bad, spec_bad;
+     unsigned per_pdu[DDE_DYN_N_PDU];
+     double maxres;
+     unsigned ph_bad, ph_n[3];   // v1d 0x142 content phase vs the KL15 model
+@@ -616,6 +616,13 @@ static bool kl_ever_on(uint64_t t)   // KL15 was on in this wake before t
+     return false;
+ }
+ static bool nm_at(uint64_t t) { return seg_at(nseg, nns, t); }
++// v1e: start of the KL15-off segment holding t, if KL15 was on earlier in this wake (0 = n/a)
++static uint64_t kl_off_since(uint64_t t)
++{
++    int i = seg_idx(kseg, nks, t);
++    if (i < 0 || kseg[i].v || !kl_ever_on(t)) return 0;
++    return kseg[i].t;
++}
+ // 0x142 content phase the model expects at t (DDE_142_P*)
+ static int ph142_model(uint64_t t)
+ {
+@@ -706,6 +713,14 @@ static dynchk_t check_dyn(bool picked)
+                 }
+             }
+         }
++        if (p == DDE_PDU_FB9) {   // v1e: back to the pre-ign content 46 cycles after KL15 off
++            uint64_t off = kl_off_since(txl[k].txen);
++            if (off) {
++                double a = (double)txl[k].txen - (double)off;
++                if (a > (DDE_OFF_FB9_CYCLES + 1) * CYC_T) { pre_must = true; post_must = false; d.fb9_off++; }
++                else if (a > (DDE_OFF_FB9_CYCLES - 1) * CYC_T) pre_must = post_must = false;
++            }
++        }
+         for (int pre = 0; pre < 2 && !okc && X != 0x142; pre++) {
+             if ((pre && post_must) || (!pre && pre_must)) continue;
+             dde_core_build_dyn_pdu((unsigned)p, cyc, ctr >= 0 ? (unsigned)ctr : 0, pre != 0, fr);
+@@ -761,6 +776,7 @@ static unsigned print_dyn(const char *tag, const dynchk_t *d)
+            "car frames moved back %u, spins %u, parked %u/put while parked %u\n",
+            tag, d->n, d->maxres, d->offgrid, d->mexp_bad, d->order_bad, d->overlap, d->noecho, d->ctr_bad, d->bytes_bad, d->preign_bad, d->e85_early,
+            d->cyc_bad, d->period_bad, d->spec_bad, n_shifted, n_spin, n_parked, n_put_parked);
++    printf("  %s v1e: 0xFB L9 after KL15 off + %u cycles checked as 1f 00 ff 7f: %u\n", tag, DDE_OFF_FB9_CYCLES, d->fb9_off);
+ #ifdef DDE_EMU_STATS_V3_SIZE
+     printf("  %s v1d: sent 10A=%u 142=%u 68=%u skip[%u %u %u] ms[10A=%u 142=%u 68=%u] 0x142 phases [%u %u %u] bad %u; "
+            "kl15=0x%02x f1_b3=0x%02x edges on %u off %u off_ago %u ms ceil_left %u ms ceiling stops %u; "
+@@ -779,7 +795,7 @@ static unsigned print_dyn(const char *tag, const dynchk_t *d)
+ // static pre-ign content: 0x28 cycle%4==1 b3..b5 = c1 17 7c, 0x29 cycle%4==3 b8 = 80 until ign
+ static unsigned check_preign_static(void)
+ {
+-    unsigned bad = 0, npre = 0, npost = 0;
++    unsigned bad = 0, npre = 0, npost = 0, noff = 0;
+     for (unsigned k = 0; k < ntx; k++) {
+         double since = t_ign ? (double)txl[k].txen - (double)t_ign : -1e18;
+         bool pre = since < 11 * CYC_T, post = since > 13 * CYC_T;
+@@ -790,11 +806,17 @@ static unsigned check_preign_static(void)
+         }
+         if (txl[k].id == 0x29 && (txl[k].cycle & 3u) == 3) {
+             bool v = txl[k].pl[7] == 0x80;
++            // v1e: after KL15 off (+6 cycles) b8 = c0, before that 10
++            uint64_t off = kl_off_since(txl[k].txen);
++            double a = off ? (double)txl[k].txen - (double)off : -1.0;
++            if (off && a > (DDE_OFF_29_CYCLES + 1) * CYC_T) { noff++; bad += txl[k].pl[7] != 0xC0; continue; }
++            if (off && a > (DDE_OFF_29_CYCLES - 1) * CYC_T) continue;
+             if (pre) { npre++; bad += !v; }
+-            if (post) { npost++; bad += v; }
++            if (post) { npost++; bad += v || txl[k].pl[7] == 0xC0; }
+         }
+     }
+-    printf("  statics: %u pre-ign / %u ign-on frames of 0x28 c1 / 0x29 c3 checked, %u wrong\n", npre, npost, bad);
++    printf("  statics: %u pre-ign / %u ign-on / %u after-off frames of 0x28 c1 / 0x29 c3 checked, %u wrong\n", npre, npost,
++           noff, bad);
+     return bad;
+ }
+ 
+-- 
+2.47.3
+

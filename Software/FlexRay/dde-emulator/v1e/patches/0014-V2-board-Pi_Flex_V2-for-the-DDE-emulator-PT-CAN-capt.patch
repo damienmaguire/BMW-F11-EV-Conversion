@@ -1,0 +1,1402 @@
+From af3af720bf1513aee0c240b01cd22aac2c50ca0d Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Sat, 31 Oct 2026 08:56:25 +0000
+Subject: [PATCH 14/18] V2 board (Pi_Flex_V2) for the DDE emulator: PT-CAN
+ capture, MCP251863 RX ONLY
+
+- PICO_FLEXRAY_BOARD_V2 CMake option (default OFF = V1). Board header, MCP251863 driver and
+  V2 LED/CAN service taken unchanged from ts-capture (= pico-flexray-v2 v2-hw a1510d0)
+- V2: no relays, LEDs GP8/9, CAN on spi0 GP16-21, FR3/FR4 parked on unconnected pins;
+  FR1/FR2/BGE/STBN identical to V1, so the emulator TX pins are unchanged
+- strictly no CAN TX: MCP251863_RX_ONLY compiles the driver without send functions,
+  init refuses anything but Listen Only, #error unless V2_CAN_MODE=LISTEN_ONLY,
+  V2_CAN_TEST_TX=0 and classic CAN (no FD)
+- CAN frames -> USB CAN records (type 0x43, opt-in vendor 0xa1), SavvyCAN bus 2
+- dde_emu.h: f1_b3 holds payload[2]; dde_kl15_reset in RAM
+---
+ CMakeLists.txt              |  17 +-
+ src/board_pico_flexray_v2.h | 133 +++++++++++++
+ src/dde_emu.h               |   2 +-
+ src/flexray_pins.h          |   7 +
+ src/main.c                  |  28 +++
+ src/mcp251863.c             | 386 ++++++++++++++++++++++++++++++++++++
+ src/mcp251863.h             | 100 ++++++++++
+ src/mcp251863_bittiming.c   |  84 ++++++++
+ src/pico_can_record.h       |  78 ++++++++
+ src/v2_cantest.c            | 345 ++++++++++++++++++++++++++++++++
+ src/v2_cantest.h            |  23 +++
+ tests/host/run.sh           |   3 +-
+ 12 files changed, 1202 insertions(+), 4 deletions(-)
+ create mode 100644 src/board_pico_flexray_v2.h
+ create mode 100644 src/mcp251863.c
+ create mode 100644 src/mcp251863.h
+ create mode 100644 src/mcp251863_bittiming.c
+ create mode 100644 src/pico_can_record.h
+ create mode 100644 src/v2_cantest.c
+ create mode 100644 src/v2_cantest.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 133b9bc..acb29ef 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -58,7 +58,22 @@ if (PICO_FLEXRAY_TS_DISABLE)
+ else()
+     target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_TS_DISABLE=0)
+ endif()
+-target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_BOARD_V2=0)
++# OFF = V1 board (relays GP17/18, LED GP20, FR3/FR4).
++# ON  = Pi_Flex_V2 carrier (no relays, LEDs GP8/9, MCP251863 CAN on spi0, FR3/FR4 parked).
++#       PT-CAN capture (500 kbit/s classic) -> USB CAN records, SavvyCAN bus 2.
++#       RX ONLY: Listen Only controller mode, driver built without send functions.
++option(PICO_FLEXRAY_BOARD_V2 "Build for the Pi_Flex_V2 carrier (MCP251863 PT-CAN RX-only + status LEDs)" OFF)
++if (PICO_FLEXRAY_BOARD_V2)
++    target_sources(pico_flexray PRIVATE
++        src/mcp251863.c
++        src/mcp251863_bittiming.c
++        src/v2_cantest.c
++        )
++    target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_BOARD_V2=1 MCP251863_RX_ONLY=1
++        V2_CAN_MODE=0 V2_CAN_TEST_TX=0 V2_CAN_FD_DATA_BITRATE=0u)
++else()
++    target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_BOARD_V2=0)
++endif()
+ # Bigger USB vendor transfers + tud_task during notify bursts (run 4 USB loss fix, untested on HW)
+ option(PICO_FR_USB_FAST "1 KB vendor IN transfers, 16 KB TX buffer" OFF)
+ if (PICO_FR_USB_FAST)
+diff --git a/src/board_pico_flexray_v2.h b/src/board_pico_flexray_v2.h
+new file mode 100644
+index 0000000..7198508
+--- /dev/null
++++ b/src/board_pico_flexray_v2.h
+@@ -0,0 +1,133 @@
++// Pin map for the pico-flexray "Pi_Flex_V2" carrier board (Raspberry Pi Pico 2,
++// RP2350A). Extracted from the KiCad V2 netlist (Pi_Flex_V2.kicad_sch).
++//
++//   FlexRay transceivers (NCV7383, IC1/IC3):
++//     firmware FR1 = schematic channel 2 (IC3): TXD2=GP28 TXEN2=GP27 RXD2=GP26
++//     firmware FR2 = schematic channel 1 (IC1): TXD1=GP4  TXEN1=GP5  RXD1=GP6
++//     BGE (both) = GP2, STBN (both) = GP3
++//   CAN FD controller + transceiver (MCP251863, IC4) on SPI0:
++//     MISO(SDO)=GP16 CS=GP17 SCK=GP18 MOSI(SDI)=GP19 nINT=GP20 STBY=GP21
++//     nINT0/nINT1/CLKO not connected. 16 MHz crystal (X1, X322516MLB4SI).
++//   Status LEDs (active high, 470R to GND):
++//     STAT1 (LED2 in schematic) = GP8, STAT2 (LED3 in schematic) = GP9
++//   Test points: TP1 = GP7 (ISR profiling pin), TP4 = GP15.
++//
++// The V2 board has only two FlexRay transceivers and no relays. The main
++// firmware's FR3/FR4 pins (GP8/9/10, GP16/21/22), relay pins (GP17/18) and
++// LED pin (GP20) collide with the V2 LEDs and CAN SPI, so on V2 FR3/FR4 are
++// parked on GPIOs that are not connected on the V2 board (see below).
++#ifndef BOARD_PICO_FLEXRAY_V2_H
++#define BOARD_PICO_FLEXRAY_V2_H
++
++// -- FlexRay (unchanged vs main for FR1/FR2) --
++#define BGE_PIN 2
++#define STBN_PIN 3
++
++#define TXD_FR_1_PIN 28
++#define TXEN_FR_1_PIN 27
++#define RXD_FR_1_PIN 26
++
++#define TXD_FR_2_PIN 4
++#define TXEN_FR_2_PIN 5
++#define RXD_FR_2_PIN 6
++
++// FR3/FR4 do not exist on V2. The PIO programs are still loaded exactly as on
++// main (so timing/resource usage is identical), but on pins that are
++// unconnected on the V2 PCB. RXD pins get pull-ups, so they idle recessive.
++#define TXD_FR_3_PIN 10
++#define TXEN_FR_3_PIN 11
++#define RXD_FR_3_PIN 12
++
++#define TXD_FR_4_PIN 13
++#define TXEN_FR_4_PIN 14
++#define RXD_FR_4_PIN 22
++
++#define DEBUG_PROFILE_PIN 7 // TP1
++
++// -- Status LEDs (active high) --
++#define V2_LED1_PIN 8 // STAT1: heartbeat 1 Hz
++#define V2_LED2_PIN 9 // STAT2: CAN TX status
++#define V2_LED_ON 1
++#define V2_LED_OFF 0
++#define V2_PICO_ONBOARD_LED_PIN 25 // Pico 2 module LED, mirrors LED1
++
++// -- MCP251863 CAN FD controller on SPI0 --
++#define V2_CAN_SPI spi0
++#define V2_CAN_SPI_MISO_PIN 16 // SPI0 RX
++#define V2_CAN_SPI_CS_PIN 17   // SPI0 CSn (driven as plain GPIO)
++#define V2_CAN_SPI_SCK_PIN 18  // SPI0 SCK
++#define V2_CAN_SPI_MOSI_PIN 19 // SPI0 TX
++#define V2_CAN_INT_PIN 20      // nINT, active low (push-pull by default)
++#define V2_CAN_STBY_PIN 21     // transceiver STBY, high = standby
++// SPI clock: datasheet requires FSCK <= 0.85 * SYSCLK / 2 (6.8 MHz at 16 MHz).
++#define V2_CAN_SPI_HZ 4000000u
++
++// Oscillator fitted on the controller (X1). Datasheet only specifies 4/20/40
++// MHz crystals; the V2 BOM has 16 MHz. Change here if X1 is replaced.
++#ifndef V2_CAN_OSC_HZ
++#define V2_CAN_OSC_HZ 16000000u
++#endif
++
++#define V2_CAN_NOMINAL_BITRATE 500000u
++
++// ---- Controller mode -------------------------------------------------------
++// V2_CAN_MODE_LISTEN_ONLY (default): REQOP "Listen Only". The controller never
++//   ACKs, never sends error frames and never transmits - safe on a car bus.
++//   (A lone sender on a bench gets no ACK from us and keeps retrying.)
++// V2_CAN_MODE_NORMAL: normal CAN 2.0 (or CAN FD if V2_CAN_FD_DATA_BITRATE != 0).
++//   ACKs every frame and takes part in error signalling - bench use, or when
++//   this board must be the ACKing node. Required for V2_CAN_TEST_TX.
++#define V2_CAN_MODE_LISTEN_ONLY 0
++#define V2_CAN_MODE_NORMAL      1
++#ifndef V2_CAN_MODE
++#define V2_CAN_MODE V2_CAN_MODE_LISTEN_ONLY
++#endif
++
++// CAN FD data-phase bit rate (BRS): 0 = classic CAN 2.0 (default for the RX
++// build). 1000000u / 2000000u / 4000000u select the precomputed FD timings in
++// mcp251863_bittiming.c (16, 20 and 40 MHz oscillators). With FD on, the RX
++// FIFO switches to 64-byte objects (16 deep) and FD records carry FDF/BRS.
++#ifndef V2_CAN_FD_DATA_BITRATE
++#define V2_CAN_FD_DATA_BITRATE 0u
++#endif
++
++// ---- Test TX (off by default) ------------------------------------------------
++// 1 = send 0x123 classic DLC 8 every 100 ms (byte0 counter, 12 34 56 78 9A BC DE)
++//     and, with FD on, 0x124 FD+BRS 64 bytes 50 ms later. Needs V2_CAN_MODE_NORMAL.
++#ifndef V2_CAN_TEST_TX
++#define V2_CAN_TEST_TX 0
++#endif
++#if V2_CAN_TEST_TX && (V2_CAN_MODE != V2_CAN_MODE_NORMAL)
++#error "V2_CAN_TEST_TX needs V2_CAN_MODE V2_CAN_MODE_NORMAL (Listen Only cannot transmit)"
++#endif
++#if PICO_FLEXRAY_DDE_EMU || defined(MCP251863_RX_ONLY)
++// DDE emulator V2 build: PT-CAN capture only. Strictly no CAN TX: Listen Only
++// controller mode (never ACKs, never sends error frames), no test TX, and the
++// driver is compiled without its send functions (MCP251863_RX_ONLY).
++#if V2_CAN_MODE != V2_CAN_MODE_LISTEN_ONLY
++#error "DDE emulator V2 build: V2_CAN_MODE must be V2_CAN_MODE_LISTEN_ONLY (no CAN TX)"
++#endif
++#if V2_CAN_TEST_TX
++#error "DDE emulator V2 build: V2_CAN_TEST_TX must be 0 (no CAN TX)"
++#endif
++#if V2_CAN_FD_DATA_BITRATE != 0
++#error "DDE emulator V2 build: PT-CAN is classic 500 kbit/s"
++#endif
++#endif
++#define V2_CAN_TEST_ID 0x123u
++#define V2_CAN_TEST_PERIOD_MS 100
++#define V2_CAN_FD_TEST_ID 0x124u
++#define V2_CAN_FD_TEST_LEN 64
++#define V2_CAN_TICK_MS (V2_CAN_TEST_PERIOD_MS / 2) // 50 ms housekeeping tick
++
++// ---- RX / USB ------------------------------------------------------------------
++#define V2_CAN_USB_BUS 2             // SavvyCAN bus number of this CAN channel
++#define V2_CAN_RX_MAX_PER_POLL 8     // frames drained per main-loop pass (~65 us each)
++#define V2_CAN_OVERFLOW_LED_MS 1000  // LED2 solid this long after an RX overflow
++// 1 = put CAN records in the bulk-IN stream without the host opting in (only
++// for hosts that know the record; older parsers resync byte by byte over it).
++#ifndef V2_CAN_RECORDS_DEFAULT_ON
++#define V2_CAN_RECORDS_DEFAULT_ON 0
++#endif
++
++#endif
+diff --git a/src/dde_emu.h b/src/dde_emu.h
+index d5f99bc..a52348f 100644
+--- a/src/dde_emu.h
++++ b/src/dde_emu.h
+@@ -110,7 +110,7 @@ typedef struct __attribute__((packed)) {
+     uint8_t kl15;                    // bit0 KL15 on, bit1 on earlier in this wake, bit2 0xF1 seen this wake,
+                                      // bit3 0x103 seen this wake, bit4 0x5C allowed now (NM), bit5 0x5C stopped
+                                      // by the 60 s ceiling now, bit6 KL15 on-evidence seen this wake
+-    uint8_t f1_b3;                   // last 0xF1 payload byte 3 (0x20 KL15 on, 0xE0 off)
++    uint8_t f1_b3;                   // last 0xF1 "byte 3" = payload[2] (1-based B3; 0x20 KL15 on, 0xE0 off)
+     uint16_t kl15_on_edges;
+     uint16_t kl15_off_edges;
+     uint16_t nm_ceiling_stops;       // 0x5C cycles stopped by the hard ceiling (should stay 0)
+diff --git a/src/flexray_pins.h b/src/flexray_pins.h
+index c17570f..d2141cc 100644
+--- a/src/flexray_pins.h
++++ b/src/flexray_pins.h
+@@ -1,6 +1,12 @@
+ #ifndef FLEXRAY_PINS_H
+ #define FLEXRAY_PINS_H
+ 
++#if PICO_FLEXRAY_BOARD_V2
++// Pi_Flex_V2 carrier: same FR1/FR2/BGE/STBN pins, FR3/FR4 parked, no relays,
++// LEDs on GP8/GP9, MCP251863 CAN on spi0 (GP16-21).
++#include "board_pico_flexray_v2.h"
++#else
++
+ // -- Streamer Pins --
+ #define BGE_PIN 2
+ #define STBN_PIN 3
+@@ -25,4 +31,5 @@
+ #define TXEN_FR_4_PIN 22
+ #define RXD_FR_4_PIN 21
+ 
++#endif // PICO_FLEXRAY_BOARD_V2
+ #endif // FLEXRAY_PINS_H
+diff --git a/src/main.c b/src/main.c
+index ddb889c..9d40159 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -25,6 +25,9 @@
+ #include "flexray_pins.h"
+ #include "flexray_ts.h"
+ #include "pico_fr_record.h"
++#if PICO_FLEXRAY_BOARD_V2
++#include "v2_cantest.h"
++#endif
+ #if PICO_FLEXRAY_DDE_EMU
+ #include "dde_emu.h"
+ #endif
+@@ -200,6 +203,7 @@ void setup_pins(void)
+     gpio_pull_up(RXD_FR_3_PIN);
+     gpio_pull_up(RXD_FR_4_PIN);
+ 
++#if !PICO_FLEXRAY_BOARD_V2
+     gpio_init(RELAY_FR_1_2);
+     gpio_set_dir(RELAY_FR_1_2, GPIO_OUT);
+     gpio_put(RELAY_FR_1_2, 1);
+@@ -207,6 +211,10 @@ void setup_pins(void)
+     gpio_init(RELAY_FR_3_4);
+     gpio_set_dir(RELAY_FR_3_4, GPIO_OUT);
+     gpio_put(RELAY_FR_3_4, 1);
++#else
++    // V2 has no bypass relays (GP17/GP18 are the CAN SPI CS/SCK lines).
++    v2_leds_init();
++#endif
+ 
+     // delay enabling pins to avoid glitch
+     sleep_ms(100);
+@@ -215,9 +223,11 @@ void setup_pins(void)
+     gpio_put(BGE_PIN, 1);
+     gpio_put(STBN_PIN, 1);
+ 
++#if !PICO_FLEXRAY_BOARD_V2
+ 		// On-board LED
+ 	gpio_init(LED_PIN);
+ 	gpio_set_dir(LED_PIN, GPIO_OUT);
++#endif
+ }
+ 
+ int main(void)
+@@ -247,6 +257,12 @@ int main(void)
+ 
+     printf("Actual system clock: %lu Hz\n", clock_get_hz(clk_sys));
+     printf("\n--- FlexRay Continuous Streaming Bridge (Forwarder Mode) ---\n");
++#if PICO_FLEXRAY_BOARD_V2
++    printf("Board: Pi_Flex_V2 (FR3/FR4 parked on unconnected pins), LED1=GP%d LED2=GP%d\n", V2_LED1_PIN, V2_LED2_PIN);
++    printf("PT-CAN: MCP251863 LISTEN-ONLY 500 kbit/s classic, RX only (no TX), USB CAN records bus %d\n", V2_CAN_USB_BUS);
++    // CAN controller init on core0 before the FlexRay machinery (bounded, < ~30 ms).
++    v2_can_init();
++#endif
+ 
+     multicore_launch_core1(core1_entry);
+     sleep_ms(500);
+@@ -264,6 +280,11 @@ int main(void)
+ 	absolute_time_t next_stats_print_time = make_timeout_time_ms(5000);
+ 	absolute_time_t next_led_toggle_time = make_timeout_time_ms(500);
+ 	bool led_on = false;
++#if PICO_FLEXRAY_BOARD_V2
++    (void)next_led_toggle_time;
++    (void)led_on;
++    v2_tick_start(); // 50 ms alarm-pool tick (core0): LED1 heartbeat, LED2, CAN housekeeping
++#endif
+     // Track previous len_ok to compute parsed-frames FPS
+     uint32_t prev_total = 0;
+     uint32_t prev_valid = 0;
+@@ -271,16 +292,23 @@ int main(void)
+     while (true)
+     {
+         panda_usb_task();
++#if PICO_FLEXRAY_BOARD_V2
++        v2_cantest_poll(); // bounded CAN RX drain + 50 ms housekeeping, never waits on USB
++#else
+ 		if (time_reached(next_led_toggle_time))
+ 		{
+ 			next_led_toggle_time = make_timeout_time_ms(500);
+ 			led_on = !led_on;
+ 			gpio_put(LED_PIN, led_on);
+ 		}
++#endif
+         if (time_reached(next_stats_print_time))
+         {
+             next_stats_print_time = make_timeout_time_ms(5000);
+             stats_print(&stats, prev_total, prev_valid);
++#if PICO_FLEXRAY_BOARD_V2
++            v2_cantest_print_status();
++#endif
+             prev_total = stats.len_ok;
+             prev_valid = stats.valid;
+             print_ram_usage();
+diff --git a/src/mcp251863.c b/src/mcp251863.c
+new file mode 100644
+index 0000000..03491de
+--- /dev/null
++++ b/src/mcp251863.c
+@@ -0,0 +1,386 @@
++#include <stdio.h>
++#include <string.h>
++#include "pico/stdlib.h"
++#include "hardware/gpio.h"
++#include "hardware/spi.h"
++#include "mcp251863.h"
++
++// SPI instructions (4-bit command + 12-bit address)
++#define CMD_RESET 0x0
++#define CMD_WRITE 0x2
++#define CMD_READ  0x3
++
++// Registers (MCP251863 DS20006624B, tables 4-1 / 4-2)
++#define REG_C1CON      0x000
++#define REG_C1NBTCFG   0x004
++#define REG_C1DBTCFG   0x008
++#define REG_C1TDC      0x00C
++#define REG_C1TBC      0x010
++#define REG_C1TSCON    0x014
++#define REG_C1INT      0x01C
++#define REG_C1FLTCON0  0x1D0
++#define REG_C1FLTOBJ0  0x1F0
++#define REG_C1MASK0    0x1F4
++#define REG_C1TREC     0x034
++#define REG_C1BDIAG1   0x03C
++#define REG_C1FIFOCON1 0x05C
++#define REG_C1FIFOSTA1 0x060
++#define REG_C1FIFOUA1  0x064
++#define REG_OSC        0xE00
++#define REG_IOCON      0xE04
++#define REG_DEVID      0xE14
++#define RAM_START      0x400
++
++#define CON_RTXAT  (1u << 16)
++#define CON_STEF   (1u << 19)
++#define CON_TXQEN  (1u << 20)
++#define CON_OPMOD_SHIFT 21
++#define CON_REQOP_SHIFT 24
++#define OPMOD_CAN20  6
++#define OPMOD_CANFD  0
++#define CON_ISOCRCEN (1u << 5)
++#define CON_BRSDIS   (1u << 12)
++#define OPMOD_CONFIG 4
++#define OPMOD_LISTEN 3
++
++#define OSC_OSCRDY  (1u << 10)
++#define INT_RXIE    (1u << 17)
++#define INT_RXOVIE  (1u << 27)
++#define TSCON_TBCEN (1u << 16)
++
++#define FIFOCON_TFNRFNIE  (1u << 0)
++#define FIFOCON_RXOVIE    (1u << 3)
++#define FIFOCON_RXTSEN    (1u << 5)
++#define FIFOCON_TXEN      (1u << 7)
++#define FIFOCON_FSIZE(n)  ((uint32_t)((n) - 1) << 24)
++#define FIFOCON_UINC      (1u << 8)
++#define FIFOCON_TXREQ     (1u << 9)
++#define FIFOCON_TXAT_3    (1u << 21)
++#define FIFOCON_PLSIZE_64 (7u << 29)
++#define FIFO_CON(n) ((uint16_t)(REG_C1FIFOCON1 + 12 * ((n) - 1)))
++#define FIFO_STA(n) ((uint16_t)(REG_C1FIFOSTA1 + 12 * ((n) - 1)))
++#define FIFO_UA(n)  ((uint16_t)(REG_C1FIFOUA1 + 12 * ((n) - 1)))
++#define FIFOSTA_TFNRFNIF  (1u << 0)
++#define FIFOSTA_RXOVIF    (1u << 3)
++#define FIFOSTA_TXATIF    (1u << 4)
++#define FIFOSTA_TXERR     (1u << 5)
++#define FIFOSTA_TXLARB    (1u << 6)
++#define FIFOSTA_TXABT     (1u << 7)
++
++static const mcp251863_cfg_t *g_cfg;
++static uint32_t g_tx_seq;
++static uint8_t g_rx_plsize_bytes = 8;
++
++// nCS setup/hold: >= TSCK/2 before first SCK, >= TSCK high between frames
++// (250 ns at 4 MHz). 50 cycles = 500 ns at the 100 MHz system clock.
++#define CS_GUARD() busy_wait_at_least_cycles(50)
++static inline void cs_low(void)  { CS_GUARD(); gpio_put(g_cfg->pin_cs, 0); CS_GUARD(); }
++static inline void cs_high(void) { CS_GUARD(); gpio_put(g_cfg->pin_cs, 1); CS_GUARD(); }
++
++static void hdr(uint8_t *h, uint8_t cmd, uint16_t addr)
++{
++    h[0] = (uint8_t)((cmd << 4) | ((addr >> 8) & 0x0F));
++    h[1] = (uint8_t)(addr & 0xFF);
++}
++
++static void mcp_reset_cmd(void)
++{
++    uint8_t h[2] = {0, 0};
++    cs_low();
++    spi_write_blocking(g_cfg->spi, h, 2);
++    cs_high();
++}
++
++static void mcp_read(uint16_t addr, uint8_t *buf, size_t len)
++{
++    uint8_t h[2];
++    hdr(h, CMD_READ, addr);
++    cs_low();
++    spi_write_blocking(g_cfg->spi, h, 2);
++    spi_read_blocking(g_cfg->spi, 0x00, buf, len);
++    cs_high();
++}
++
++static void mcp_write(uint16_t addr, const uint8_t *buf, size_t len)
++{
++    uint8_t h[2];
++    hdr(h, CMD_WRITE, addr);
++    cs_low();
++    spi_write_blocking(g_cfg->spi, h, 2);
++    spi_write_blocking(g_cfg->spi, buf, len);
++    cs_high();
++}
++
++static uint32_t rd32(uint16_t addr)
++{
++    uint8_t b[4];
++    mcp_read(addr, b, 4);
++    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++}
++
++static void wr32(uint16_t addr, uint32_t v)
++{
++    uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
++    mcp_write(addr, b, 4);
++}
++
++static void wr8(uint16_t addr, uint8_t v) { mcp_write(addr, &v, 1); }
++
++static bool wait_opmod(uint8_t mode, uint32_t timeout_ms)
++{
++    absolute_time_t until = make_timeout_time_ms(timeout_ms);
++    do {
++        uint8_t b2;
++        mcp_read(REG_C1CON + 2, &b2, 1);
++        if (((b2 >> 5) & 7) == mode) return true;
++        sleep_us(100);
++    } while (!time_reached(until));
++    return false;
++}
++
++const char *mcp251863_strerror(mcp_status_t s)
++{
++    switch (s) {
++    case MCP_OK: return "ok";
++    case MCP_ERR_SPI: return "SPI check failed (no response / wrong reset values)";
++    case MCP_ERR_OSC: return "oscillator not ready (OSC.OSCRDY never set)";
++    case MCP_ERR_MODE: return "mode change refused (bus stuck dominant?)";
++    case MCP_ERR_BITTIMING: return "no bit timing for oscillator/bitrate";
++    case MCP_ERR_TX_FULL: return "TX FIFO full (previous frame not sent)";
++    }
++    return "?";
++}
++
++mcp_status_t mcp251863_init(const mcp251863_cfg_t *cfg, mcp_bittiming_t *bt_out,
++                            mcp_data_bittiming_t *dbt_out, uint8_t *devid_out)
++{
++    g_cfg = cfg;
++    static bool io_done = false;
++    if (!io_done) {
++        // Transceiver in standby until the controller is configured.
++        gpio_init(cfg->pin_stby);
++        gpio_set_dir(cfg->pin_stby, GPIO_OUT);
++        gpio_put(cfg->pin_stby, 1);
++
++        gpio_init(cfg->pin_int);
++        gpio_set_dir(cfg->pin_int, GPIO_IN);
++        gpio_pull_up(cfg->pin_int);
++
++        gpio_init(cfg->pin_cs);
++        gpio_set_dir(cfg->pin_cs, GPIO_OUT);
++        gpio_put(cfg->pin_cs, 1);
++
++        spi_init(cfg->spi, cfg->spi_hz);
++        spi_set_format(cfg->spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
++        gpio_set_function(cfg->pin_sck, GPIO_FUNC_SPI);
++        gpio_set_function(cfg->pin_mosi, GPIO_FUNC_SPI);
++        gpio_set_function(cfg->pin_miso, GPIO_FUNC_SPI);
++        gpio_pull_up(cfg->pin_miso); // keep MISO defined if the chip is absent
++        io_done = true;
++    }
++    gpio_put(cfg->pin_stby, 1);
++
++    mcp_bittiming_t bt;
++    if (!mcp251863_calc_bittiming(cfg->osc_hz, cfg->bitrate, &bt)) return MCP_ERR_BITTIMING;
++    if (bt_out) *bt_out = bt;
++    const bool fd = cfg->data_bitrate != 0;
++    mcp_data_bittiming_t dbt = {0};
++    if (fd && !mcp251863_calc_data_bittiming(cfg->osc_hz, cfg->data_bitrate, &dbt)) return MCP_ERR_BITTIMING;
++    if (dbt_out) *dbt_out = dbt;
++
++    mcp_reset_cmd();
++    sleep_ms(3); // oscillator stabilisation, TOSCSTAB max 3 ms
++
++    // Wait for the crystal.
++    absolute_time_t until = make_timeout_time_ms(20);
++    uint32_t osc;
++    do {
++        osc = rd32(REG_OSC);
++        if (osc & OSC_OSCRDY) break;
++        sleep_us(200);
++    } while (!time_reached(until));
++
++    // Sanity check SPI: after RESET, CON must report configuration mode, and a
++    // write/readback of NBTCFG must round-trip.
++    uint32_t con = rd32(REG_C1CON);
++    if (((con >> CON_OPMOD_SHIFT) & 7) != OPMOD_CONFIG || con == 0xFFFFFFFFu) return MCP_ERR_SPI;
++    uint32_t nbt = ((bt.brp - 1) << 24) | ((bt.tseg1 - 1) << 16) | ((bt.tseg2 - 1) << 8) | (bt.sjw - 1);
++    wr32(REG_C1NBTCFG, nbt);
++    if (rd32(REG_C1NBTCFG) != nbt) return MCP_ERR_SPI;
++    if (!(osc & OSC_OSCRDY)) return MCP_ERR_OSC;
++
++    if (fd) {
++        wr32(REG_C1DBTCFG, dbt.dbtcfg);
++        wr32(REG_C1TDC, dbt.tdc);
++        if (rd32(REG_C1DBTCFG) != dbt.dbtcfg) return MCP_ERR_SPI;
++    }
++
++    if (devid_out) mcp_read(REG_DEVID, devid_out, 1);
++
++    // nINT0/nINT1 are unconnected: make them driven-low GPIO outputs instead of
++    // floating inputs. IOCON must be written byte-wise (datasheet note).
++    wr8(REG_IOCON + 0, 0x00); // TRIS0=TRIS1=0 (output), XSTBYEN=0; LATx default 0
++
++    // CON: no TX event FIFO, no TX queue -> FIFO1 sits at the start of RAM.
++    // Restricted retransmissions so an un-ACKed test frame is dropped after 3
++    // retries instead of retrying forever. ISO CRC, BRS allowed.
++    con &= ~(CON_STEF | CON_TXQEN | CON_BRSDIS);
++    con |= CON_RTXAT | CON_ISOCRCEN;
++    con = (con & ~(7u << CON_REQOP_SHIFT)) | ((uint32_t)OPMOD_CONFIG << CON_REQOP_SHIFT);
++    wr32(REG_C1CON, con);
++
++    // Time base: 1 us per tick (TBCPRE = osc/1 MHz - 1), stamp at SOF (TSEOF=0).
++    uint32_t pre = cfg->osc_hz / 1000000u;
++    if (pre < 1) pre = 1;
++    wr32(REG_C1TSCON, TSCON_TBCEN | ((pre - 1) & 0x3FF));
++
++    // FIFO1: receive, time stamped, interrupt on not-empty and on overflow.
++    g_rx_plsize_bytes = fd ? 64 : 8;
++    uint32_t rxcon = FIFOCON_TFNRFNIE | FIFOCON_RXOVIE | FIFOCON_RXTSEN |
++                     FIFOCON_FSIZE(fd ? MCP_RX_DEPTH_FD : MCP_RX_DEPTH_CLASSIC) |
++                     (fd ? FIFOCON_PLSIZE_64 : 0);
++    wr32(FIFO_CON(MCP_FIFO_RX), rxcon);
++    // FIFO2: transmit, 1 message deep, 8 byte payload, 3 retransmissions.
++    // FIFO3: transmit, 1 message deep, 64 byte payload, 3 retransmissions.
++    wr32(FIFO_CON(MCP_FIFO_CLASSIC), FIFOCON_TXEN | FIFOCON_TXAT_3);
++    wr32(FIFO_CON(MCP_FIFO_FD), FIFOCON_PLSIZE_64 | FIFOCON_TXEN | FIFOCON_TXAT_3);
++
++    // Filter 0 -> FIFO1, mask 0 with MIDE=0: accepts every standard and
++    // extended ID. Object/mask first, then enable (filter is off after reset).
++    wr32(REG_C1FLTOBJ0, 0);
++    wr32(REG_C1MASK0, 0);
++    wr8(REG_C1FLTCON0, (uint8_t)(0x80 | MCP_FIFO_RX)); // FLTEN0 | F0BP = 1
++
++    // nINT (active low) = RX FIFO not empty or RX overflow; all else off.
++    wr32(REG_C1INT, INT_RXIE | INT_RXOVIE);
++
++    // Transceiver to normal mode (needed to receive; in Listen Only the
++    // controller keeps TXD recessive), then the controller mode.
++    gpio_put(cfg->pin_stby, 0);
++    sleep_us(50);
++#ifdef MCP251863_RX_ONLY
++    // RX-only build: the controller is only ever put into Listen Only (no ACK,
++    // no error frames, no TX). Anything else is refused before leaving config mode.
++    if (!cfg->listen_only) return MCP_ERR_MODE;
++#endif
++    const uint8_t mode = cfg->listen_only ? OPMOD_LISTEN : (fd ? OPMOD_CANFD : OPMOD_CAN20);
++    wr8(REG_C1CON + 3, mode); // REQOP, ABAT=0, TXBWS=0
++    if (!wait_opmod(mode, 20)) return MCP_ERR_MODE;
++    g_tx_seq = 0;
++    return MCP_OK;
++}
++
++#ifndef MCP251863_RX_ONLY
++static mcp_status_t send_obj(uint8_t fifo, uint16_t id, const uint8_t *data, uint8_t len, bool fdf, bool brs)
++{
++    uint8_t dlc = mcp251863_len_to_dlc(len);
++    if (!fdf && dlc > 8) dlc = 8;
++    uint8_t wire_len = mcp251863_dlc_to_len(dlc);
++
++    uint8_t sta;
++    mcp_read(FIFO_STA(fifo), &sta, 1);
++    if (!(sta & FIFOSTA_TFNRFNIF)) return MCP_ERR_TX_FULL;
++
++    uint32_t ua = rd32(FIFO_UA(fifo));
++    uint16_t addr = (uint16_t)(RAM_START + (ua & 0xFFF));
++
++    uint8_t obj[8 + 64] = {0};
++    uint32_t t0 = id & 0x7FFu;                                          // SID, SID11=0
++    uint32_t t1 = ((g_tx_seq++ & 0x7FFFFFu) << 9) | (fdf ? (1u << 7) : 0) |
++                  ((fdf && brs) ? (1u << 6) : 0) | (dlc & 0xF);          // IDE=0 RTR=0 ESI=0
++    for (int i = 0; i < 4; i++) { obj[i] = (uint8_t)(t0 >> (8 * i)); obj[4 + i] = (uint8_t)(t1 >> (8 * i)); }
++    memcpy(&obj[8], data, len < wire_len ? len : wire_len); // pad (if any) stays 0
++    size_t n = 8 + (((size_t)wire_len + 3u) & ~3u);           // RAM writes: whole 32-bit words
++    mcp_write(addr, obj, n);
++
++    wr8((uint16_t)(FIFO_CON(fifo) + 1), (uint8_t)((FIFOCON_UINC | FIFOCON_TXREQ) >> 8));
++    return MCP_OK;
++}
++
++mcp_status_t mcp251863_send_std(uint16_t id, const uint8_t *data, uint8_t dlc)
++{
++    if (dlc > 8) dlc = 8;
++    return send_obj(MCP_FIFO_CLASSIC, id, data, dlc, false, false);
++}
++
++mcp_status_t mcp251863_send_fd_std(uint16_t id, const uint8_t *data, uint8_t len, bool brs)
++{
++    if (len > 64) len = 64;
++    return send_obj(MCP_FIFO_FD, id, data, len, true, brs);
++}
++#endif // MCP251863_RX_ONLY
++
++mcp_status_t mcp251863_read_tx_state_fifo(uint8_t fifo, mcp_tx_state_t *st)
++{
++    uint8_t b[8];
++    mcp_read(FIFO_CON(fifo), b, 8); // FIFOCONm + FIFOSTAm
++    uint32_t con = b[0] | (b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++    uint8_t sta = b[4];
++    st->txreq_pending = (con & FIFOCON_TXREQ) != 0;
++    st->tx_attempts_exhausted = (sta & FIFOSTA_TXATIF) != 0;
++    st->tx_err = (sta & FIFOSTA_TXERR) != 0;
++    st->tx_lost_arb = (sta & FIFOSTA_TXLARB) != 0;
++    st->tx_aborted = (sta & FIFOSTA_TXABT) != 0;
++    uint32_t trec = rd32(REG_C1TREC);
++    st->rec = (uint8_t)trec;
++    st->tec = (uint8_t)(trec >> 8);
++    st->tx_warn = (trec >> 18) & 1;
++    st->rx_warn = (trec >> 17) & 1;
++    st->rx_passive = (trec >> 19) & 1;
++    st->tx_passive = (trec >> 20) & 1;
++    st->bus_off = (trec >> 21) & 1;
++    st->bdiag1 = rd32(REG_C1BDIAG1);
++    uint8_t c2;
++    mcp_read(REG_C1CON + 2, &c2, 1);
++    st->opmod = (c2 >> 5) & 7;
++    return (con == 0xFFFFFFFFu) ? MCP_ERR_SPI : MCP_OK;
++}
++
++mcp_status_t mcp251863_read_tx_state(mcp_tx_state_t *st) { return mcp251863_read_tx_state_fifo(MCP_FIFO_CLASSIC, st); }
++
++void mcp251863_clear_tx_attempt_flag_fifo(uint8_t fifo)
++{
++    // Byte 0 of FIFOSTA: TXATIF/RXOVIF are clear-on-write-0, the rest read-only.
++    wr8(FIFO_STA(fifo), 0x00);
++}
++
++void mcp251863_clear_tx_attempt_flag(void) { mcp251863_clear_tx_attempt_flag_fifo(MCP_FIFO_CLASSIC); }
++
++int mcp251863_rx_read(mcp_rx_frame_t *f, bool *overflow)
++{
++    uint8_t b[8];
++    mcp_read(FIFO_STA(MCP_FIFO_RX), b, 8); // FIFOSTA1 + FIFOUA1 in one transfer
++    uint32_t ua = b[4] | (b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
++    if (ua == 0xFFFFFFFFu) return MCP_ERR_SPI;
++    if (b[0] & FIFOSTA_RXOVIF) {
++        if (overflow) *overflow = true;
++        wr8(FIFO_STA(MCP_FIFO_RX), 0x00); // clears RXOVIF (other bits read-only in an RX FIFO)
++    }
++    if (!(b[0] & FIFOSTA_TFNRFNIF)) return 0;
++
++    uint16_t addr = (uint16_t)(RAM_START + (ua & 0xFFF));
++    uint8_t o[12 + 8];
++    mcp_read(addr, o, sizeof o);  // R0 ID, R1 flags, R2 timestamp, first 8 data bytes
++    uint32_t r0 = o[0] | (o[1] << 8) | ((uint32_t)o[2] << 16) | ((uint32_t)o[3] << 24);
++    uint8_t r1 = o[4];
++    f->ide = (r1 >> 4) & 1;
++    f->fdf = (r1 >> 7) & 1;
++    f->rtr = !f->fdf && ((r1 >> 5) & 1);  // FD frames have no remote frames (the bit is RRS there)
++    f->brs = f->fdf && ((r1 >> 6) & 1);
++    f->esi = f->fdf && (o[5] & 1);
++    f->dlc = r1 & 0xF;
++    f->id = f->ide ? (((r0 & 0x7FFu) << 18) | ((r0 >> 11) & 0x3FFFFu)) : (r0 & 0x7FFu);
++    f->ts = o[8] | (o[9] << 8) | ((uint32_t)o[10] << 16) | ((uint32_t)o[11] << 24);
++    uint8_t len = mcp251863_dlc_to_len(f->dlc);
++    if (!f->fdf && len > 8) len = 8;      // classic DLC 9..15 means 8 bytes
++    if (f->rtr && !f->fdf) len = 0;        // remote frame: DLC only, no data
++    if (len > g_rx_plsize_bytes) len = g_rx_plsize_bytes; // truncated by the FIFO payload size
++    f->len = len;
++    memcpy(f->data, &o[12], len < 8 ? len : 8);
++    if (len > 8) mcp_read((uint16_t)(addr + 20), &f->data[8], (size_t)(len - 8)); // FD only
++
++    wr8((uint16_t)(FIFO_CON(MCP_FIFO_RX) + 1), (uint8_t)(FIFOCON_UINC >> 8)); // release the object
++    return 1;
++}
++
++uint32_t mcp251863_read_tbc(void) { return rd32(REG_C1TBC); }
+diff --git a/src/mcp251863.h b/src/mcp251863.h
+new file mode 100644
+index 0000000..c4ec634
+--- /dev/null
++++ b/src/mcp251863.h
+@@ -0,0 +1,100 @@
++// Minimal SPI driver for the Microchip MCP251863 (MCP2518FD CAN FD controller
++// + ATA6563 transceiver in one package). RX via FIFO1 (accept-all filter,
++// time stamped, nINT on "FIFO not empty" / overflow); test TX via FIFO2/FIFO3.
++#ifndef MCP251863_H
++#define MCP251863_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "hardware/spi.h"
++
++typedef enum {
++    MCP_OK = 0,
++    MCP_ERR_SPI = -1,        // SPI readback / reset-state check failed (no chip, wiring, power)
++    MCP_ERR_OSC = -2,        // oscillator never became ready (crystal not running)
++    MCP_ERR_MODE = -3,       // controller refused the requested operating mode
++    MCP_ERR_BITTIMING = -4,  // no valid bit timing for the configured oscillator
++    MCP_ERR_TX_FULL = -5,    // TX FIFO still holds the previous frame
++} mcp_status_t;
++
++typedef struct {
++    uint32_t brp, tseg1, tseg2, sjw; // real values
++    uint32_t tq_per_bit, sample_point_permille;
++    uint32_t tdco, tdcmod;           // TDCO in SYSCLK periods; TDCMOD 2 = auto
++    uint32_t dbtcfg, tdc;            // register images (C1DBTCFG, C1TDC)
++} mcp_data_bittiming_t;
++
++typedef struct {
++    spi_inst_t *spi;
++    uint pin_miso, pin_mosi, pin_sck, pin_cs, pin_int, pin_stby;
++    uint32_t spi_hz;
++    uint32_t osc_hz;
++    uint32_t bitrate;
++    uint32_t data_bitrate;  // CAN FD data phase (BRS); 0 = classic CAN 2.0 only mode
++    bool listen_only;       // true: REQOP Listen Only (never ACKs / error-frames / transmits)
++} mcp251863_cfg_t;
++
++// FIFO layout (TEF and TXQ disabled, FIFO1 starts at RAM 0x400):
++//   FIFO1 RX, time stamped, 32 x 8 B payload  (32 x 20 B = 640 B)   classic build
++//                           16 x 64 B payload (16 x 76 B = 1216 B)  FD build
++//   FIFO2 TX classic, 1 x 8 B   (16 B)
++//   FIFO3 TX CAN FD,  1 x 64 B  (72 B)
++//   FIFO4..31 left at reset default (RX, 1 x 8 B, no TS = 28 x 16 B = 448 B)
++//   total 1176 B (classic) / 1752 B (FD) of 2048 B
++#define MCP_FIFO_RX      1
++#define MCP_FIFO_CLASSIC 2
++#define MCP_FIFO_FD      3
++#define MCP_RX_DEPTH_CLASSIC 32
++#define MCP_RX_DEPTH_FD      16
++
++typedef struct {
++    uint32_t id;       // 11 or 29 bit
++    bool ide, rtr, fdf, brs, esi;
++    uint8_t dlc;       // as received
++    uint8_t len;       // data bytes stored in data[] (<= FIFO payload size)
++    uint32_t ts;       // RXMSGTS: time base counter at SOF, 1 us/tick (TBCPRE)
++    uint8_t data[64];
++} mcp_rx_frame_t;
++
++typedef struct {
++    uint32_t brp, tseg1, tseg2, sjw; // real values (register value + 1)
++    uint32_t tq_per_bit;
++    uint32_t sample_point_permille;
++} mcp_bittiming_t;
++
++typedef struct {
++    bool txreq_pending; // FIFO still trying to send
++    bool tx_attempts_exhausted; // TXATIF: frame dropped after retries
++    bool tx_err, tx_lost_arb, tx_aborted;
++    uint8_t tec, rec;
++    bool bus_off, tx_passive, rx_passive, tx_warn, rx_warn;
++    uint32_t bdiag1;
++    uint8_t opmod;
++} mcp_tx_state_t;
++
++// Pure function (host-testable): compute nominal bit timing for classic CAN.
++bool mcp251863_calc_bittiming(uint32_t osc_hz, uint32_t bitrate, mcp_bittiming_t *bt);
++bool mcp251863_calc_data_bittiming(uint32_t osc_hz, uint32_t dbitrate, mcp_data_bittiming_t *d);
++uint8_t mcp251863_len_to_dlc(uint8_t len);
++uint8_t mcp251863_dlc_to_len(uint8_t dlc);
++
++mcp_status_t mcp251863_init(const mcp251863_cfg_t *cfg, mcp_bittiming_t *bt_out,
++                            mcp_data_bittiming_t *dbt_out, uint8_t *devid_out);
++#ifndef MCP251863_RX_ONLY // RX-only builds have no send functions at all
++// Classic CAN 2.0 frame via FIFO1 (unchanged behaviour from the first test).
++mcp_status_t mcp251863_send_std(uint16_t id, const uint8_t *data, uint8_t dlc);
++// CAN FD frame (FDF=1, optional BRS) via FIFO2; len rounded up to a valid FD length.
++mcp_status_t mcp251863_send_fd_std(uint16_t id, const uint8_t *data, uint8_t len, bool brs);
++#endif
++mcp_status_t mcp251863_read_tx_state_fifo(uint8_t fifo, mcp_tx_state_t *st);
++mcp_status_t mcp251863_read_tx_state(mcp_tx_state_t *st); // FIFO1
++void mcp251863_clear_tx_attempt_flag_fifo(uint8_t fifo);
++void mcp251863_clear_tx_attempt_flag(void); // FIFO1
++// Reads one frame from the RX FIFO. Returns 1 = frame read, 0 = FIFO empty,
++// MCP_ERR_SPI on a bad read. *overflow is set if the FIFO had overflowed since
++// the last call (RXOVIF, cleared here).
++int mcp251863_rx_read(mcp_rx_frame_t *f, bool *overflow);
++uint32_t mcp251863_read_tbc(void);  // C1TBC, same 1 us time base as RXMSGTS
++const char *mcp251863_strerror(mcp_status_t s);
++
++#endif
+diff --git a/src/mcp251863_bittiming.c b/src/mcp251863_bittiming.c
+new file mode 100644
+index 0000000..3fb13e9
+--- /dev/null
++++ b/src/mcp251863_bittiming.c
+@@ -0,0 +1,84 @@
++// Bit-timing calculation, kept free of SDK dependencies so it can be unit
++// tested on the host (see tests/test_bittiming.c).
++#include "mcp251863.h"
++
++// Classic CAN nominal bit timing. Prefers BRP=1 (largest number of TQ, best
++// resolution), sample point as close to 80 % as possible (CiA 601 / Microchip
++// reference configs), SJW = TSEG2.
++bool mcp251863_calc_bittiming(uint32_t osc_hz, uint32_t bitrate, mcp_bittiming_t *bt)
++{
++    if (!bt || bitrate == 0) return false;
++    for (uint32_t brp = 1; brp <= 256; brp++) {
++        if (osc_hz % (brp * bitrate)) continue;
++        uint32_t tq = osc_hz / (brp * bitrate);
++        // NBTCFG: TSEG1 1..256, TSEG2 1..128, SJW 1..128; need sync+tseg1+tseg2
++        if (tq < 8 || tq > 1 + 256 + 128) continue;
++        // sample point = (1 + tseg1) / tq; target 80 % rounded up to a TQ
++        uint32_t sp_tq = (tq * 80 + 99) / 100;
++        uint32_t tseg1 = sp_tq - 1;
++        uint32_t tseg2 = tq - sp_tq;
++        if (tseg2 < 2 || tseg2 > 128 || tseg1 < 1 || tseg1 > 256) continue;
++        bt->brp = brp;
++        bt->tseg1 = tseg1;
++        bt->tseg2 = tseg2;
++        bt->sjw = tseg2;
++        bt->tq_per_bit = tq;
++        bt->sample_point_permille = (1000 * sp_tq) / tq;
++        return true;
++    }
++    return false;
++}
++
++// CAN FD data-phase timing (DBTCFG + TDC). Precomputed table rather than a
++// search, so every supported combination is an explicit, reviewable entry.
++//   16 MHz: ~75 % sample point (few TQ available at 4 Mbit/s).
++//   40 MHz: Microchip reference values (MCP25xxFD API / AN), 80 % sample point.
++// TDCO = (DTSEG1_reg + 1) * DBRP  (Microchip recommendation), TDC auto mode.
++typedef struct { uint32_t osc, dbr; uint8_t brp, tseg1, tseg2, sjw; } dtab_t;
++static const dtab_t dtab[] = {
++    //  osc        dbitrate  BRP TSEG1 TSEG2 SJW   (real values, register = value - 1)
++    {16000000u, 1000000u,  1,  11,   4,   4},  // 16 TQ, SP 75.0 %
++    {16000000u, 2000000u,  1,   5,   2,   2},  //  8 TQ, SP 75.0 %
++    {16000000u, 4000000u,  1,   2,   1,   1},  //  4 TQ, SP 75.0 % (marginal, coarse)
++    {20000000u, 1000000u,  1,  15,   4,   4},  // 20 TQ, SP 80.0 %
++    {20000000u, 2000000u,  1,   7,   2,   2},  // 10 TQ, SP 80.0 %
++    {20000000u, 4000000u,  1,   3,   1,   1},  //  5 TQ, SP 80.0 %
++    {40000000u, 1000000u,  1,  31,   8,   8},  // 40 TQ, SP 80.0 %  DBTCFG 0x001E0707 TDCO 31
++    {40000000u, 2000000u,  1,  15,   4,   4},  // 20 TQ, SP 80.0 %  DBTCFG 0x000E0303 TDCO 15
++    {40000000u, 4000000u,  1,   7,   2,   2},  // 10 TQ, SP 80.0 %  DBTCFG 0x00060101 TDCO 7
++};
++
++bool mcp251863_calc_data_bittiming(uint32_t osc_hz, uint32_t dbitrate, mcp_data_bittiming_t *d)
++{
++    if (!d) return false;
++    for (unsigned i = 0; i < sizeof dtab / sizeof dtab[0]; i++) {
++        if (dtab[i].osc != osc_hz || dtab[i].dbr != dbitrate) continue;
++        d->brp = dtab[i].brp;
++        d->tseg1 = dtab[i].tseg1;
++        d->tseg2 = dtab[i].tseg2;
++        d->sjw = dtab[i].sjw;
++        d->tq_per_bit = 1u + d->tseg1 + d->tseg2;
++        d->sample_point_permille = (1000u * (1u + d->tseg1)) / d->tq_per_bit;
++        d->tdco = d->tseg1 * d->brp; // = (DTSEG1 register value + 1) * DBRP
++        d->tdcmod = 2;                            // auto: measure TDCV, add TDCO
++        d->dbtcfg = ((uint32_t)(d->brp - 1) << 24) | ((uint32_t)(d->tseg1 - 1) << 16) |
++                    ((uint32_t)(d->tseg2 - 1) << 8) | (uint32_t)(d->sjw - 1);
++        d->tdc = ((uint32_t)d->tdcmod << 16) | ((uint32_t)(d->tdco & 0x3F) << 8); // TDCV=0, SID11EN=0, EDGFLTEN=0
++        return osc_hz == d->brp * d->tq_per_bit * dbitrate;
++    }
++    return false;
++}
++
++uint8_t mcp251863_len_to_dlc(uint8_t len)
++{
++    static const uint8_t fd_len[] = {12, 16, 20, 24, 32, 48, 64};
++    if (len <= 8) return len;
++    for (uint8_t i = 0; i < 7; i++) if (len <= fd_len[i]) return (uint8_t)(9 + i);
++    return 15;
++}
++
++uint8_t mcp251863_dlc_to_len(uint8_t dlc)
++{
++    static const uint8_t l[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
++    return l[dlc & 0xF];
++}
+diff --git a/src/pico_can_record.h b/src/pico_can_record.h
+new file mode 100644
+index 0000000..a0629ce
+--- /dev/null
++++ b/src/pico_can_record.h
+@@ -0,0 +1,78 @@
++// CAN record in the pico-flexray bulk-IN record stream (endpoint 0x81).
++//
++// The stream is a sequence of records, each [u16 LE length field][body]:
++//   FlexRay format 1 : length = body length (< 0x8000), body[0] = source digits
++//                      (1 = FR1 -> SavvyCAN bus 0, 2 = FR2 -> bus 1, 13/14/23/24 ...)
++//   FlexRay format 2 : length = 0x8000 | body length, body[0] = 2 (version)
++//   CAN record (this): length = 0x8000 | body length, body[0] = 0x43 ('C')
++//
++//   offset size  field
++//     0     1    type   = PICO_CAN_REC_TYPE (0x43)
++//     1     1    bus    = 2 on the V2 board (SavvyCAN bus number)
++//     2     1    flags  bit0 IDE (29-bit ID), bit1 RTR, bit2 FDF, bit3 BRS,
++//                       bit4 ESI, bit7 data truncated (fewer bytes than DLC says)
++//     3     1    dlc    raw DLC 0..15 as received
++//     4     4    id     u32 LE, 11- or 29-bit identifier (no flag bits)
++//     8     4    time   u32 LE, device time in us at SOF (RP2350 time_us_32
++//                       clock, the same clock FlexRay format-2 records use;
++//                       wraps every ~71.6 min)
++//    12     n    data   n = body length - 12 bytes (0..8 classic, 0..64 FD;
++//                       0 for remote frames)
++//   body length = 12 + n  ->  14..22 bytes on the wire for classic CAN.
++//
++// Bit 15 of the length marks an "extended" record; body[0] says which kind.
++// CAN records are only sent after the host opts in with the vendor control
++// request PICOFLEX_SET_CAN_RECORDS (0xa1, wValue 1 = on, 0 = off, OUT, no data),
++// so hosts that don't know them (older SavvyCAN, flexray_stream_recorder.py)
++// never receive one. The setting returns to off on USB unmount/reset.
++#ifndef PICO_CAN_RECORD_H
++#define PICO_CAN_RECORD_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++#define PICO_REC_LEN_EXTENDED      0x8000u
++#define PICO_CAN_REC_TYPE          0x43u
++#define PICO_CAN_REC_HDR_LEN       12u
++#define PICO_CAN_REC_MAX_DATA      64u
++#define PICO_CAN_REC_MAX_WIRE      (2u + PICO_CAN_REC_HDR_LEN + PICO_CAN_REC_MAX_DATA)
++#define PICOFLEX_SET_CAN_RECORDS   0xa1u
++
++#define PICO_CAN_FLAG_IDE        0x01u
++#define PICO_CAN_FLAG_RTR        0x02u
++#define PICO_CAN_FLAG_FDF        0x04u
++#define PICO_CAN_FLAG_BRS        0x08u
++#define PICO_CAN_FLAG_ESI        0x10u
++#define PICO_CAN_FLAG_TRUNCATED  0x80u
++
++typedef struct {
++    uint8_t bus;
++    uint8_t flags;
++    uint8_t dlc;
++    uint8_t len;        // data bytes (<= PICO_CAN_REC_MAX_DATA)
++    uint32_t id;
++    uint32_t time_us;
++    uint8_t data[PICO_CAN_REC_MAX_DATA];
++} pico_can_record_t;
++
++// Encodes r into out (>= PICO_CAN_REC_MAX_WIRE bytes). Returns bytes written.
++static inline size_t pico_can_record_encode(const pico_can_record_t *r, uint8_t *out)
++{
++    uint8_t n = r->len > PICO_CAN_REC_MAX_DATA ? PICO_CAN_REC_MAX_DATA : r->len;
++    uint16_t lenf = (uint16_t)(PICO_REC_LEN_EXTENDED | (PICO_CAN_REC_HDR_LEN + n));
++    out[0] = (uint8_t)lenf;
++    out[1] = (uint8_t)(lenf >> 8);
++    out[2] = PICO_CAN_REC_TYPE;
++    out[3] = r->bus;
++    out[4] = r->flags;
++    out[5] = r->dlc;
++    for (int i = 0; i < 4; i++) {
++        out[6 + i] = (uint8_t)(r->id >> (8 * i));
++        out[10 + i] = (uint8_t)(r->time_us >> (8 * i));
++    }
++    memcpy(&out[14], r->data, n);
++    return 14u + n;
++}
++
++#endif
+diff --git a/src/v2_cantest.c b/src/v2_cantest.c
+new file mode 100644
+index 0000000..0c5dd3d
+--- /dev/null
++++ b/src/v2_cantest.c
+@@ -0,0 +1,345 @@
++// V2 board: status LEDs and the MCP251863 CAN channel.
++//   - RX (default): Listen Only, accept-all filter, nINT-driven drain on core0,
++//     frames go to the USB bulk-IN stream as CAN records on SavvyCAN bus 2.
++//   - Test TX (V2_CAN_TEST_TX=1, Normal mode only): 0x123 classic, 0x124 FD.
++#include <stdio.h>
++#include <string.h>
++#include "pico/stdlib.h"
++#include "hardware/gpio.h"
++#include "hardware/sync.h"
++#include "board_pico_flexray_v2.h"
++#include "mcp251863.h"
++#include "panda_usb.h"
++#include "pico_can_record.h"
++#include "v2_cantest.h"
++
++static const mcp251863_cfg_t can_cfg = {
++    .spi = V2_CAN_SPI,
++    .pin_miso = V2_CAN_SPI_MISO_PIN,
++    .pin_mosi = V2_CAN_SPI_MOSI_PIN,
++    .pin_sck = V2_CAN_SPI_SCK_PIN,
++    .pin_cs = V2_CAN_SPI_CS_PIN,
++    .pin_int = V2_CAN_INT_PIN,
++    .pin_stby = V2_CAN_STBY_PIN,
++    .spi_hz = V2_CAN_SPI_HZ,
++    .osc_hz = V2_CAN_OSC_HZ,
++    .bitrate = V2_CAN_NOMINAL_BITRATE,
++    .data_bitrate = V2_CAN_FD_DATA_BITRATE,
++    .listen_only = (V2_CAN_MODE == V2_CAN_MODE_LISTEN_ONLY),
++};
++
++#define FD_ENABLED (V2_CAN_FD_DATA_BITRATE != 0)
++#define LISTEN_ONLY (V2_CAN_MODE == V2_CAN_MODE_LISTEN_ONLY)
++
++static repeating_timer_t tick_timer;
++static volatile uint32_t tick_count;
++static volatile bool tick_due;
++static volatile uint32_t nint_edges;
++
++static mcp_status_t init_status = MCP_ERR_SPI;
++static bool can_ready;
++static uint32_t ticks_since_init_try;
++
++static struct {
++    uint32_t init_attempts;
++    uint32_t rx_frames, rx_std, rx_ext, rx_rtr, rx_fd;
++    uint32_t rx_overflows;    // RXOVIF events (>= 1 frame lost in the MCP each)
++    uint32_t rx_spi_errors;
++    uint32_t max_batch;
++    uint32_t last_id;
++    bool rx_activity;         // frame (or ACKed test TX) since last tick
++    absolute_time_t led2_hold_until;
++    bool led2_state;
++    mcp_tx_state_t last;      // last controller error state snapshot
++} st;
++
++static inline void led1(bool on)
++{
++    gpio_put(V2_LED1_PIN, on ? V2_LED_ON : V2_LED_OFF);
++    gpio_put(V2_PICO_ONBOARD_LED_PIN, on);
++}
++static inline void led2(bool on) { st.led2_state = on; gpio_put(V2_LED2_PIN, on ? V2_LED_ON : V2_LED_OFF); }
++static void led2_hold(uint32_t ms) { st.led2_hold_until = make_timeout_time_ms(ms); led2(true); }
++
++void v2_leds_init(void)
++{
++    const uint pins[] = {V2_LED1_PIN, V2_LED2_PIN, V2_PICO_ONBOARD_LED_PIN};
++    for (unsigned i = 0; i < 3; i++) {
++        gpio_init(pins[i]);
++        gpio_set_dir(pins[i], GPIO_OUT);
++        gpio_put(pins[i], 0);
++    }
++}
++
++// nINT (GP20, active low) falling edge: only wakes the core0 main loop out of
++// __wfe(); all SPI work happens in v2_cantest_poll(), which also checks the
++// pin level, so a missed edge cannot stall RX.
++static void nint_irq(uint gpio, uint32_t events)
++{
++    (void)gpio; (void)events;
++    nint_edges++;
++    __sev();
++}
++
++#if V2_CAN_TEST_TX
++typedef struct {
++    const char *name;
++    uint8_t fifo;
++    bool in_flight, was_failing;
++    uint8_t counter;
++    uint32_t queued, ok, fail, fifo_full;
++} stream_t;
++static stream_t s_classic = {.name = "0x123 classic", .fifo = MCP_FIFO_CLASSIC};
++static stream_t s_fd = {.name = "0x124 FD+BRS", .fifo = MCP_FIFO_FD};
++#endif
++
++void v2_can_init(void)
++{
++    mcp_bittiming_t bt = {0};
++    mcp_data_bittiming_t dbt = {0};
++    uint8_t devid = 0;
++    st.init_attempts++;
++    init_status = mcp251863_init(&can_cfg, &bt, &dbt, &devid);
++    can_ready = (init_status == MCP_OK);
++    ticks_since_init_try = 0;
++#if V2_CAN_TEST_TX
++    s_classic.in_flight = s_fd.in_flight = false;
++#endif
++    if (st.init_attempts == 1 || can_ready) {
++        printf("[CAN] MCP251863 on spi0 SCK=%d MOSI=%d MISO=%d CS=%d INT=%d STBY=%d, SPI %lu Hz\n",
++               V2_CAN_SPI_SCK_PIN, V2_CAN_SPI_MOSI_PIN, V2_CAN_SPI_MISO_PIN, V2_CAN_SPI_CS_PIN,
++               V2_CAN_INT_PIN, V2_CAN_STBY_PIN, (unsigned long)V2_CAN_SPI_HZ);
++        printf("[CAN] osc=%lu Hz nominal=%lu bit/s: BRP=%lu TQ/bit=%lu TSEG1=%lu TSEG2=%lu SJW=%lu SP=%lu.%lu%%\n",
++               (unsigned long)V2_CAN_OSC_HZ, (unsigned long)V2_CAN_NOMINAL_BITRATE,
++               (unsigned long)bt.brp, (unsigned long)bt.tq_per_bit, (unsigned long)bt.tseg1,
++               (unsigned long)bt.tseg2, (unsigned long)bt.sjw,
++               (unsigned long)(bt.sample_point_permille / 10), (unsigned long)(bt.sample_point_permille % 10));
++        if (FD_ENABLED)
++            printf("[CAN] FD data=%lu bit/s: DBTCFG=0x%08lx TDC=0x%08lx\n", (unsigned long)V2_CAN_FD_DATA_BITRATE,
++                   (unsigned long)dbt.dbtcfg, (unsigned long)dbt.tdc);
++    }
++    if (can_ready) {
++        static bool irq_done = false;
++        if (!irq_done) {
++            // Runs on core0, so the GPIO IRQ is core0's; core1 only uses PIO IRQs.
++            gpio_set_irq_enabled_with_callback(V2_CAN_INT_PIN, GPIO_IRQ_EDGE_FALL, true, nint_irq);
++            irq_done = true;
++        }
++        printf("[CAN] init OK (DEVID=0x%02x): %s, %s, RX FIFO1 %d x %d B accept-all -> USB bus %d%s\n",
++               devid, LISTEN_ONLY ? "LISTEN-ONLY (no ACK, no error frames, no TX)" : "NORMAL mode (ACKs!)",
++               FD_ENABLED ? "CAN FD" : "classic CAN 2.0",
++               FD_ENABLED ? MCP_RX_DEPTH_FD : MCP_RX_DEPTH_CLASSIC, FD_ENABLED ? 64 : 8, V2_CAN_USB_BUS,
++               V2_CAN_TEST_TX ? ", test TX 0x123 on" : "");
++        led2(false);
++    } else {
++        printf("[CAN] init FAILED (attempt %lu): %s - retrying every 5 s\n",
++               (unsigned long)st.init_attempts, mcp251863_strerror(init_status));
++        led2(true); // solid = failure
++    }
++}
++
++static bool tick_cb(repeating_timer_t *t)
++{
++    (void)t;
++    uint32_t n = ++tick_count;
++    const uint32_t half_s = 500 / V2_CAN_TICK_MS;
++    if ((n % half_s) == 0) led1(((n / half_s) & 1) != 0); // 1 Hz heartbeat
++    tick_due = true;
++    __sev();
++    return true;
++}
++
++void v2_tick_start(void)
++{
++    add_repeating_timer_ms(-V2_CAN_TICK_MS, tick_cb, NULL, &tick_timer);
++}
++
++// ---- RX ----------------------------------------------------------------------
++static void can_rx_service(void)
++{
++    // Bounded: at most V2_CAN_RX_MAX_PER_POLL frames (~65 us of SPI each at
++    // 4 MHz) per main-loop pass, so FlexRay notification handling and
++    // tud_task() keep running even on a fully loaded CAN bus.
++    if (gpio_get(V2_CAN_INT_PIN)) return; // nINT high: nothing pending
++
++    bool have_ref = false;
++    uint32_t tbc_ref = 0, us_ref = 0;
++    uint32_t n = 0;
++    for (; n < V2_CAN_RX_MAX_PER_POLL; n++) {
++        mcp_rx_frame_t f;
++        bool ovf = false;
++        int r = mcp251863_rx_read(&f, &ovf);
++        if (ovf) {
++            st.rx_overflows++;
++            led2_hold(V2_CAN_OVERFLOW_LED_MS);
++        }
++        if (r < 0) {
++            st.rx_spi_errors++;
++            printf("[CAN] SPI read failed during RX, re-initialising\n");
++            can_ready = false;
++            led2(true);
++            return;
++        }
++        if (r == 0) break;
++        if (!have_ref) {
++            // Map the controller's 1 us time base onto time_us_32() once per
++            // batch: frame time = now - (TBC now - RXMSGTS).
++            tbc_ref = mcp251863_read_tbc();
++            us_ref = time_us_32();
++            have_ref = true;
++        }
++        pico_can_record_t rec;
++        rec.bus = V2_CAN_USB_BUS;
++        rec.flags = (uint8_t)((f.ide ? PICO_CAN_FLAG_IDE : 0) | (f.rtr ? PICO_CAN_FLAG_RTR : 0) |
++                              (f.fdf ? PICO_CAN_FLAG_FDF : 0) | (f.brs ? PICO_CAN_FLAG_BRS : 0) |
++                              (f.esi ? PICO_CAN_FLAG_ESI : 0));
++        uint8_t full = mcp251863_dlc_to_len(f.dlc);
++        if (!f.fdf && full > 8) full = 8;
++        if (f.rtr && !f.fdf) full = 0;
++        if (f.len < full) rec.flags |= PICO_CAN_FLAG_TRUNCATED;
++        rec.dlc = f.dlc;
++        rec.len = f.len;
++        rec.id = f.id;
++        rec.time_us = us_ref + (uint32_t)(int32_t)(f.ts - tbc_ref); // signed: frames newer than tbc_ref
++        memcpy(rec.data, f.data, f.len);
++
++        st.rx_frames++;
++        if (f.ide) st.rx_ext++; else st.rx_std++;
++        if (f.rtr) st.rx_rtr++;
++        if (f.fdf) st.rx_fd++;
++        st.last_id = f.id;
++        st.rx_activity = true;
++        (void)panda_can_record_push(&rec); // never blocks; drops are counted in panda_usb.c
++    }
++    if (n > st.max_batch) st.max_batch = n;
++    // More frames left (nINT still low): make the next __wfe() return at once.
++    if (!gpio_get(V2_CAN_INT_PIN)) __sev();
++}
++
++#if V2_CAN_TEST_TX
++static void on_tx_result(stream_t *s, bool ok)
++{
++    if (ok) {
++        s->ok++;
++        if (s->was_failing) { printf("[CAN] %s TX recovered (ACK seen)\n", s->name); s->was_failing = false; }
++        st.rx_activity = true;
++    } else {
++        s->fail++;
++        if (!s->was_failing) {
++            printf("[CAN] %s TX failed: TEC=%u REC=%u%s%s BDIAG1=0x%08lx (no ACK? 2nd node + termination)\n",
++                   s->name, st.last.tec, st.last.rec, st.last.tx_passive ? " TX-PASSIVE" : "",
++                   st.last.bus_off ? " BUS-OFF" : "", (unsigned long)st.last.bdiag1);
++            s->was_failing = true;
++        }
++        led2_hold(V2_CAN_OVERFLOW_LED_MS);
++    }
++}
++
++static bool service_stream(stream_t *s)
++{
++    if (mcp251863_read_tx_state_fifo(s->fifo, &st.last) != MCP_OK) return false;
++    if (s->in_flight) {
++        on_tx_result(s, !st.last.txreq_pending && !st.last.tx_attempts_exhausted);
++        if (st.last.tx_attempts_exhausted) mcp251863_clear_tx_attempt_flag_fifo(s->fifo);
++        s->in_flight = false;
++    }
++    mcp_status_t r;
++    if (s->fifo == MCP_FIFO_CLASSIC) {
++        uint8_t data[8] = {s->counter, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE};
++        r = mcp251863_send_std(V2_CAN_TEST_ID, data, 8);
++    } else {
++        uint8_t data[V2_CAN_FD_TEST_LEN];
++        for (unsigned i = 0; i < sizeof data; i++) data[i] = (uint8_t)i;
++        data[0] = s->counter;
++        r = mcp251863_send_fd_std(V2_CAN_FD_TEST_ID, data, sizeof data, true);
++    }
++    if (r == MCP_OK) { s->counter++; s->queued++; s->in_flight = true; }
++    else { s->fifo_full++; on_tx_result(s, false); }
++    return true;
++}
++#endif
++
++static void housekeeping_tick(uint32_t n)
++{
++    // LED2: one toggle per 50 ms tick with RX activity -> visible <= 10 Hz
++    // flicker however busy the bus is; solid while a hold (overflow / TX
++    // failure) is active.
++    bool holding = !time_reached(st.led2_hold_until);
++    if (holding) led2(true);
++    else if (st.rx_activity) led2(!st.led2_state);
++    st.rx_activity = false;
++
++    // Error counters for status / panda health (cheap: once per second).
++    if ((n % (1000 / V2_CAN_TICK_MS)) == 0) {
++        if (mcp251863_read_tx_state_fifo(MCP_FIFO_RX, &st.last) != MCP_OK) {
++            printf("[CAN] SPI read failed, re-initialising\n");
++            can_ready = false;
++            led2(true);
++            return;
++        }
++    }
++#if V2_CAN_TEST_TX
++    stream_t *s = (n & 1) ? &s_fd : &s_classic;
++    if (s == &s_fd && !FD_ENABLED) return;
++    if (!service_stream(s)) { can_ready = false; led2(true); }
++#endif
++}
++
++void v2_cantest_poll(void)
++{
++    if (can_ready) can_rx_service();
++
++    if (!tick_due) return;
++    tick_due = false;
++    uint32_t n = tick_count;
++    if (!can_ready) {
++        if (++ticks_since_init_try >= 5000 / V2_CAN_TICK_MS) v2_can_init();
++        return;
++    }
++    housekeeping_tick(n);
++}
++
++void v2_cantest_print_status(void)
++{
++    if (!can_ready) {
++        printf("[CAN] not ready: %s (init attempts %lu)\n", mcp251863_strerror(init_status),
++               (unsigned long)st.init_attempts);
++        return;
++    }
++    panda_can_q_stats_t q;
++    panda_can_get_q_stats(&q);
++    printf("[CAN] RX %lu (std %lu ext %lu rtr %lu fd %lu) last ID 0x%lx | MCP overflows %lu | USB %s: sent %lu "
++           "queued %lu dropped %lu not-streamed %lu depth %u | max batch %lu nINT edges %lu | TEC=%u REC=%u%s opmod=%u\n",
++           (unsigned long)st.rx_frames, (unsigned long)st.rx_std, (unsigned long)st.rx_ext,
++           (unsigned long)st.rx_rtr, (unsigned long)st.rx_fd, (unsigned long)st.last_id,
++           (unsigned long)st.rx_overflows, q.enabled ? "on" : "off (host not opted in)", (unsigned long)q.sent,
++           (unsigned long)q.queued, (unsigned long)q.dropped, (unsigned long)q.not_streamed, q.depth,
++           (unsigned long)st.max_batch, (unsigned long)nint_edges, st.last.tec, st.last.rec,
++           st.last.bus_off ? " BUSOFF" : (st.last.rx_passive ? " RXPASSIVE" : ""), st.last.opmod);
++#if V2_CAN_TEST_TX
++    printf("[CAN] test TX 0x123: queued=%lu ok=%lu fail=%lu | 0x124: queued=%lu ok=%lu fail=%lu\n",
++           (unsigned long)s_classic.queued, (unsigned long)s_classic.ok, (unsigned long)s_classic.fail,
++           (unsigned long)s_fd.queued, (unsigned long)s_fd.ok, (unsigned long)s_fd.fail);
++#endif
++}
++
++void v2_can_fill_health(struct can_health_t *h)
++{
++    // panda health reports speeds in kbit/s (bus_config speed / 10 in panda fw)
++    h->bus_off = st.last.bus_off;
++    h->error_warning = st.last.tx_warn || st.last.rx_warn;
++    h->error_passive = st.last.tx_passive || st.last.rx_passive;
++    h->receive_error_cnt = st.last.rec;
++    h->transmit_error_cnt = st.last.tec;
++    h->total_rx_cnt = st.rx_frames;
++    h->total_rx_lost_cnt = st.rx_overflows; // overflow events (each >= 1 frame)
++#if V2_CAN_TEST_TX
++    h->total_tx_cnt = s_classic.ok + s_fd.ok;
++    h->total_error_cnt = s_classic.fail + s_fd.fail;
++#endif
++    h->can_speed = can_ready ? (uint16_t)(V2_CAN_NOMINAL_BITRATE / 1000) : 0;
++    h->can_data_speed = (can_ready && FD_ENABLED) ? (uint16_t)(V2_CAN_FD_DATA_BITRATE / 1000) : 0;
++    h->canfd_enabled = can_ready && FD_ENABLED;
++    h->brs_enabled = can_ready && FD_ENABLED;
++    h->canfd_non_iso = 0;
++}
+diff --git a/src/v2_cantest.h b/src/v2_cantest.h
+new file mode 100644
+index 0000000..a94784f
+--- /dev/null
++++ b/src/v2_cantest.h
+@@ -0,0 +1,23 @@
++// V2 board extras: status LEDs and the MCP251863 CAN channel (RX to USB as
++// SavvyCAN bus 2; optional test TX behind V2_CAN_TEST_TX).
++#ifndef V2_CANTEST_H
++#define V2_CANTEST_H
++#include <stdbool.h>
++#include <stdint.h>
++
++struct can_health_t;
++
++void v2_leds_init(void);
++// Initialise the CAN controller (blocking, < ~30 ms). Call on core0 before the
++// FlexRay cores are started. Prints the result over stdio.
++void v2_can_init(void);
++// Start the 50 ms hardware-alarm tick (LED1 heartbeat, LED2, status, test TX).
++void v2_tick_start(void);
++// Non-blocking service routine for the core0 main loop: drains at most
++// V2_CAN_RX_MAX_PER_POLL frames (~65 us SPI each) while nINT is low, then the
++// 50 ms housekeeping when due. Never waits on USB.
++void v2_cantest_poll(void);
++void v2_cantest_print_status(void);
++// Fills the panda CAN health struct from cached values (no SPI access).
++void v2_can_fill_health(struct can_health_t *h);
++#endif
+diff --git a/tests/host/run.sh b/tests/host/run.sh
+index bd42d01..55e584d 100755
+--- a/tests/host/run.sh
++++ b/tests/host/run.sh
+@@ -1,7 +1,6 @@
+ #!/bin/sh
+ # Host unit checks for the FIXED ts-capture build (pass-through repeater):
+-# TS-CAPTURE record encoder / timestamp matching. (The MCP251863 checks live on
+-# the ts-capture branch; this branch has no V2 CAN driver.)
++# TS-CAPTURE record encoder / timestamp matching, MCP251863 (V2 PT-CAN RX) driver checks.
+ set -e
+ cd "$(dirname "$0")"
+ if [ -f ../../src/mcp251863.c ]; then
+-- 
+2.47.3
+

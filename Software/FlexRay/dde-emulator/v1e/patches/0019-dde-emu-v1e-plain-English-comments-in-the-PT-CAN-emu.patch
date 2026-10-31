@@ -1,0 +1,87 @@
+From d7e490a9f1a88dd4d6466145d72c977be6df2eb8 Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Sat, 31 Oct 2026 16:27:33 +0000
+Subject: [PATCH] dde-emu v1e: plain-English comments in the PT-CAN emulator
+ (comments only, V2 UF2 byte-identical)
+
+---
+ src/ptcan_emu.c      | 10 ++++++++++
+ src/ptcan_emu_core.c | 36 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/src/ptcan_emu.c b/src/ptcan_emu.c
+index 89e3371..6d6e758 100644
+--- a/src/ptcan_emu.c
++++ b/src/ptcan_emu.c
+@@ -1,5 +1,15 @@
+ // PT-CAN DDE/EGS emulation TX glue, see ptcan_emu.h and ptcan_emu_core.h.
+ //
++// In plain words
++// --------------
++// This is the part that switches the V2 board's CAN chip (MCP251863) between
++// "listen only" (it can hear the car but cannot send, acknowledge or disturb anything)
++// and "normal" (it can send), and hands the frames chosen by ptcan_emu_core.c to it.
++// Listen only is the default after power-up. It changes to normal ONLY while the
++// laptop logger is running with --can-tx / --can-tx-ids and keeps saying so (every
++// 2 s; 20 s without that = off). Any problem drops it straight back to listen only
++// and it stays there until the logger is restarted.
++//
+ // Safety model
+ // - The MCP251863 boots in Listen Only (v2_cantest.c). Only while the host has CAN TX
+ //   enabled (and the keepalive is fresh, and no fault is latched) is it switched to
+diff --git a/src/ptcan_emu_core.c b/src/ptcan_emu_core.c
+index 74c85a6..33f811d 100644
+--- a/src/ptcan_emu_core.c
++++ b/src/ptcan_emu_core.c
+@@ -1,5 +1,23 @@
+ // PT-CAN DDE+EGS emulation core (v1e). See ptcan_emu_core.h.
+ //
++// In plain words
++// --------------
++// With the engine (DDE) and gearbox (EGS) removed, the rest of the car still expects
++// to hear their messages on PT-CAN. This file decides WHICH of those 19 messages to
++// send, WHEN, and WITH WHAT CONTENT, copying what the real DDE and EGS did in the
++// run 4 capture (ignition on, selector in P, engine off). It does not talk to the CAN
++// chip itself: ptcan_emu.c does that, and only when the laptop has switched TX on.
++//
++// The rules it follows, in order of importance:
++//   1. Never send anything on the "forbidden" list (pte_id_forbidden() below):
++//      immobiliser/EWS IDs, diagnostics (0x6xx), 0x137, 0x27A, 0x598.
++//   2. Never wake the car or keep it awake: send only while the car itself has been
++//      talking on PT-CAN in the last 200 ms, and stop each message when the real ECU
++//      stopped it after ignition off (so the bus can go to sleep on time).
++//   3. Copy the real frames: same length, same period, same bytes, and for the 7
++//      protected frames the same checksum (CRC8, polynomial 0x1D) and 0..14 counter.
++//   4. 0x592 is only ever the "MIL off" (engine light off) message, never MIL on.
++//
+ // All content timelines are the run 4 "ddecan" capture (real DDE + EGS, KL15 on with
+ // the engine off, selector in P), measured relative to:
+ //   W   = first PT-CAN frame after bus sleep (wake),
+@@ -11,6 +29,24 @@
+ #define MS(x) ((uint64_t)(x) * 1000u)
+ #define NO_E2E 0xFFFFu
+ 
++// The 19 emulated frames, one line each. Columns:
++//   id     CAN identifier
++//   dlc    number of data bytes
++//   kind   CYCLIC = sent every 'period'; CYC_EVENT = cyclic plus an extra copy when
++//          the content changes; NM512/NM518 = network-management ("stay awake")
++//          frames of the DDE/EGS; CC592 = the DDE's check-control (MIL off) frame
++//   dataID E2E data ID used in the checksum, NO_E2E = frame has no checksum
++//   hi     fixed value of the high nibble next to the counter in byte 1
++//   egs    1 = this is an EGS (gearbox) frame, 0 = DDE (engine) frame
++//   period ms between frames (measured in run 4)
++//   first  ms after the bus wakes until the first frame (as the real ECU)
++//   evgap  minimum ms between event copies
++//
++// Which ECU / what for (EGS first, then DDE):
++//   EGS: 0x3FD gear display (P), 0x39A gear/P-lock status, 0x396, 0x518 EGS NM
++//   DDE: 0x3F9 engine status (Park, engine off), 0x0A5/0x0D9/0x0DC/0x0F3/0x08F fast
++//        torque/engine frames, 0x2C4, 0x281, 0x1B9, 0x381, 0x3B3, 0x397, 0x3FB,
++//        0x512 DDE NM, 0x592 check-control (MIL off only)
+ const pte_def_t pte_defs[PTE_N_FRAMES] = {
+     //            id  dlc kind             dataID  hi egs period first  evgap
+     [PTE_F_3F9] = {0x3F9, 8, PTE_K_CYC_EVENT, 0x0037, 1, 0, 1000, 439, 1},
+-- 
+2.47.3
+
