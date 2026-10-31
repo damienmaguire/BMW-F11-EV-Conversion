@@ -26,6 +26,23 @@ switches TX off by itself if it hears nothing for 20 s), the emulator counters
 is disabled again on exit, Ctrl-C or any error. With the v1b firmware the 0xa4
 stats also carry the first fault (code, slot, cycle, time, counters at the fault)
 and per-reason late counters; the first fault is printed once as "EMU FAULT ...".
+v1d (stats v4, 256 bytes; older firmware answers 64/128/192 and still works): the
+emu line also shows KL15 (source 0xF1/0x103, edges, time since off), the 0x5C NM
+state and the time left before the 60 s hard ceiling, and the 0x10A/0x142/0x68 counts.
+
+--can (V2 board): PT-CAN frames (MCP251863, listen-only) are logged to
+<output>.can.csv and, together with the FlexRay frames, to a SavvyCAN CSV
+<output>.savvy.csv (FR1 = bus 0, FR2 = bus 1, PT-CAN = bus 2). Status lines show
+"can=N (bus2:N ids=K)". On a V1 board the request is refused and ignored.
+
+--can-tx / --can-tx-ids LIST (v1e DDE emulator firmware, V2 board; implies --can):
+enable the PT-CAN DDE/EGS frame emulation (vendor request 0xa5: 0 = clear, then the
+ID mask; repeated every 2 s as keepalive, the firmware stops by itself 20 s after the
+last one). --can-tx = every emulated ID; --can-tx-ids takes hex IDs and/or set names,
+comma separated: step1 (3F9), step2 (+3FD), step3 (+39A), step4 (+396,518), step5/all,
+dde, egs. The firmware only transmits while PT-CAN traffic is present (silence >200 ms
+stops it). The counters (vendor request 0xa6) are printed with every status line as
+"cantx: ...". TX is disabled on exit, Ctrl-C or any error. Default: no CAN TX at all.
 """
 import argparse
 import csv
@@ -78,7 +95,7 @@ def start_console_log(path, argv):
 
 
 class Logger:
-    def __init__(self, out_csv, can_csv=None, fine_hz=100_000_000, quiet=False):
+    def __init__(self, out_csv, can_csv=None, fine_hz=100_000_000, quiet=False, savvy_csv=None):
         self.f = open(out_csv, "w", newline="")
         self.w = csv.DictWriter(self.f, fieldnames=frts.CSV_COLUMNS)
         self.w.writeheader()
@@ -87,11 +104,17 @@ class Logger:
             self.cf = open(can_csv, "w", newline="")
             self.cw = csv.DictWriter(self.cf, fieldnames=frts.CAN_CSV_COLUMNS)
             self.cw.writeheader()
+        self.sf = None
+        if savvy_csv:
+            self.sf = open(savvy_csv, "w", newline="")
+            self.sf.write(frts.SAVVY_HEADER + "\n")
         self.parser = frts.RecordParser()
         self.clock = frts.DeviceClock(fine_hz)
         self.seq = frts.SeqTracker()
         self.n_fr = 0
         self.n_can = 0
+        self.can_by_bus = {}
+        self.can_ids = set()
         self.n_hw = 0
         self.by_ch = {}
         self.fmt_seen = set()
@@ -101,8 +124,13 @@ class Logger:
         for rec in self.parser.feed(data):
             if rec["kind"] == "can":
                 self.n_can += 1
+                self.can_by_bus[rec["bus"]] = self.can_by_bus.get(rec["bus"], 0) + 1
+                self.can_ids.add(rec["can_id"])
+                t = self.can_time(rec["t_us_raw"])
                 if self.cf:
-                    self.cw.writerow(frts.can_csv_row(rec, host_time))
+                    self.cw.writerow(frts.can_csv_row(rec, host_time, t))
+                if self.sf:
+                    self.sf.write(frts.savvy_can_row(rec, t) + "\n")
                 continue
             self.n_fr += 1
             self.fmt_seen.add(rec["fmt"])
@@ -116,23 +144,42 @@ class Logger:
             ch = frts.channel_name(rec["source"])
             self.by_ch[ch] = self.by_ch.get(ch, 0) + 1
             self.w.writerow(frts.fr_csv_row(rec, t, host_time))
+            if self.sf:
+                self.sf.write(frts.savvy_fr_row(rec, t) + "\n")
+
+    def can_time(self, t_us_raw):
+        """CAN records carry time_us_32 (same clock as FlexRay): put them on the FlexRay
+        device time axis (unwrapped around the latest FlexRay timestamp)."""
+        c = self.clock
+        if c.last_raw is None:
+            return float(c.unwrap(t_us_raw))
+        delta = ((t_us_raw - c.last_raw + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+        return float(c.t64 + delta)
+
+    def can_summary(self):
+        if not self.n_can:
+            return "can=0"
+        return "can=%d (%s ids=%d)" % (self.n_can, " ".join("bus%d:%d" % kv for kv in sorted(self.can_by_bus.items())),
+                                       len(self.can_ids))
 
     def summary(self):
-        return ("frames=%d (%s) hw_ts=%d (%.1f%%) seq_gaps=%d seq_missing=%d can=%d "
+        return ("frames=%d (%s) hw_ts=%d (%.1f%%) seq_gaps=%d seq_missing=%d %s "
                 "clock_anomalies=%d bytes_skipped=%d formats=%s" % (
                     self.n_fr, " ".join("%s:%d" % kv for kv in sorted(self.by_ch.items())),
                     self.n_hw, 100.0 * self.n_hw / max(1, self.n_fr), self.seq.gaps, self.seq.missing,
-                    self.n_can, self.clock.anomalies, self.parser.bytes_skipped,
+                    self.can_summary(), self.clock.anomalies, self.parser.bytes_skipped,
                     ",".join(str(x) for x in sorted(self.fmt_seen)) or "-"))
 
     def close(self):
         self.f.close()
         if self.cf:
             self.cf.close()
+        if self.sf:
+            self.sf.close()
 
 
 def replay(args):
-    lg = Logger(args.output, args.can_csv, args.fine_hz)
+    lg = Logger(args.output, args.can_csv, args.fine_hz, savvy_csv=args.savvy_csv)
     with open(args.replay, "rb") as f:
         while True:
             chunk = f.read(65536)
@@ -196,7 +243,7 @@ def live(args):
             print("note: CAN records not supported by this board (main board build) - ignored")
     ctrl_out(frts.REQ_RESET_COMMS, 0)
 
-    lg = Logger(args.output, args.can_csv, fine_hz)
+    lg = Logger(args.output, args.can_csv, fine_hz, savvy_csv=args.savvy_csv)
     raw = open(args.raw, "wb") if args.raw else None
     stop = {"flag": False}
 
@@ -261,9 +308,47 @@ def live(args):
                 print("EMU %s (logger t=%+.1fs)" % (ff, time.time() - t_start - d["ff_age_s"]))
         return frts.fmt_emu(d)
 
+    cantx = {"on": False, "prev": None, "fault": None}
+
+    def cantx_set(mask):
+        dev.ctrl_transfer(0x40, frts.REQ_SET_CANTX, mask & 0xFFFF, (mask >> 16) & 0xFFFF, None, timeout=1000)
+
+    def cantx_line(delta=False):
+        try:
+            d = frts.parse_cantx_stats(dev.ctrl_transfer(0xC0, frts.REQ_GET_CANTX, 0, 0,
+                                                         frts.CANTX_STATS_STRUCT.size, timeout=1000))
+        except usb.core.USBError:
+            return "(PT-CAN TX stats read failed)"
+        if d and d["fault"] and d["fault"] != cantx["fault"]:
+            print("CANTX FAULT: %s%s - PT-CAN TX stopped, controller back to Listen Only (logger t=%.1fs)"
+                  % (frts.CANTX_FAULTS[d["fault"]] if d["fault"] < len(frts.CANTX_FAULTS) else d["fault"],
+                     (" (ID 0x%03X)" % d["fault_id"]) if d["fault"] == 1 else "", time.time() - t_start))
+        if d:
+            cantx["fault"] = d["fault"]
+        line = frts.fmt_cantx(d, cantx["prev"] if delta else None)
+        if d and delta:
+            cantx["prev"] = d["tx"]
+        return line
+
     emu_on = False
     next_keepalive = 0.0
     try:
+        if args.can_tx_mask:
+            time.sleep(0.5)   # capture running first
+            try:
+                cantx_set(0)  # clear any latched fault
+                cantx_set(args.can_tx_mask)
+            except usb.core.USBError as e:
+                print("ERROR: the device refused PT-CAN TX (%s).\n"
+                      "It is not running the v1e (or later) DDE emulator firmware for the V2 board "
+                      "(pico_flexray_dde_emu_v1e_ignon_v2.uf2); V1 boards have no CAN." % e, file=sys.stderr)
+                stop["flag"] = True
+                raise SystemExit(1)
+            cantx["on"] = True
+            next_keepalive = time.time() + 2.0
+            print("PT-CAN TX ENABLED for %s (sends only while PT-CAN is awake). Ctrl-C disables it."
+                  % " ".join("0x%03X" % i for i in frts.cantx_ids_of(args.can_tx_mask)))
+            print("cantx: " + cantx_line(True))
         if args.emulate:
             time.sleep(0.5)   # capture running first
             try:
@@ -296,13 +381,20 @@ def live(args):
             if stop["flag"] and not th.is_alive():
                 continue
             now = time.time()
-            if emu_on and now >= next_keepalive:
+            if (emu_on or cantx["on"]) and now >= next_keepalive:
                 next_keepalive = now + 2.0
-                try:
-                    emu_set(1)
-                except usb.core.USBError:
-                    print("emu: keepalive failed (USB)", file=sys.stderr)
-                emu_line()   # prints "EMU FAULT ..." as soon as a first fault appears
+                if emu_on:
+                    try:
+                        emu_set(1)
+                    except usb.core.USBError:
+                        print("emu: keepalive failed (USB)", file=sys.stderr)
+                    emu_line()   # prints "EMU FAULT ..." as soon as a first fault appears
+                if cantx["on"]:
+                    try:
+                        cantx_set(args.can_tx_mask)
+                    except usb.core.USBError:
+                        print("cantx: keepalive failed (USB)", file=sys.stderr)
+                    cantx_line()   # prints "CANTX FAULT ..." as soon as a fault appears
             if now >= next_status:
                 rate = (lg.n_fr - last_n) / max(1e-6, now - last_t)
                 last_n, last_t = lg.n_fr, now
@@ -316,12 +408,32 @@ def live(args):
                 print("         device: " + di)
                 if emu_on:
                     print("         emu: " + emu_line())
+                if cantx["on"]:
+                    print("         cantx: " + cantx_line(True))
                 if raw:
                     raw.flush()
                 lg.f.flush()
         if rd["fatal"]:
             print(rd["fatal"], file=sys.stderr)
     finally:
+        if args.can_tx_mask and not cantx["on"]:
+            try:
+                cantx_set(0)   # enable was refused or never sent: best effort, no warning
+            except Exception:
+                pass
+        if cantx["on"]:
+            # PT-CAN TX off first, before anything else can fail
+            for _ in range(3):
+                try:
+                    cantx_set(0)
+                    print("PT-CAN TX DISABLED")
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            else:
+                print("WARNING: could not disable PT-CAN TX over USB - unplug the pico! "
+                      "(the firmware also stops by itself 20 s after the last keepalive)", file=sys.stderr)
+            print("cantx at stop: " + cantx_line(True))
         if args.emulate:
             # TX off first, before anything else can fail
             for _ in range(3):
@@ -365,7 +477,16 @@ def main(argv=None):
     ap.add_argument("--can", action="store_true", help="also log CAN records (V2 board only)")
     ap.add_argument("--emulate", action="store_true",
                     help="DDE emulator firmware: enable FR1 TX while logging, disable on exit")
+    ap.add_argument("--can-tx", action="store_true",
+                    help="v1e V2 DDE emulator: enable PT-CAN DDE/EGS frame TX, all IDs (implies --can; off by default)")
+    ap.add_argument("--can-tx-ids", default=None, metavar="LIST",
+                    help="like --can-tx but only these: hex IDs and/or sets, comma separated "
+                         "(step1=3F9, step2=+3FD, step3=+39A, step4=+396,518, step5/all, dde, egs), e.g. 3F9 or 3F9,3FD,39A")
     ap.add_argument("--can-csv", default=None, help="CAN CSV output (default <output>.can.csv with --can)")
+    ap.add_argument("--savvy-csv", default=None,
+                    help="combined SavvyCAN CSV: FR1 = bus 0, FR2 = bus 1, PT-CAN = bus 2 "
+                         "(default <output>.savvy.csv with --can in live mode; --no-savvy-csv to disable)")
+    ap.add_argument("--no-savvy-csv", action="store_true", help="do not write the combined SavvyCAN CSV")
     ap.add_argument("--fine-hz", type=int, default=100_000_000,
                     help="fine counter rate for --replay (live mode reads it from the device)")
     ap.add_argument("--console-log", default=None,
@@ -375,6 +496,15 @@ def main(argv=None):
                     help="bytes per USB bulk read, multiple of 64 (default %(default)s)")
     ap.add_argument("--read-timeout-ms", type=int, default=100, help="USB bulk read timeout, ms")
     args = ap.parse_args(argv)
+    args.can_tx_mask = 0
+    if args.can_tx_ids is not None or args.can_tx:
+        if args.replay:
+            ap.error("--can-tx/--can-tx-ids are for live capture only")
+        try:
+            args.can_tx_mask = frts.cantx_mask(args.can_tx_ids if args.can_tx_ids is not None else "all")
+        except ValueError as e:
+            ap.error(str(e))
+        args.can = True
     if args.read_size % 64:
         ap.error("--read-size must be a multiple of 64")
     if args.raw is None and not args.no_raw and not args.replay:
@@ -385,6 +515,10 @@ def main(argv=None):
         args.can_csv = args.output + ".can.csv"
     if args.replay and not args.can_csv:
         args.can_csv = None
+    if args.savvy_csv is None and args.can and not args.replay and not args.no_savvy_csv:
+        args.savvy_csv = args.output + ".savvy.csv"
+    if args.no_savvy_csv:
+        args.savvy_csv = None
     if args.console_log is None and not args.no_console_log:
         args.console_log = args.output + ".console.log"
     if args.no_console_log:

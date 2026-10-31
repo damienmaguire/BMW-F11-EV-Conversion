@@ -16,7 +16,9 @@ REQ_SET_RECORD_FORMAT = 0xA0
 REQ_SET_CAN_RECORDS = 0xA1
 REQ_GET_TS_INFO = 0xA2
 REQ_SET_EMU = 0xA3        # DDE emulator build: wValue 1 = enable TX / keepalive, 0 = disable + clear fault
-REQ_GET_EMU = 0xA4        # DDE emulator build: stats, 64/128/192 bytes by version (src/dde_emu.h dde_emu_stats_t)
+REQ_GET_EMU = 0xA4        # DDE emulator build: stats, 64/128/192/256 bytes by version (src/dde_emu.h dde_emu_stats_t)
+REQ_SET_CANTX = 0xA5      # v1e V2 DDE emulator: PT-CAN TX ID mask, wValue = bits 0..15, wIndex = bits 16..31, 0 = off
+REQ_GET_CANTX = 0xA6      # v1e: PT-CAN TX stats (src/ptcan_emu.h ptcan_stats_t, 178 bytes)
 REQ_RESET_COMMS = 0xC0
 
 FLAG_FRAME_CRC_OK = 0x01
@@ -39,7 +41,7 @@ CSV_COLUMNS = [
     "null_frame", "sync", "startup", "t_us_raw", "t_fine", "seq", "rec_flags", "ts_hw",
     "rec_format", "host_time_s",
 ]
-CAN_CSV_COLUMNS = ["t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s"]
+CAN_CSV_COLUMNS = ["t_us", "t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s"]
 
 
 EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h (v1 layout = first 64 bytes of v2)
@@ -48,7 +50,10 @@ EMU_STATS_V2_STRUCT = struct.Struct("<4B6Ii4B5H2BhH3I")  # bytes 64..127 (v2, fi
 assert EMU_STATS_V2_STRUCT.size == 64
 EMU_STATS_V3_STRUCT = struct.Struct("<6I6H7HH3H2BHH")  # bytes 128..191 (v3, firmware v1c: dynamic frames)
 assert EMU_STATS_V3_STRUCT.size == 64
-EMU_STATS_LEN = 192   # request this many; v1 firmware answers 64, v1b 128
+EMU_STATS_V4_STRUCT = struct.Struct("<3I3H3H2B3H2I4h2H2BH2I")  # bytes 192..255 (v4, firmware v1d)
+assert EMU_STATS_V4_STRUCT.size == 64
+EMU_STATS_LEN = 256   # request this many; v1 firmware answers 64, v1b 128, v1c 192
+EMU_DYN_PDUS2 = ("10A", "142", "68")
 EMU_DYN_PDUS = ("E6", "FB5", "FB7", "FB9", "E8L9", "E8L5")
 EMU_DYN_SKIP_REASONS = ("anchor", "mark", "passed", "len", "grid", "limit", "late")
 EMU_LATE_REASONS = ("busy", "fire", "short", "win", "missed")
@@ -56,6 +61,101 @@ EMU_STATES = {0: "disabled", 1: "no-lock", 2: "arming", 3: "ACTIVE", 4: "FAULT"}
 EMU_FAULTS = {0: "none", 1: "TX state machine stuck", 2: "DDE frame seen that we did not send (DDE still connected?)",
               3: "own frames not seen on FR1 RX (wiring / transceiver?)"}
 EMU_SLOTS = ("0x26", "0x28", "0x29", "0x3D", "0x5C")
+
+
+# ---- v1e PT-CAN DDE/EGS emulation TX (V2 board) ---------------------------------
+# Index = mask bit; order and IDs must match src/ptcan_emu_core.h (checked by tests/host/run.sh).
+CANTX_IDS = (0x3F9, 0x3FD, 0x39A, 0x396, 0x518, 0x0A5, 0x0D9, 0x0DC, 0x0F3, 0x08F,
+             0x2C4, 0x281, 0x1B9, 0x381, 0x3B3, 0x397, 0x3FB, 0x512, 0x592)
+CANTX_EGS = (0x3FD, 0x39A, 0x396, 0x518)
+CANTX_SETS = {
+    "step1": (0x3F9,),
+    "step2": (0x3F9, 0x3FD),
+    "step3": (0x3F9, 0x3FD, 0x39A),
+    "step4": (0x3F9, 0x3FD, 0x39A, 0x396, 0x518),
+    "step5": CANTX_IDS,
+    "all": CANTX_IDS,
+    "egs": CANTX_EGS,
+    "dde": tuple(i for i in CANTX_IDS if i not in CANTX_EGS),
+}
+CANTX_STATS_STRUCT = struct.Struct("<BBBBIHBBBBBBIIIiiiiiIIII19H19I")
+assert CANTX_STATS_STRUCT.size == 178
+CANTX_STATES = ("off", "wait-bus", "RUN", "silent", "prep-sleep", "FAULT")
+CANTX_FAULTS = ("none", "foreign sender of an emulated ID (real DDE/EGS still on the bus?)", "BUS-OFF",
+                "TX error passive", "controller mode change failed", "SPI")
+
+
+def cantx_mask(spec):
+    """'--can-tx-ids' value -> mask. Set names (step1..step5, dde, egs, all) and/or hex IDs,
+    comma separated ('3F9', '3F9,3FD,39A', 'step2,396'). Raises ValueError."""
+    mask = 0
+    for tok in str(spec).replace(" ", "").split(","):
+        if not tok:
+            continue
+        ids = CANTX_SETS.get(tok.lower())
+        if ids is None:
+            try:
+                v = int(tok, 16)
+            except ValueError:
+                raise ValueError("unknown CAN TX set or ID %r (sets: %s)" % (tok, ", ".join(CANTX_SETS)))
+            if v not in CANTX_IDS:
+                raise ValueError("0x%X is not an emulated PT-CAN ID (emulated: %s)"
+                                 % (v, " ".join("%03X" % i for i in CANTX_IDS)))
+            ids = (v,)
+        for i in ids:
+            mask |= 1 << CANTX_IDS.index(i)
+    if not mask:
+        raise ValueError("empty CAN TX selection")
+    return mask
+
+
+def cantx_ids_of(mask):
+    return [i for b, i in enumerate(CANTX_IDS) if mask >> b & 1]
+
+
+def parse_cantx_stats(raw):
+    raw = bytes(raw)
+    if len(raw) < CANTX_STATS_STRUCT.size:
+        return None
+    v = CANTX_STATS_STRUCT.unpack_from(raw)
+    names = ("version", "state", "fault", "flags", "mask", "fault_id", "st_kl", "n_frames", "tec", "rec", "opmod",
+             "reserved", "rx_frames", "n12f", "wakes", "ms_wake", "ms_rx", "ms_on", "ms_off", "ms_fnm",
+             "tx_total", "fifo_full", "tx_fail", "mode_switches")
+    d = dict(zip(names, v[:24]))
+    d["ids"] = list(v[24:43])
+    d["tx"] = list(v[43:62])
+    fl = d["flags"]
+    for b, k in enumerate(("enabled", "normal", "kl15", "kl15_ever", "bus_off", "tx_passive", "rx_passive",
+                           "keepalive_lost")):
+        d[k] = bool(fl >> b & 1)
+    return d
+
+
+def _cantx_ago(ms):
+    return "-" if ms < 0 else "%.1fs" % (ms / 1000.0)
+
+
+def fmt_cantx(d, prev_tx=None):
+    """One status line. prev_tx: per-ID counts at the previous line (for +deltas)."""
+    if d is None:
+        return "(short PT-CAN TX stats)"
+    st = CANTX_STATES[d["state"]] if d["state"] < len(CANTX_STATES) else str(d["state"])
+    flt = CANTX_FAULTS[d["fault"]] if d["fault"] < len(CANTX_FAULTS) else str(d["fault"])
+    s = "%s%s ctl=%s mask=%s | KL15=%s(ST_KL %X) wake %s rx %s on %s off %s | tx %d fifo-full %d fail %d TEC %d REC %d%s" % (
+        st, (" FAULT=%s%s" % (flt, (" id=0x%03X" % d["fault_id"]) if d["fault"] == 1 else "")) if d["fault"] else "",
+        "Normal" if d["normal"] else "ListenOnly", ",".join("%03X" % i for i in cantx_ids_of(d["mask"])) or "-",
+        "on" if d["kl15"] else "off", d["st_kl"], _cantx_ago(d["ms_wake"]), _cantx_ago(d["ms_rx"]),
+        _cantx_ago(d["ms_on"]), _cantx_ago(d["ms_off"]), d["tx_total"], d["fifo_full"], d["tx_fail"], d["tec"],
+        d["rec"], " BUS-OFF" if d["bus_off"] else (" TX-PASSIVE" if d["tx_passive"] else ""))
+    if d["keepalive_lost"]:
+        s += " KEEPALIVE-LOST"
+    per = []
+    for k, (i, n) in enumerate(zip(d["ids"], d["tx"])):
+        if n or (d["mask"] >> k & 1):
+            per.append("%03X=%d%s" % (i, n, ("(+%d)" % (n - prev_tx[k])) if prev_tx else ""))
+    if per:
+        s += " | " + " ".join(per)
+    return s
 
 
 def parse_emu_stats(raw):
@@ -79,7 +179,51 @@ def parse_emu_stats(raw):
         x = EMU_STATS_V3_STRUCT.unpack(bytes(raw[128:192]))
         d.update(v3=True, dyn_sent=list(x[0:6]), dyn_skip=list(x[6:12]), dyn_skip_reason=list(x[12:19]),
                  dyn_defer=x[19], dyn_last_ms=list(x[20:23]), ign=x[23], dyn_flags=x[24], dyn_parks=x[25])
+    d["v4"] = False
+    if d["version"] >= 4 and len(raw) >= 256:
+        y = EMU_STATS_V4_STRUCT.unpack(bytes(raw[192:256]))
+        d.update(v4=True, dyn_sent2=list(y[0:3]), dyn_skip2=list(y[3:6]), dyn_last_ms2=list(y[6:9]),
+                 kl15=y[9], f1_b3=y[10], kl15_on_edges=y[11], kl15_off_edges=y[12], nm_ceiling_stops=y[13],
+                 kl15_off_ago_ms=y[14], ceil_left_ms=y[15], isr_late_min_us=y[16], isr_late_max_us=y[17],
+                 r_entry_min=y[18], r_final_min=y[19], topup_timeouts=y[20], hk_deferred=y[21],
+                 dyn_flags2=y[22], ph142=y[23], abs_cycle=y[25])
     return d
+
+
+def emu_slot_name(d, slot):
+    """ff_slot / last_late_slot are 8 bits: v1d's 0x10A / 0x142 show up as 0x0A / 0x42."""
+    if d.get("v4") and slot in (0x0A, 0x42):
+        return "0x1%02X" % slot
+    return "0x%02X" % slot
+
+
+def fmt_emu_kl15(d):
+    """v1d KL15 / NM part of the emu line, '' for older firmware."""
+    if not d.get("v4"):
+        return ""
+    k = d["kl15"]
+    src = "F1" if k & 4 else ("103" if k & 8 else "none")
+    s = "kl15=%s(src=%s f1b3=0x%02X on=%d off=%d" % (
+        "ON" if k & 1 else ("off(was on)" if k & 2 else "off"), src, d["f1_b3"],
+        d["kl15_on_edges"], d["kl15_off_edges"])
+    if d["kl15_off_ago_ms"] != 0xFFFFFFFF:
+        s += " off_ago=%.1fs" % (d["kl15_off_ago_ms"] / 1000.0)
+    s += ") nm=%s ceil_left=%.1fs" % ("TX" if k & 16 else "quiet", d["ceil_left_ms"] / 1000.0)
+    if k & 32 or d["nm_ceiling_stops"]:
+        s += " CEILING(stops=%d)" % d["nm_ceiling_stops"]
+    s += " dyn2[%s] ms2[%s] ph142=%d abs=%d" % (
+        " ".join("%s=%d" % (n, c) for n, c in zip(EMU_DYN_PDUS2, d["dyn_sent2"])),
+        " ".join("%s=%d" % (n, c) for n, c in zip(EMU_DYN_PDUS2, d["dyn_last_ms2"])),
+        d["ph142"], d["abs_cycle"])
+    if any(d["dyn_skip2"]):
+        s += " skip2[%s]" % " ".join("%s=%d" % (n, c) for n, c in zip(EMU_DYN_PDUS2, d["dyn_skip2"]) if c)
+    s += " isr_late=%d..%dus r_min=%d/%d" % (d["isr_late_min_us"], d["isr_late_max_us"],
+                                             d["r_entry_min"], d["r_final_min"])
+    if d["topup_timeouts"]:
+        s += " TOPUP_TIMEOUTS=%d" % d["topup_timeouts"]
+    if d["dyn_flags2"] & 31 != 31:
+        s += " build2=0x%X" % d["dyn_flags2"]
+    return s
 
 
 def fmt_emu_dyn(d):
@@ -104,9 +248,9 @@ def fmt_emu_first_fault(d):
     """One-line first-fault record (v2 stats), '' when there is none."""
     if not d.get("v2") or not d["ff_code"]:
         return ""
-    return ("FAULT %d \"%s\" slot=0x%02X cycle=%d %.3f s ago detail=%d | at the fault: sent=%d late=%d "
+    return ("FAULT %d \"%s\" slot=%s cycle=%d %.3f s ago detail=%d | at the fault: sent=%d late=%d "
             "echo ok=%d miss=%d foreign=%d%s%s" % (
-                d["ff_code"], EMU_FAULTS.get(d["ff_code"], "?"), d["ff_slot"], d["ff_cycle"], d["ff_age_s"],
+                d["ff_code"], EMU_FAULTS.get(d["ff_code"], "?"), emu_slot_name(d, d["ff_slot"]), d["ff_cycle"], d["ff_age_s"],
                 d["ff_detail"], d["ff_sent_total"], d["ff_late"], d["ff_echo_ok"], d["ff_echo_miss"],
                 d["ff_foreign"], " locked" if d["ff_flags"] & 1 else " not-locked",
                 " tx-in-flight" if d["ff_flags"] & 2 else ""))
@@ -126,9 +270,9 @@ def fmt_emu(d):
             s += " (%s)" % ("LATCHED until restart" if d["latched"] else "auto re-arm after 2 s quiet")
     if d.get("v2"):
         if any(d["late_reason"]):
-            s += " | late[%s] last=0x%02X/%s r=%d" % (
+            s += " | late[%s] last=%s/%s r=%d" % (
                 " ".join("%s=%d" % (n, c) for n, c in zip(EMU_LATE_REASONS, d["late_reason"])),
-                d["last_late_slot"], EMU_LATE_REASONS[d["last_late_reason"] - 1] if 1 <= d["last_late_reason"] <= 5
+                emu_slot_name(d, d["last_late_slot"]), EMU_LATE_REASONS[d["last_late_reason"] - 1] if 1 <= d["last_late_reason"] <= 5
                 else d["last_late_reason"], d["last_late_r"])
         if d["fault_count"] or d["auto_clears"]:
             s += " | faults=%d auto_clears=%d" % (d["fault_count"], d["auto_clears"])
@@ -138,6 +282,9 @@ def fmt_emu(d):
     dyn = fmt_emu_dyn(d)
     if dyn:
         s += " | " + dyn
+    kl = fmt_emu_kl15(d)
+    if kl:
+        s += " | " + kl
     return s
 
 
@@ -313,9 +460,10 @@ def fr_csv_row(rec, t_us, host_time=None):
     }
 
 
-def can_csv_row(rec, host_time=None):
+def can_csv_row(rec, host_time=None, t_us=None):
     f = rec["can_flags"]
     return {
+        "t_us": "" if t_us is None else "%.2f" % t_us,
         "t_us_raw": rec["t_us_raw"], "bus": rec["bus"], "can_id": "0x%X" % rec["can_id"],
         "ide": f & 1, "rtr": (f >> 1) & 1, "fdf": (f >> 2) & 1, "brs": (f >> 3) & 1,
         "dlc": rec["dlc"], "data_hex": rec["data"].hex(),
@@ -343,3 +491,22 @@ class SeqTracker:
                 lost = d
         self.last = seq
         return lost
+
+
+# SavvyCAN native CSV (as in the MITM captures): FlexRay rows put the cycle in D1 and the
+# payload after it (LEN = payload + 1); FR1 = bus 0, FR2 = bus 1, PT-CAN (V2 board) = bus 2.
+SAVVY_HEADER = "Time Stamp,ID,Extended,Dir,Bus,LEN,D1,D2,D3,D4,D5,D6,D7,D8"
+
+
+def savvy_fr_row(rec, t_us):
+    bus = {1: 0, 2: 1}.get(rec["source"], (rec["source"] % 10) - 1 if rec["source"] else 0)
+    data = bytes([rec["cycle"]]) + rec["payload"]
+    tag = "FR" if rec["indicators"] & 0x04 else "FR+NULL"
+    return "%d,%08X,false,Rx,%d,%d,%s,%s," % (int(t_us or 0), rec["slot_id"], bus, len(data),
+                                              ",".join("%02X" % x for x in data), tag)
+
+
+def savvy_can_row(rec, t_us):
+    f = rec["can_flags"]
+    return "%d,%08X,%s,Rx,%d,%d%s" % (int(t_us), rec["can_id"], "true" if f & 1 else "false", rec["bus"],
+                                      len(rec["data"]), "".join(",%02X" % x for x in rec["data"]))

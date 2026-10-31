@@ -1,0 +1,460 @@
+From a2f33219ba2d0be438c061293560c51ee850777e Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Sat, 31 Oct 2026 15:59:07 +0000
+Subject: [PATCH 18/18] logger: --can-tx / --can-tx-ids (v1e PT-CAN TX), cantx:
+ status line; run.sh ptcan tests
+
+- --can-tx = all emulated IDs, --can-tx-ids hex IDs and/or sets step1..step5, dde,
+  egs, all; implies --can. Clear, then mask; keepalive every 2 s; TX off first on
+  exit / Ctrl-C / error. Refused by firmware without 0xa5 -> error exit.
+- frts: REQ 0xa5/0xa6, CANTX_IDS (= firmware table order), ptcan_stats_t parser
+- tests: fake-USB logger flow, stats layout C vs frts.py, ptcan replays in run.sh
+---
+ tests/host/run.sh                |  35 +++++++++
+ tests/host/test_cantx_logger.py  | 117 +++++++++++++++++++++++++++++++
+ tools/ts_capture/fr_ts_logger.py | 100 ++++++++++++++++++++++++--
+ tools/ts_capture/frts.py         |  97 +++++++++++++++++++++++++
+ 4 files changed, 343 insertions(+), 6 deletions(-)
+ create mode 100644 tests/host/test_cantx_logger.py
+
+diff --git a/tests/host/run.sh b/tests/host/run.sh
+index a6c3f1e..ba61ace 100755
+--- a/tests/host/run.sh
++++ b/tests/host/run.sh
+@@ -153,4 +153,39 @@ bad = [k for k in want if d.get(k) != want[k]]
+ print("stats v4 layout (C vs frts.py): " + ("ok" if not bad else "MISMATCH " + str(bad)))
+ sys.exit(1 if bad else 0)
+ PY
++# v1e PT-CAN DDE/EGS emulation (src/ptcan_emu_core.c): unit checks, E2E CRC/counter of
++# real frames (committed vector set; whole run 4 capture if present), gate / timeline
++# replays against run 4 (DDE+EGS on the bus, and DDE unplugged) and run 5 (EGS fuse pulled,
++# DDE off = the v1e target setup), ptcan_stats_t layout C vs frts.py, logger --can-tx flow.
++gcc -std=c11 -Wall -Wextra -Werror -Istubs -I../../src -o /tmp/pico_flexray_test_pte \
++    test_ptcan_emu.c ../../src/ptcan_emu_core.c
++/tmp/pico_flexray_test_pte unit
++/tmp/pico_flexray_test_pte e2e ptcan_e2e_vectors_run4.txt
++RUN4_DDECAN="${PTE_RUN4_DDECAN:-/workspace/f11-emu-run4/replay/f11_emu4_ddecan.csv.can.csv}"
++RUN4_NODDECAN="${PTE_RUN4_NODDECAN:-/workspace/f11-emu-run4/f11_emu4_noddecan.csv.can.csv}"
++RUN5_NOEGS="${PTE_RUN5_NOEGS:-/workspace/f11-emu-run5/replay/f11_emu5_noegs.csv.can.csv}"
++CHK=../../tools/dde_emu/check_ptcan_replay.py
++if [ -f "$RUN4_DDECAN" ]; then
++    python3 $CHK /tmp/pico_flexray_test_pte vectors "$RUN4_DDECAN" /tmp/pico_flexray_pte_vectors_all.txt > /dev/null
++    /tmp/pico_flexray_test_pte e2e /tmp/pico_flexray_pte_vectors_all.txt
++    python3 $CHK /tmp/pico_flexray_test_pte ddecan "$RUN4_DDECAN" > /tmp/pico_flexray_pte_ddecan.txt ||
++        { cat /tmp/pico_flexray_pte_ddecan.txt; exit 1; }
++    tail -n 1 /tmp/pico_flexray_pte_ddecan.txt
++else
++    echo "(run 4 ddecan CAN capture not found: PT-CAN replay skipped)"
++fi
++if [ -f "$RUN4_NODDECAN" ]; then
++    python3 $CHK /tmp/pico_flexray_test_pte noddecan "$RUN4_NODDECAN" > /tmp/pico_flexray_pte_noddecan.txt ||
++        { cat /tmp/pico_flexray_pte_noddecan.txt; exit 1; }
++    tail -n 1 /tmp/pico_flexray_pte_noddecan.txt
++fi
++if [ -f "$RUN5_NOEGS" ]; then
++    python3 $CHK /tmp/pico_flexray_test_pte noegs "$RUN5_NOEGS" > /tmp/pico_flexray_pte_noegs.txt ||
++        { cat /tmp/pico_flexray_pte_noegs.txt; exit 1; }
++    tail -n 1 /tmp/pico_flexray_pte_noegs.txt
++fi
++/tmp/pico_flexray_test_pte stats /tmp/pico_flexray_pte_stats.bin > /dev/null
++python3 test_cantx_logger.py /tmp/pico_flexray_pte_stats.bin > /tmp/pico_flexray_cantx_logger.txt 2>&1 ||
++    { cat /tmp/pico_flexray_cantx_logger.txt; exit 1; }
++tail -n 1 /tmp/pico_flexray_cantx_logger.txt
+ echo "host tests: all OK"
+diff --git a/tests/host/test_cantx_logger.py b/tests/host/test_cantx_logger.py
+new file mode 100644
+index 0000000..fb54f93
+--- /dev/null
++++ b/tests/host/test_cantx_logger.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""v1e: fr_ts_logger.py --can-tx/--can-tx-ids against a fake USB device (no pyusb needed).
++Checks: mask parsing/sets, clear -> mask -> keepalives -> 0 on exit, stats line, and that a
++firmware that stalls 0xa5 (V1 / older builds) makes the logger stop with an error."""
++import os
++import sys
++import tempfile
++import types
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, "../../tools/ts_capture"))
++import frts  # noqa: E402
++
++usb = types.ModuleType("usb")
++usb.core = types.ModuleType("usb.core")
++usb.util = types.ModuleType("usb.util")
++
++
++class USBError(Exception):
++    pass
++
++
++class USBTimeoutError(USBError):
++    pass
++
++
++usb.core.USBError = USBError
++usb.core.USBTimeoutError = USBTimeoutError
++sys.modules["usb"], sys.modules["usb.core"], sys.modules["usb.util"] = usb, usb.core, usb.util
++
++
++class FakeDev:
++    def __init__(self, cantx_ok=True, stats=None):
++        self.log = []
++        self.cantx_ok = cantx_ok
++        self.stats = stats
++
++    def set_configuration(self):
++        pass
++
++    def ctrl_transfer(self, bm, req, value, index, data_or_len, timeout=None):
++        self.log.append((bm, req, value, index))
++        if req in (frts.REQ_SET_CANTX, frts.REQ_GET_CANTX) and not self.cantx_ok:
++            raise USBError("Pipe error")
++        if bm == 0xC0 and req == frts.REQ_GET_TS_INFO:
++            return bytes(frts.TS_INFO_STRUCT.pack(*([1, 3, 0, 1, 100_000_000] + [0] * 13)))
++        if bm == 0xC0 and req == frts.REQ_GET_CANTX:
++            return self.stats
++        return None
++
++    def read(self, ep, size, timeout=None):
++        import time
++        time.sleep(timeout / 1000.0)
++        raise USBTimeoutError("timeout")
++
++
++def run(argv, dev):
++    usb.core.find = lambda **kw: dev
++    import importlib
++    import fr_ts_logger
++    importlib.reload(fr_ts_logger)
++    try:
++        return fr_ts_logger.main(argv)
++    except SystemExit as e:
++        return e.code
++
++
++def main():
++    fails = 0
++
++    def check(c, msg):
++        nonlocal fails
++        print(("  ok   " if c else "  FAIL ") + msg)
++        fails += not c
++
++    check(frts.cantx_mask("3F9") == 1 and frts.cantx_mask("step1") == 1, "3F9 = step1 = bit 0")
++    check(frts.cantx_mask("3F9,3FD,39A") == 7 == frts.cantx_mask("step3"), "3F9,3FD,39A = step3")
++    check(frts.cantx_mask("all") == (1 << 19) - 1, "all = 19 IDs")
++    check(frts.cantx_mask("dde") | frts.cantx_mask("egs") == frts.cantx_mask("all")
++          and not frts.cantx_mask("dde") & frts.cantx_mask("egs"), "dde + egs = all, disjoint")
++    for bad in ("137", "598", "351", "618", "27A", "80", "x"):
++        try:
++            frts.cantx_mask(bad)
++            check(False, "%s refused" % bad)
++        except ValueError:
++            check(True, "%s refused" % bad)
++
++    raw = open(sys.argv[1], "rb").read() if len(sys.argv) > 1 else bytes(frts.CANTX_STATS_STRUCT.size)
++    if len(sys.argv) > 1:   # blob from test_ptcan_emu.c "stats" (known values)
++        d = frts.parse_cantx_stats(raw)
++        want = dict(version=1, state=2, fault=1, flags=0xA5, mask=0x7FFFF, fault_id=0x3FD, st_kl=0xA, n_frames=19,
++                    tec=7, rec=9, opmod=6, rx_frames=123456, n12f=789, wakes=3, ms_wake=1000, ms_rx=2, ms_on=-1,
++                    ms_off=45930, ms_fnm=1950, tx_total=99999, fifo_full=11, tx_fail=12, mode_switches=13)
++        bad = [k for k in want if d[k] != want[k]]
++        check(not bad and tuple(d["ids"]) == frts.CANTX_IDS and d["tx"] == [1000 + i for i in range(19)],
++              "ptcan_stats_t layout C vs frts.py, ID order = firmware table %s" % (bad or ""))
++    tmp = tempfile.mkdtemp()
++    dev = FakeDev(stats=raw)
++    rc = run(["-o", os.path.join(tmp, "t.csv"), "--duration", "4.5", "--status-interval", "1",
++              "--can-tx-ids", "step2", "--no-console-log"], dev)
++    sets = [(v | i << 16) for bm, r, v, i in dev.log if r == frts.REQ_SET_CANTX]
++    check(rc == 0, "logger run rc=0 (%s)" % rc)
++    check(sets[:2] == [0, 3], "clear first, then mask 0x3 (%s)" % sets[:3])
++    check(sets[-1] == 0, "TX disabled on exit")
++    check(sets.count(3) >= 2, "keepalive repeated (%d)" % sets.count(3))
++    check(any(r == frts.REQ_SET_CAN_RECORDS and v == 1 for _, r, v, _ in dev.log), "--can-tx implies --can")
++    check(any(r == frts.REQ_GET_CANTX for _, r, _, _ in dev.log), "stats read")
++
++    dev = FakeDev(cantx_ok=False)
++    rc = run(["-o", os.path.join(tmp, "t2.csv"), "--duration", "2", "--can-tx", "--no-console-log"], dev)
++    check(rc == 1, "firmware without 0xa5 -> error exit (%s)" % rc)
++    print("cantx logger: " + ("ok" if not fails else "%d FAILED" % fails))
++    return 1 if fails else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/ts_capture/fr_ts_logger.py b/tools/ts_capture/fr_ts_logger.py
+index 4b925d8..40ae3ee 100644
+--- a/tools/ts_capture/fr_ts_logger.py
++++ b/tools/ts_capture/fr_ts_logger.py
+@@ -34,6 +34,15 @@ state and the time left before the 60 s hard ceiling, and the 0x10A/0x142/0x68 c
+ <output>.can.csv and, together with the FlexRay frames, to a SavvyCAN CSV
+ <output>.savvy.csv (FR1 = bus 0, FR2 = bus 1, PT-CAN = bus 2). Status lines show
+ "can=N (bus2:N ids=K)". On a V1 board the request is refused and ignored.
++
++--can-tx / --can-tx-ids LIST (v1e DDE emulator firmware, V2 board; implies --can):
++enable the PT-CAN DDE/EGS frame emulation (vendor request 0xa5: 0 = clear, then the
++ID mask; repeated every 2 s as keepalive, the firmware stops by itself 20 s after the
++last one). --can-tx = every emulated ID; --can-tx-ids takes hex IDs and/or set names,
++comma separated: step1 (3F9), step2 (+3FD), step3 (+39A), step4 (+396,518), step5/all,
++dde, egs. The firmware only transmits while PT-CAN traffic is present (silence >200 ms
++stops it). The counters (vendor request 0xa6) are printed with every status line as
++"cantx: ...". TX is disabled on exit, Ctrl-C or any error. Default: no CAN TX at all.
+ """
+ import argparse
+ import csv
+@@ -299,9 +308,47 @@ def live(args):
+                 print("EMU %s (logger t=%+.1fs)" % (ff, time.time() - t_start - d["ff_age_s"]))
+         return frts.fmt_emu(d)
+ 
++    cantx = {"on": False, "prev": None, "fault": None}
++
++    def cantx_set(mask):
++        dev.ctrl_transfer(0x40, frts.REQ_SET_CANTX, mask & 0xFFFF, (mask >> 16) & 0xFFFF, None, timeout=1000)
++
++    def cantx_line(delta=False):
++        try:
++            d = frts.parse_cantx_stats(dev.ctrl_transfer(0xC0, frts.REQ_GET_CANTX, 0, 0,
++                                                         frts.CANTX_STATS_STRUCT.size, timeout=1000))
++        except usb.core.USBError:
++            return "(PT-CAN TX stats read failed)"
++        if d and d["fault"] and d["fault"] != cantx["fault"]:
++            print("CANTX FAULT: %s%s - PT-CAN TX stopped, controller back to Listen Only (logger t=%.1fs)"
++                  % (frts.CANTX_FAULTS[d["fault"]] if d["fault"] < len(frts.CANTX_FAULTS) else d["fault"],
++                     (" (ID 0x%03X)" % d["fault_id"]) if d["fault"] == 1 else "", time.time() - t_start))
++        if d:
++            cantx["fault"] = d["fault"]
++        line = frts.fmt_cantx(d, cantx["prev"] if delta else None)
++        if d and delta:
++            cantx["prev"] = d["tx"]
++        return line
++
+     emu_on = False
+     next_keepalive = 0.0
+     try:
++        if args.can_tx_mask:
++            time.sleep(0.5)   # capture running first
++            try:
++                cantx_set(0)  # clear any latched fault
++                cantx_set(args.can_tx_mask)
++            except usb.core.USBError as e:
++                print("ERROR: the device refused PT-CAN TX (%s).\n"
++                      "It is not running the v1e (or later) DDE emulator firmware for the V2 board "
++                      "(pico_flexray_dde_emu_v1e_ignon_v2.uf2); V1 boards have no CAN." % e, file=sys.stderr)
++                stop["flag"] = True
++                raise SystemExit(1)
++            cantx["on"] = True
++            next_keepalive = time.time() + 2.0
++            print("PT-CAN TX ENABLED for %s (sends only while PT-CAN is awake). Ctrl-C disables it."
++                  % " ".join("0x%03X" % i for i in frts.cantx_ids_of(args.can_tx_mask)))
++            print("cantx: " + cantx_line(True))
+         if args.emulate:
+             time.sleep(0.5)   # capture running first
+             try:
+@@ -334,13 +381,20 @@ def live(args):
+             if stop["flag"] and not th.is_alive():
+                 continue
+             now = time.time()
+-            if emu_on and now >= next_keepalive:
++            if (emu_on or cantx["on"]) and now >= next_keepalive:
+                 next_keepalive = now + 2.0
+-                try:
+-                    emu_set(1)
+-                except usb.core.USBError:
+-                    print("emu: keepalive failed (USB)", file=sys.stderr)
+-                emu_line()   # prints "EMU FAULT ..." as soon as a first fault appears
++                if emu_on:
++                    try:
++                        emu_set(1)
++                    except usb.core.USBError:
++                        print("emu: keepalive failed (USB)", file=sys.stderr)
++                    emu_line()   # prints "EMU FAULT ..." as soon as a first fault appears
++                if cantx["on"]:
++                    try:
++                        cantx_set(args.can_tx_mask)
++                    except usb.core.USBError:
++                        print("cantx: keepalive failed (USB)", file=sys.stderr)
++                    cantx_line()   # prints "CANTX FAULT ..." as soon as a fault appears
+             if now >= next_status:
+                 rate = (lg.n_fr - last_n) / max(1e-6, now - last_t)
+                 last_n, last_t = lg.n_fr, now
+@@ -354,12 +408,32 @@ def live(args):
+                 print("         device: " + di)
+                 if emu_on:
+                     print("         emu: " + emu_line())
++                if cantx["on"]:
++                    print("         cantx: " + cantx_line(True))
+                 if raw:
+                     raw.flush()
+                 lg.f.flush()
+         if rd["fatal"]:
+             print(rd["fatal"], file=sys.stderr)
+     finally:
++        if args.can_tx_mask and not cantx["on"]:
++            try:
++                cantx_set(0)   # enable was refused or never sent: best effort, no warning
++            except Exception:
++                pass
++        if cantx["on"]:
++            # PT-CAN TX off first, before anything else can fail
++            for _ in range(3):
++                try:
++                    cantx_set(0)
++                    print("PT-CAN TX DISABLED")
++                    break
++                except Exception:
++                    time.sleep(0.1)
++            else:
++                print("WARNING: could not disable PT-CAN TX over USB - unplug the pico! "
++                      "(the firmware also stops by itself 20 s after the last keepalive)", file=sys.stderr)
++            print("cantx at stop: " + cantx_line(True))
+         if args.emulate:
+             # TX off first, before anything else can fail
+             for _ in range(3):
+@@ -403,6 +477,11 @@ def main(argv=None):
+     ap.add_argument("--can", action="store_true", help="also log CAN records (V2 board only)")
+     ap.add_argument("--emulate", action="store_true",
+                     help="DDE emulator firmware: enable FR1 TX while logging, disable on exit")
++    ap.add_argument("--can-tx", action="store_true",
++                    help="v1e V2 DDE emulator: enable PT-CAN DDE/EGS frame TX, all IDs (implies --can; off by default)")
++    ap.add_argument("--can-tx-ids", default=None, metavar="LIST",
++                    help="like --can-tx but only these: hex IDs and/or sets, comma separated "
++                         "(step1=3F9, step2=+3FD, step3=+39A, step4=+396,518, step5/all, dde, egs), e.g. 3F9 or 3F9,3FD,39A")
+     ap.add_argument("--can-csv", default=None, help="CAN CSV output (default <output>.can.csv with --can)")
+     ap.add_argument("--savvy-csv", default=None,
+                     help="combined SavvyCAN CSV: FR1 = bus 0, FR2 = bus 1, PT-CAN = bus 2 "
+@@ -417,6 +496,15 @@ def main(argv=None):
+                     help="bytes per USB bulk read, multiple of 64 (default %(default)s)")
+     ap.add_argument("--read-timeout-ms", type=int, default=100, help="USB bulk read timeout, ms")
+     args = ap.parse_args(argv)
++    args.can_tx_mask = 0
++    if args.can_tx_ids is not None or args.can_tx:
++        if args.replay:
++            ap.error("--can-tx/--can-tx-ids are for live capture only")
++        try:
++            args.can_tx_mask = frts.cantx_mask(args.can_tx_ids if args.can_tx_ids is not None else "all")
++        except ValueError as e:
++            ap.error(str(e))
++        args.can = True
+     if args.read_size % 64:
+         ap.error("--read-size must be a multiple of 64")
+     if args.raw is None and not args.no_raw and not args.replay:
+diff --git a/tools/ts_capture/frts.py b/tools/ts_capture/frts.py
+index 6915d06..9fb0a87 100644
+--- a/tools/ts_capture/frts.py
++++ b/tools/ts_capture/frts.py
+@@ -17,6 +17,8 @@ REQ_SET_CAN_RECORDS = 0xA1
+ REQ_GET_TS_INFO = 0xA2
+ REQ_SET_EMU = 0xA3        # DDE emulator build: wValue 1 = enable TX / keepalive, 0 = disable + clear fault
+ REQ_GET_EMU = 0xA4        # DDE emulator build: stats, 64/128/192/256 bytes by version (src/dde_emu.h dde_emu_stats_t)
++REQ_SET_CANTX = 0xA5      # v1e V2 DDE emulator: PT-CAN TX ID mask, wValue = bits 0..15, wIndex = bits 16..31, 0 = off
++REQ_GET_CANTX = 0xA6      # v1e: PT-CAN TX stats (src/ptcan_emu.h ptcan_stats_t, 178 bytes)
+ REQ_RESET_COMMS = 0xC0
+ 
+ FLAG_FRAME_CRC_OK = 0x01
+@@ -61,6 +63,101 @@ EMU_FAULTS = {0: "none", 1: "TX state machine stuck", 2: "DDE frame seen that we
+ EMU_SLOTS = ("0x26", "0x28", "0x29", "0x3D", "0x5C")
+ 
+ 
++# ---- v1e PT-CAN DDE/EGS emulation TX (V2 board) ---------------------------------
++# Index = mask bit; order and IDs must match src/ptcan_emu_core.h (checked by tests/host/run.sh).
++CANTX_IDS = (0x3F9, 0x3FD, 0x39A, 0x396, 0x518, 0x0A5, 0x0D9, 0x0DC, 0x0F3, 0x08F,
++             0x2C4, 0x281, 0x1B9, 0x381, 0x3B3, 0x397, 0x3FB, 0x512, 0x592)
++CANTX_EGS = (0x3FD, 0x39A, 0x396, 0x518)
++CANTX_SETS = {
++    "step1": (0x3F9,),
++    "step2": (0x3F9, 0x3FD),
++    "step3": (0x3F9, 0x3FD, 0x39A),
++    "step4": (0x3F9, 0x3FD, 0x39A, 0x396, 0x518),
++    "step5": CANTX_IDS,
++    "all": CANTX_IDS,
++    "egs": CANTX_EGS,
++    "dde": tuple(i for i in CANTX_IDS if i not in CANTX_EGS),
++}
++CANTX_STATS_STRUCT = struct.Struct("<BBBBIHBBBBBBIIIiiiiiIIII19H19I")
++assert CANTX_STATS_STRUCT.size == 178
++CANTX_STATES = ("off", "wait-bus", "RUN", "silent", "prep-sleep", "FAULT")
++CANTX_FAULTS = ("none", "foreign sender of an emulated ID (real DDE/EGS still on the bus?)", "BUS-OFF",
++                "TX error passive", "controller mode change failed", "SPI")
++
++
++def cantx_mask(spec):
++    """'--can-tx-ids' value -> mask. Set names (step1..step5, dde, egs, all) and/or hex IDs,
++    comma separated ('3F9', '3F9,3FD,39A', 'step2,396'). Raises ValueError."""
++    mask = 0
++    for tok in str(spec).replace(" ", "").split(","):
++        if not tok:
++            continue
++        ids = CANTX_SETS.get(tok.lower())
++        if ids is None:
++            try:
++                v = int(tok, 16)
++            except ValueError:
++                raise ValueError("unknown CAN TX set or ID %r (sets: %s)" % (tok, ", ".join(CANTX_SETS)))
++            if v not in CANTX_IDS:
++                raise ValueError("0x%X is not an emulated PT-CAN ID (emulated: %s)"
++                                 % (v, " ".join("%03X" % i for i in CANTX_IDS)))
++            ids = (v,)
++        for i in ids:
++            mask |= 1 << CANTX_IDS.index(i)
++    if not mask:
++        raise ValueError("empty CAN TX selection")
++    return mask
++
++
++def cantx_ids_of(mask):
++    return [i for b, i in enumerate(CANTX_IDS) if mask >> b & 1]
++
++
++def parse_cantx_stats(raw):
++    raw = bytes(raw)
++    if len(raw) < CANTX_STATS_STRUCT.size:
++        return None
++    v = CANTX_STATS_STRUCT.unpack_from(raw)
++    names = ("version", "state", "fault", "flags", "mask", "fault_id", "st_kl", "n_frames", "tec", "rec", "opmod",
++             "reserved", "rx_frames", "n12f", "wakes", "ms_wake", "ms_rx", "ms_on", "ms_off", "ms_fnm",
++             "tx_total", "fifo_full", "tx_fail", "mode_switches")
++    d = dict(zip(names, v[:24]))
++    d["ids"] = list(v[24:43])
++    d["tx"] = list(v[43:62])
++    fl = d["flags"]
++    for b, k in enumerate(("enabled", "normal", "kl15", "kl15_ever", "bus_off", "tx_passive", "rx_passive",
++                           "keepalive_lost")):
++        d[k] = bool(fl >> b & 1)
++    return d
++
++
++def _cantx_ago(ms):
++    return "-" if ms < 0 else "%.1fs" % (ms / 1000.0)
++
++
++def fmt_cantx(d, prev_tx=None):
++    """One status line. prev_tx: per-ID counts at the previous line (for +deltas)."""
++    if d is None:
++        return "(short PT-CAN TX stats)"
++    st = CANTX_STATES[d["state"]] if d["state"] < len(CANTX_STATES) else str(d["state"])
++    flt = CANTX_FAULTS[d["fault"]] if d["fault"] < len(CANTX_FAULTS) else str(d["fault"])
++    s = "%s%s ctl=%s mask=%s | KL15=%s(ST_KL %X) wake %s rx %s on %s off %s | tx %d fifo-full %d fail %d TEC %d REC %d%s" % (
++        st, (" FAULT=%s%s" % (flt, (" id=0x%03X" % d["fault_id"]) if d["fault"] == 1 else "")) if d["fault"] else "",
++        "Normal" if d["normal"] else "ListenOnly", ",".join("%03X" % i for i in cantx_ids_of(d["mask"])) or "-",
++        "on" if d["kl15"] else "off", d["st_kl"], _cantx_ago(d["ms_wake"]), _cantx_ago(d["ms_rx"]),
++        _cantx_ago(d["ms_on"]), _cantx_ago(d["ms_off"]), d["tx_total"], d["fifo_full"], d["tx_fail"], d["tec"],
++        d["rec"], " BUS-OFF" if d["bus_off"] else (" TX-PASSIVE" if d["tx_passive"] else ""))
++    if d["keepalive_lost"]:
++        s += " KEEPALIVE-LOST"
++    per = []
++    for k, (i, n) in enumerate(zip(d["ids"], d["tx"])):
++        if n or (d["mask"] >> k & 1):
++            per.append("%03X=%d%s" % (i, n, ("(+%d)" % (n - prev_tx[k])) if prev_tx else ""))
++    if per:
++        s += " | " + " ".join(per)
++    return s
++
++
+ def parse_emu_stats(raw):
+     v = EMU_STATS_STRUCT.unpack(bytes(raw[:64]))
+     d = dict(version=v[0], state=v[1], enabled=v[2], fault=v[3], sent=list(v[4:9]),
+-- 
+2.47.3
+

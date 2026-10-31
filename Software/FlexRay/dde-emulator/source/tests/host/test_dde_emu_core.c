@@ -97,13 +97,14 @@ static void test_vectors(const char *path, bool strict)
 
 static void test_pack_args(void)
 {
-    uint8_t b[24] = {0};
+    uint8_t b[48] = {0};
     uint32_t w[DDE_TX_MAX_WORDS];
     CHECK(dde_core_pack(b, 21, 7, 0, w) == 0, "odd length rejected");
     CHECK(dde_core_pack(b, 24, 2, 0, w) == 0, "tss 2 rejected");
     CHECK(dde_core_pack(b, 24, 16, 0, w) == 0, "tss 16 rejected");
     CHECK(dde_core_pack(b, 24, 7, 2, w) == 0, "dts 2 rejected");
-    CHECK(dde_core_pack(b, 36, 7, 0, w) == 0, "too long rejected");
+    CHECK(dde_core_pack(b, 42, 7, 0, w) == 0, "too long rejected");
+    CHECK(dde_core_pack(b, 38, 7, 0, w) == 12, "38 bytes (0x142) = 12 words");
     CHECK(dde_core_pack(b, 24, 7, 0, w) == 8, "24 bytes = 8 words (TX FIFO depth)");
 }
 
@@ -223,8 +224,8 @@ static int pdu_of(unsigned id, unsigned plen)
     return -1;
 }
 
-// Builder vs the real DDE's 0xE6/0xE8/0xFB (run 5 FR2): E2E key, counter sequence,
-// content, cycle classes.
+// Builder vs the real DDE's 0xE6/0xE8/0xFB, v1d 0x10A/0x142/0x68 (run 5 FR2): E2E key,
+// counter sequence, content, cycle classes.
 static void test_dyn_build(const char *path)
 {
     unsigned n;
@@ -233,7 +234,8 @@ static void test_dyn_build(const char *path)
     if (!v) return;
     CHECK(ign > 0, "ign time in %s", path);
     unsigned cnt[DDE_DYN_N_PDU] = {0}, exact[DDE_DYN_N_PDU] = {0}, e2e_ok = 0, e2e_n = 0, ctr_ok = 0, ctr_n = 0;
-    unsigned diffpos[DDE_DYN_N_PDU][8] = {{0}}, other = 0, ncmp[DDE_DYN_N_PDU] = {0};
+    unsigned diffpos[DDE_DYN_N_PDU][32] = {{0}}, other = 0, ncmp[DDE_DYN_N_PDU] = {0};
+    unsigned ctr8_ok = 0, ctr8_n = 0;
     int64_t first_t = n ? v[0].t : 0;
     unsigned cyc_mask[DDE_DYN_N_PDU] = {0};
     int last_ctr[DDE_DYN_N_PDU];
@@ -254,6 +256,18 @@ static void test_dyn_build(const char *path)
         // up to 50 s; later in run 5 the drive state changes 0xFB L9 b2 / 0xE8 / 0xFB L7 values)
         bool cmp_win = ign > 0 && ((dt < 0 && d->t > first_t + 100000000) || (dt > 25000000 && dt < 5000000000LL));
         bool preign = ign < 0 || dt < 6000000;
+        unsigned phase = preign ? 0u : 1u;
+        if (p == DDE_PDU_142) {
+            // phases from the capture start (= wake, the DDE's first frame is 61 ms later) and
+            // ign; compared away from the switch times and before B1/B5 move on (t 30.99 s)
+            int64_t tw = d->t;   // ticks since the first frame of the capture
+            int64_t p1 = (int64_t)DDE_142_P1_CYCLES * 500000, p2 = (int64_t)DDE_142_P2_CYCLES * 500000;
+            if (ign > 0 && dt >= p2) phase = DDE_142_P2;
+            else if (tw >= p1) phase = DDE_142_P1;
+            else phase = DDE_142_P0;
+            cmp_win = (tw > 10000000 && tw < p1 - 5000000) || (tw > p1 + 5000000 && dt < -5000000) ||
+                      (dt > 720000000 && tw < 3090000000LL);
+        }
         unsigned ctr = 0;
         if (q->kind == DDE_DYN_KIND_E2E) {
             ctr = d->pl[1] & 15;
@@ -261,8 +275,23 @@ static void test_dyn_build(const char *path)
             if (d->pl[0] == (uint8_t)(dde_core_crc8(d->pl + 1, d->plen - 1u) ^ q->k)) e2e_ok++;
         } else if (q->kind == DDE_DYN_KIND_CTR) {
             ctr = d->pl[0] & 15;
+        } else if (q->kind == DDE_DYN_KIND_CTR8) {
+            ctr = d->pl[0];
+            // Ian: B0 = free counter 0..254, +1 per TX (mod 255); the next frame of the capture
+            // (every 4 cycles, 20 ms) must be +1 (a lost frame +2)
+            if (last_ctr[p] >= 0) {
+                int steps = (int)((d->t - last_t[p] + 1000000) / 2000000);
+                if (steps >= 1 && steps <= 3) {
+                    ctr8_n++;
+                    if ((int)ctr == (last_ctr[p] + steps) % 255) ctr8_ok++;
+                    else if (ctr8_n - ctr8_ok < 5)
+                        printf("  counter 142 %d -> %u after %d periods (t %.3f s)\n", last_ctr[p], ctr, steps, (double)d->t / 1e8);
+                }
+            }
+            last_ctr[p] = (int)ctr; last_t[p] = d->t;
+            CHECK(ctr <= 254, "0x142 counter 255 seen");
         }
-        if (q->kind != DDE_DYN_KIND_CONST) {
+        if (q->kind == DDE_DYN_KIND_E2E || q->kind == DDE_DYN_KIND_CTR) {
             // counter: +1 per transmission (0..14); a frame the capture lost = +2 after 2 periods
             int64_t per_t = (int64_t)q->period * 500000;
             int steps = (int)((d->t - last_t[p] + per_t / 2) / per_t);
@@ -276,7 +305,7 @@ static void test_dyn_build(const char *path)
             CHECK(ctr <= 14, "counter 15 seen id 0x%X", d->id);
         }
         uint8_t b[DDE_MAX_FRAME_BYTES];
-        unsigned bn = dde_core_build_dyn_pdu((unsigned)p, d->cycle, ctr, preign, b);
+        unsigned bn = dde_core_build_dyn_pdu_ph((unsigned)p, d->cycle, ctr, phase, b);
         CHECK(bn == 5u + d->plen + 3u, "dyn length %s", q->name);
         // header: indicators 0x04 (payload preamble off, sync off, startup off), id, length, cycle
         CHECK(((b[0] & 7u) << 8 | b[1]) == d->id && (b[2] >> 1) == d->plen / 2u && (b[4] & 63u) == d->cycle,
@@ -294,7 +323,10 @@ static void test_dyn_build(const char *path)
         for (unsigned j = 0; j < q->plen; j++) if (diffpos[p][j]) printf(" b%u x%u", j + 1, diffpos[p][j]);
         printf("\n");
         CHECK(cnt[p] > 0, "%s present in run 5", q->name);
-        // our cycle%8 lies in the PDU's stable class (period 40: %4, 200/1000: %2 at least)
+        // our cycle%8 lies in the PDU's stable class (period 40: %4, 200/1000: %2 at least).
+        // 0x142 / 0x68 drift through the cycle classes in run 5 (their own timer, not cycle based):
+        // any class the vehicle accepts, we use a fixed one (0x142: %4 == 3, 0x68: %8 == 5).
+        if (p == DDE_PDU_142 || p == DDE_PDU_68) continue;
         unsigned cls = q->period == 40 ? 3u : 1u;
         for (unsigned cy = 0; cy < 8; cy++)
             if (cyc_mask[p] & (1u << cy)) CHECK((cy & cls) == (q->cyc_mod8 & cls), "%s cycle class %u", q->name, cy);
@@ -308,6 +340,12 @@ static void test_dyn_build(const char *path)
     CHECK(exact[DDE_PDU_FB9] == ncmp[DDE_PDU_FB9] && ncmp[DDE_PDU_FB9] > 5, "FB9 content");
     CHECK(exact[DDE_PDU_FB5] == ncmp[DDE_PDU_FB5] && ncmp[DDE_PDU_FB5] > 5, "FB5 content");
     CHECK(exact[DDE_PDU_E85] == ncmp[DDE_PDU_E85] && ncmp[DDE_PDU_E85] > 5, "E8 L5 content");
+    // v1d
+    printf("  0x142 counter +1 mod 255: %u/%u\n", ctr8_ok, ctr8_n);
+    CHECK(ctr8_n > 1000 && ctr8_ok * 100 >= ctr8_n * 99, "0x142 counter sequence");
+    CHECK(exact[DDE_PDU_10A] == ncmp[DDE_PDU_10A] && ncmp[DDE_PDU_10A] > 5, "0x10A content");
+    CHECK(exact[DDE_PDU_68] == ncmp[DDE_PDU_68] && ncmp[DDE_PDU_68] > 3, "0x68 content");
+    CHECK(exact[DDE_PDU_142] == ncmp[DDE_PDU_142] && ncmp[DDE_PDU_142] > 500, "0x142 content (3 phases)");
     free(v);
 }
 
@@ -374,7 +412,14 @@ static void test_dyn_basics(void)
     CHECK(dde_core_dyn_dts_bits(14, 7) == 56, "dts 6 B (got %u)", dde_core_dyn_dts_bits(14, 7));
     CHECK(dde_core_dyn_dts_bits(16, 7) == 36, "dts 8 B (got %u)", dde_core_dyn_dts_bits(16, 7));
     CHECK(dde_core_dyn_ms_used(4) == 4 && dde_core_dyn_ms_used(6) == 5 && dde_core_dyn_ms_used(8) == 5 &&
-          dde_core_dyn_ms_used(14) == 6 && dde_core_dyn_ms_used(20) == 0, "minislots used");
+          dde_core_dyn_ms_used(14) == 6, "minislots used");
+    // v1d formula: all lengths seen in run 5 (2..32 B), unknown where the fitted overhead
+    // range does not give one value (18 B), odd / 0 never
+    static const uint8_t msk[][2] = {{2, 4}, {4, 4}, {6, 5}, {8, 5}, {10, 5}, {14, 6}, {16, 6}, {26, 8}, {30, 8},
+                                     {32, 9}, {20, 7}, {18, 0}, {0, 0}, {7, 0}};
+    for (unsigned i = 0; i < sizeof msk / sizeof msk[0]; i++)
+        CHECK(dde_core_dyn_ms_used(msk[i][0]) == msk[i][1], "minislots used by %u B: %u (want %u)", msk[i][0],
+              dde_core_dyn_ms_used(msk[i][0]), msk[i][1]);
     // 14-byte frame: 2 control words + 4 data words, last half word = pad
     uint8_t b[16];
     for (int i = 0; i < 16; i++) b[i] = (uint8_t)(0x11 * (i + 1));
@@ -404,7 +449,7 @@ static void test_dyn_basics(void)
     CHECK(dde_dyn_predict(&t, 0xE6, &m) == DDE_DYN_OK && m == 0xE6 - 0x5C, "empty dynamic segment");
     dde_dyn_track_header(&t, 0x80, 6, true, 3, DDE_DYN_BASE_Q8 + 50LL * DDE_DYN_MS_Q8);
     CHECK(dde_dyn_predict(&t, 0xE6, &m) == DDE_DYN_OK && m == 50 + 5 + (0xE6 - 0x80 - 1), "after 0x80 L6");
-    dde_dyn_track_header(&t, 0x90, 20, true, 4, DDE_DYN_BASE_Q8 + 80LL * DDE_DYN_MS_Q8);
+    dde_dyn_track_header(&t, 0x90, 18, true, 4, DDE_DYN_BASE_Q8 + 80LL * DDE_DYN_MS_Q8);
     CHECK(dde_dyn_predict(&t, 0xE6, &m) == DDE_SKIP_LEN, "unknown length -> skip");
     dde_dyn_track_start(&t, 4, true, 1);
     dde_dyn_track_header(&t, 0x80, 6, true, 2, DDE_DYN_BASE_Q8 + 30LL * DDE_DYN_MS_Q8);
@@ -487,11 +532,43 @@ static void test_dyn_flash(void)
         // E2E only on 0xE6
         CHECK((d->kind == DDE_DYN_KIND_E2E) == (br[i].p == DDE_PDU_E6), "%s E2E kind", d->name);
     }
-    // Only 0xE6 / 0xE8 / 0xFB, one 0xE6 PDU (base0 = DT_PT_2; base1 ID 0x8C and 0x88 are never on the bus)
+    // Only 0xE6 / 0xE8 / 0xFB + v1d 0x10A / 0x142 / 0x68, one 0xE6 PDU (base0 = DT_PT_2; base1 ID 0x8C
+    // and 0x88 are never on the bus; PDU 0x1E on 0xE6 base1 ignored per Ian). Never 0xEA/0x88/0x67/0xBE/0x8C.
     int ne6 = 0;
     for (int p = 0; p < DDE_DYN_N_PDU; p++) {
-        CHECK(dde_dyn_pdu[p].id == 0xE6 || dde_dyn_pdu[p].id == 0xE8 || dde_dyn_pdu[p].id == 0xFB, "unexpected id");
-        ne6 += dde_dyn_pdu[p].id == 0xE6;
+        unsigned id = dde_dyn_pdu[p].id;
+        CHECK(id == 0xE6 || id == 0xE8 || id == 0xFB || id == 0x10A || id == 0x142 || id == 0x68, "unexpected id");
+        ne6 += id == 0xE6;
+    }
+    for (unsigned d = 0; d < DDE_DYN_N_SLOT; d++) {
+        unsigned id = dde_dyn_slot_id[d];
+        CHECK(id != 0xEA && id != 0x88 && id != 0x67 && id != 0xBE && id != 0x8C, "forbidden id 0x%X", id);
+    }
+    // v1d PDUs: 0x10A KL15-gated constant, 0x142 every 4 cycles, 0x68 constant from wake;
+    // every 0x142 frame fits the frame buffer / 12 TX words and the minislot limit
+    CHECK(dde_dyn_pdu[DDE_PDU_10A].ign_only && dde_dyn_pdu[DDE_PDU_10A].start_cyc == DDE_IGN_10A_CYCLES, "10A gating");
+    CHECK(!dde_dyn_pdu[DDE_PDU_142].ign_only && !dde_dyn_pdu[DDE_PDU_68].ign_only, "142/68 from wake");
+    {
+        unsigned n142 = 0;
+        for (unsigned cyc = 0; cyc < 64; cyc++)
+            if (dde_core_dyn_pdu_for(DDE_DSLOT_142, cyc) == DDE_PDU_142) { n142++; CHECK(cyc % 4 == 3, "142 cycle %u", cyc); }
+        CHECK(n142 == 16, "0x142 in 16 of 64 cycles");
+        for (unsigned ph = 0; ph < DDE_142_NPH; ph++)
+            for (unsigned ctr = 0; ctr < 255; ctr += 37) {
+                unsigned bn = dde_core_build_dyn_pdu_ph(DDE_PDU_142, 3, ctr, ph, f);
+                CHECK(bn == 38 && f[5] == ctr && f[7] == 0xFF && memcmp(f + 6, dde_142_phase[ph] + 1, 29) == 0,
+                      "142 phase %u ctr %u", ph, ctr);
+                uint32_t w[DDE_TX_MAX_WORDS];
+                CHECK(dde_core_pack(f, bn, 7, dde_core_dyn_dts_bits(bn, 7), w) == 12, "142 packs to 12 words");
+            }
+        CHECK(dde_core_dyn_ms_used(30) == 8, "142 uses 8 minislots");
+        CHECK(dde_dyn_slot_id[DDE_DSLOT_142] - 0x5Cu + 8u <= DDE_DYN_MS_LIMIT, "142 below the limit when alone");
+        dde_core_build_dyn_pdu(DDE_PDU_10A, 2, 5, false, f);
+        CHECK(f[5] == 0x00 && f[6] == 0xFF && f[7] == 0xFF && f[8] == 0xFF, "10A content");
+        dde_core_build_dyn_pdu(DDE_PDU_68, 5, 5, true, f);
+        CHECK(f[5] == 0xC0 && f[6] == 0xFF, "68 content");
+        CHECK(dde_core_dyn_ctr_mod(DDE_PDU_142) == 255 && dde_core_dyn_ctr_mod(DDE_PDU_E6) == 15 &&
+              dde_core_dyn_ctr_mod(DDE_PDU_FB7) == 15, "counter modulus");
     }
     CHECK(ne6 == 1, "one 0xE6 PDU");
     // Unused bits = 1 (flash fills PDUs with 0xFF, LSB-first) in every frame we can send
@@ -517,6 +594,88 @@ static void test_dyn_flash(void)
     CHECK(((f[5] >> 4) | (f[6] << 4)) == 0x604, "FB L5 12-bit value 0x604");
 }
 
+// v1d KL15 / 0x5C NM gate (dde_kl15_*, dde_nm_allowed)
+static void test_kl15_nm(void)
+{
+    dde_kl15_t k;
+    bool ceil;
+    const uint32_t W = 1000000u;   // wake at t = 1 s
+    #define US(c) (W + (uint32_t)(c) * 5000u)
+    // door wake, no ign: 0x5C for 352 cycles (1.76 s), then off; never on later
+    dde_kl15_reset(&k, W);
+    for (uint32_t c = 0; c < 2000; c++) {
+        dde_kl15_eval(&k, US(c), c, true);
+        bool ok = dde_nm_allowed(&k, c, US(c), &ceil);
+        CHECK(ok == (c < DDE_NM_WAKE_CYCLES), "door wake: cycle %u nm %d", c, ok);
+        if (ok != (c < DDE_NM_WAKE_CYCLES)) break;
+    }
+    // ign via 0xF1 at cycle 1200 (6 s), 0xF1 every 2 s, 0x20 until cycle 20000 (100 s), then 0xE0:
+    // 0x5C until off + 9400 cycles (47 s); 0x103 keeps running after KL15 off (run 5) and must not matter
+    dde_kl15_reset(&k, W);
+    uint32_t last_ok = 0, first_ok_after = 0, on_c = 0, off_c = 0;
+    bool was = false;
+    for (uint32_t c = 0; c < 40000; c++) {
+        uint32_t t = US(c);
+        if (c >= 1190 && (c - 1190) % 42 == 0) dde_kl15_103(&k, t);
+        if (c >= 1200 && (c - 1200) % 400 == 0 && c < 30000) dde_kl15_f1(&k, c < 20000 ? 0x20 : 0xE0, t);
+        bool on = dde_kl15_eval(&k, t, c, true);
+        if (on && !was) on_c = c;
+        if (!on && was) off_c = c;
+        was = on;
+        bool ok = dde_nm_allowed(&k, c, t, &ceil);
+        CHECK(!ceil, "ceiling with F1 refresh at cycle %u", c);
+        if (ok) { last_ok = c; if (c > DDE_NM_WAKE_CYCLES && !first_ok_after) first_ok_after = c; }
+    }
+    // 0x103 arrives before the first 0xF1 (fallback): on at 1190, then 0xF1 decides
+    CHECK(on_c == 1190 && first_ok_after == 1190, "KL15 on at the 0x103 (fallback) %u / nm %u", on_c, first_ok_after);
+    CHECK(off_c == 20000, "KL15 off at the 0xE0 (%u)", off_c);
+    CHECK(last_ok == 20000 + DDE_NM_RELEASE_CYCLES - 1, "0x5C until off + 47 s (%u)", last_ok);
+    CHECK(k.on_edges == 1 && k.off_edges == 1, "one on/off edge (%u/%u)", k.on_edges, k.off_edges);
+    // 0xF1 stops (no 0xE0): off after 5 s
+    dde_kl15_reset(&k, W);
+    dde_kl15_f1(&k, 0x20, US(100));
+    CHECK(dde_kl15_eval(&k, US(101), 101, true), "on after 0x20");
+    CHECK(!dde_kl15_eval(&k, US(100) + DDE_KL15_F1_TIMEOUT_US, 1100, true), "off 5 s after the last 0xF1");
+    CHECK(dde_nm_allowed(&k, 1100 + DDE_NM_RELEASE_CYCLES - 1, US(1100 + DDE_NM_RELEASE_CYCLES - 1), &ceil),
+          "release time from the timeout edge");
+    // unknown b3 keeps the state
+    dde_kl15_reset(&k, W);
+    dde_kl15_f1(&k, 0x20, US(10));
+    dde_kl15_f1(&k, 0x60, US(400));
+    CHECK(dde_kl15_eval(&k, US(401), 401, true), "unknown b3 keeps on");
+    // hard ceiling: 0x103 only (no 0xF1 in this wake), 0x103 never stops -> 0x5C ends 60 s after
+    // the 0x103 onset, whatever the NM rule says
+    dde_kl15_reset(&k, W);
+    uint32_t last = 0, nceil = 0;
+    for (uint32_t c = 0; c < 30000; c++) {
+        uint32_t t = US(c);
+        if (c >= 200 && (c - 200) % 42 == 0) dde_kl15_103(&k, t);
+        dde_kl15_eval(&k, t, c, true);
+        if (dde_nm_allowed(&k, c, t, &ceil)) last = c;
+        nceil += ceil;
+    }
+    CHECK(last == 200 + DDE_NM_CEIL_US / 5000u - 1, "ceiling 60 s after the 0x103 onset (%u)", last);
+    CHECK(nceil > 0, "ceiling counted");
+    // stuck 0xF1 0x20 without refresh can not hold the bus: timeout 5 s, then off + 47 s, ceiling 60 s
+    dde_kl15_reset(&k, W);
+    dde_kl15_f1(&k, 0x20, US(0));
+    last = 0;
+    for (uint32_t c = 0; c < 30000; c++) {
+        dde_kl15_eval(&k, US(c), c, true);
+        if (dde_nm_allowed(&k, c, US(c), &ceil)) last = c;
+    }
+    CHECK(last < DDE_NM_CEIL_US / 5000u, "never past 60 s after the last on-evidence (%u)", last);
+    // use_f1 = 0 (EMU_KL15_F1 off): 0x103 only, 0xF1 ignored for the state
+    dde_kl15_reset(&k, W);
+    dde_kl15_f1(&k, 0xE0, US(0));
+    dde_kl15_103(&k, US(10));
+    CHECK(dde_kl15_eval(&k, US(11), 11, false), "0x103 decides when F1 is off");
+    // evidence older than the wake: a new wake restarts the ceiling
+    dde_kl15_reset(&k, 0xFFFFFF00u);   // wrap-around safe
+    CHECK(dde_nm_allowed(&k, 0, 0xFFFFFF00u + 100u, &ceil), "wrap-around wake");
+    #undef US
+}
+
 int main(int argc, char **argv)
 {
     dde_core_init();
@@ -531,6 +690,7 @@ int main(int argc, char **argv)
     }
     test_dyn_basics();
     test_dyn_flash();
+    test_kl15_nm();
     test_pack_args();
     test_schedule();
     test_lock();

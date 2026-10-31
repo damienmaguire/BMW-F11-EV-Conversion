@@ -7,6 +7,9 @@
 #include "v2_cantest.h"
 #include "board_pico_flexray_v2.h"
 #include "pico_can_record.h"
+#if EMU_CAN_TX
+#include "ptcan_emu.h"
+#endif
 #endif
 #include "pico/stdlib.h"
 #include "pico/unique_id.h"
@@ -275,13 +278,21 @@ static bool handle_control_read(uint8_t rhport, tusb_control_request_t const *re
 #if PICO_FLEXRAY_DDE_EMU
     case PICOFLEX_GET_EMU:
         {
-            // 192 bytes (v3) do not fit response_data[64] and a multi-packet control IN
+            // 256 bytes (v4) do not fit response_data[64] and a multi-packet control IN
             // reads its buffer after this function returns: use a static buffer. TinyUSB
-            // sends min(wLength, 192), so a v1 host asking for 64 gets the v1 layout and
-            // a v2 host asking for 128 the v2 layout.
+            // sends min(wLength, 256), so a v1 host asking for 64 gets the v1 layout,
+            // a v2 host asking for 128 the v2 and a v3 host asking for 192 the v3 layout.
             static dde_emu_stats_t es;
             dde_emu_fill_stats(&es);
             return tud_control_xfer(rhport, request, &es, sizeof(es));
+        }
+#endif
+#if PICO_FLEXRAY_BOARD_V2 && EMU_CAN_TX
+    case PICOFLEX_GET_CANTX:
+        {
+            static uint8_t cs[sizeof(ptcan_stats_t)];
+            uint16_t n = ptcan_emu_get_stats(cs, sizeof cs);
+            return tud_control_xfer(rhport, request, cs, n);
         }
 #endif
 
@@ -449,6 +460,14 @@ static bool handle_control_write(uint8_t rhport, tusb_control_request_t const *r
             return false;
         }
         dde_emu_host_set(request->wValue);
+        handled = true;
+        break;
+#endif
+
+#if PICO_FLEXRAY_BOARD_V2 && EMU_CAN_TX
+    case PICOFLEX_SET_CANTX:
+        // PT-CAN DDE/EGS TX: ID mask (repeat as keepalive), 0 = off + clear a latched fault.
+        ptcan_emu_host_set((uint32_t)request->wValue | ((uint32_t)request->wIndex << 16));
         handled = true;
         break;
 #endif

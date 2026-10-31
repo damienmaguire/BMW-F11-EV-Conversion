@@ -20,6 +20,16 @@ static uint32_t crc24_table[256];
 static uint8_t crc8_table[256];
 static bool tables_ready;
 
+static uint8_t ms_tab[256];
+static unsigned ms_used_calc(unsigned plen)
+{
+    if (plen == 0 || (plen & 1u) || plen > 254u) return 0;
+    // frame + overhead in 0.1 bit = 1 tick units, overhead 12.6 .. 17.5 bits
+    uint64_t lo = (uint64_t)(100u * (plen + 8u) + 126u) * 256u, hi = (uint64_t)(100u * (plen + 8u) + 175u) * 256u;
+    uint64_t klo = (lo + DDE_DYN_MS_Q8 - 1u) / DDE_DYN_MS_Q8, khi = (hi + DDE_DYN_MS_Q8 - 1u) / DDE_DYN_MS_Q8;
+    return klo == khi ? (unsigned)klo + 2u : 0u;
+}
+
 void dde_core_init(void)
 {
     for (unsigned i = 0; i < 256; i++) {
@@ -30,6 +40,7 @@ void dde_core_init(void)
         for (int b = 0; b < 8; b++) d = (d & 0x80u) ? (uint8_t)((d << 1) ^ 0x1Du) : (uint8_t)(d << 1);
         crc8_table[i] = d;
     }
+    for (unsigned n = 0; n < 256; n++) ms_tab[n] = (uint8_t)ms_used_calc(n);
     tables_ready = true;
 }
 
@@ -104,14 +115,21 @@ unsigned DDE_RAM(dde_core_build_static)(unsigned target, unsigned cycle, unsigne
 unsigned DDE_RAM(dde_core_build_static_ex)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
                                            bool preign, uint8_t *out)
 {
+    return dde_core_build_static_ph(target, cycle, counter, keep_sync, preign ? DDE_PH_PREIGN : DDE_PH_ON, out);
+}
+
+unsigned DDE_RAM(dde_core_build_static_ph)(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
+                                           unsigned phase, uint8_t *out)
+{
     const unsigned plen = DDE_EMU_STATIC_PAYLOAD_BYTES;
     uint8_t ind = dde_core_emu_indicators(target, cycle, keep_sync);
     dde_core_header(ind, dde_emu_static_id[target], plen / 2u, cycle, out);
     memcpy(out + 5, dde_emu_static_payload[target][cycle & 63u], plen);
-    if (preign && (ind & 0x04u)) {
+    if (phase == DDE_PH_PREIGN && (ind & 0x04u)) {
         if (target == 1 && (cycle & 3u) == 1) { out[5 + 2] = 0xC1; out[5 + 3] = 0x17; out[5 + 4] = 0x7C; }
         if (target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0x80;
     }
+    if (phase == DDE_PH_OFF && (ind & 0x04u) && target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0xC0;
     if (ind & 0x04u) dde_core_e2e_apply(out + 5, target, cycle, counter);
     uint32_t c = dde_core_frame_crc(out, 5u + plen);
     out[5 + plen] = (uint8_t)(c >> 16);
@@ -263,30 +281,57 @@ bool DDE_RAM(dde_lock_poll)(dde_lock_t *l, uint32_t now_us)
 // ---------------------------------------------------------------------------
 // v1c dynamic PDUs. Content from run 4/5 real DDE ign-on (engine off), Fred's
 // dde_dynamic_ignon_template.csv (v1c_rank_after_emu2 1..6).
-const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT] = {0xE6, 0xE8, 0xFB};
+const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT] = {0xE6, 0xE8, 0xFB, 0x10A, 0x142, 0x68};
 
 const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU] = {
     // Content = Fred's v1c spec (f11_emu2_dsc.md). Pre-ign: the real DDE (runs 4 and 5) sends
     // the same layout before ign after a ~0.3 s start-up, except 0xFB L9 = 1f 00 ff 7f 00 f3 ff ff.
-    // id   slot           plen %8 kind               k     hi    hi_pre ign  period
-    {0xE6, DDE_DSLOT_E6, 8, 2, DDE_DYN_KIND_E2E,   0x04, 0x10, 0x10, 0, 200,
+    // id   slot           plen %8 kind               k     hi    hi_pre ign  period every4 start
+    {0xE6, DDE_DSLOT_E6, 8, 2, DDE_DYN_KIND_E2E,   0x04, 0x10, 0x10, 0, 200, 0, 0,
      {0x00, 0x10, 0x80, 0x64, 0x45, 0x44, 0x23, 0x47}, {0x00, 0x10, 0x80, 0x64, 0x45, 0x44, 0x23, 0x47}, "E6"},
-    {0xFB, DDE_DSLOT_FB, 4, 5, DDE_DYN_KIND_CTR,   0x00, 0x40, 0x40, 0, 1000,
+    {0xFB, DDE_DSLOT_FB, 4, 5, DDE_DYN_KIND_CTR,   0x00, 0x40, 0x40, 0, 1000, 0, 0,
      {0x40, 0x60, 0xF1, 0xFF}, {0x40, 0x60, 0xF1, 0xFF}, "FB5"},
-    {0xFB, DDE_DSLOT_FB, 6, 6, DDE_DYN_KIND_CTR,   0x00, 0xF0, 0xF0, 0, 40,
+    {0xFB, DDE_DSLOT_FB, 6, 6, DDE_DYN_KIND_CTR,   0x00, 0xF0, 0xF0, 0, 40, 0, 0,
      {0xF0, 0xFF, 0x47, 0x32, 0x00, 0xF0}, {0xF0, 0xFF, 0x47, 0x32, 0x00, 0xF0}, "FB7"},
-    {0xFB, DDE_DSLOT_FB, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 1000,
+    {0xFB, DDE_DSLOT_FB, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 1000, 0, 0,
      {0x1F, 0x00, 0x04, 0x00, 0x00, 0xF3, 0xFF, 0xFF}, {0x1F, 0x00, 0xFF, 0x7F, 0x00, 0xF3, 0xFF, 0xFF}, "FB9"},
-    {0xE8, DDE_DSLOT_E8, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 200,
+    {0xE8, DDE_DSLOT_E8, 8, 3, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 200, 0, 0,
      {0x00, 0x00, 0x00, 0x9A, 0x29, 0xF3, 0x56, 0xF0}, {0x00, 0x00, 0x00, 0x9A, 0x29, 0xF3, 0x56, 0xF0}, "E89"},
-    {0xE8, DDE_DSLOT_E8, 4, 0, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 1, 1000,
+    {0xE8, DDE_DSLOT_E8, 4, 0, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 1, 1000, 0, DDE_IGN_E8L5_CYCLES,
      {0x86, 0x78, 0xFE, 0xFE}, {0x86, 0x78, 0xFE, 0xFE}, "E85"},
+    // v1d. 0x10A: "00 ff ff ff" is the whole content, KL15-gated (Ian); run 5 c%8 = 2, every 1 s.
+    {0x10A, DDE_DSLOT_10A, 4, 2, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 1, 200, 0, DDE_IGN_10A_CYCLES,
+     {0x00, 0xFF, 0xFF, 0xFF}, {0x00, 0xFF, 0xFF, 0xFF}, "10A"},
+    // 0x142: every 4 cycles (run 5: cycle % 4 == 3 through ign), content from dde_142_phase[]
+    {0x142, DDE_DSLOT_142, 30, 3, DDE_DYN_KIND_CTR8, 0x00, 0x00, 0x00, 0, 4, 1, 0,
+     {0}, {0}, "142"},
+    // 0x68: "c0 ff" every 5 s from wake (run 5: first DDE frame after wake, cycle % 8 == 5)
+    {0x68, DDE_DSLOT_68, 2, 5, DDE_DYN_KIND_CONST, 0x00, 0x00, 0x00, 0, 1000, 0, 0,
+     {0xC0, 0xFF}, {0xC0, 0xFF}, "68"},
 };
+
+// 0x142 payload B0..B29 per phase (B0 = counter, overwritten). Run 5 real DDE (FR2):
+// P0 0.06 s, P1 2.592 s, P2 13.592 s (ign on, engine off; B1/B5 are slow event counters that
+// went 03 -> 06 later in run 5 and differ in run 4 / the MITM capture: situational).
+const uint8_t dde_142_phase[DDE_142_NPH][DDE_142_PLEN] = {
+    {0x00, 0x00, 0xFF, 0x00, 0x00, 0x00},
+    {0x00, 0x01, 0xFF, 0x00, 0x00, 0x01},
+    {0x00, 0x03, 0xFF, 0x00, 0x00, 0x03, 0x00, 0xA4, 0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x01, 0x00,
+     0x00, 0x00, 0x02, 0x10, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+};
+
+unsigned DDE_RAM(dde_core_dyn_ctr_mod)(unsigned p)
+{
+    unsigned k = dde_dyn_pdu[p].kind;
+    return k == DDE_DYN_KIND_CTR8 ? 255u : (k == DDE_DYN_KIND_CONST ? 1u : 15u);
+}
 
 int DDE_RAM(dde_core_dyn_pdu_for)(unsigned dslot, unsigned cycle)
 {
     for (int p = 0; p < DDE_DYN_N_PDU; p++)
-        if (dde_dyn_pdu[p].dslot == dslot && dde_dyn_pdu[p].cyc_mod8 == (cycle & 7u)) return p;
+        if (dde_dyn_pdu[p].dslot == dslot &&
+            (dde_dyn_pdu[p].every4 ? (dde_dyn_pdu[p].cyc_mod8 & 3u) == (cycle & 3u)
+                                   : dde_dyn_pdu[p].cyc_mod8 == (cycle & 7u))) return p;
     return -1;
 }
 
@@ -298,13 +343,22 @@ int DDE_RAM(dde_core_dyn_slot_of_id)(unsigned id)
 
 unsigned DDE_RAM(dde_core_build_dyn_pdu)(unsigned p, unsigned cycle, unsigned counter, bool preign, uint8_t *out)
 {
+    return dde_core_build_dyn_pdu_ph(p, cycle, counter, preign ? 0u : (p == DDE_PDU_142 ? DDE_142_P2 : 1u), out);
+}
+
+unsigned DDE_RAM(dde_core_build_dyn_pdu_ph)(unsigned p, unsigned cycle, unsigned counter, unsigned phase, uint8_t *out)
+{
     const dde_dyn_pdu_t *d = &dde_dyn_pdu[p];
     const unsigned plen = d->plen;
+    bool preign = phase == 0;
     dde_core_header(0x04u, d->id, plen / 2u, cycle, out);
     uint8_t *pl = out + 5;
-    memcpy(pl, preign ? d->payload_pre : d->payload, plen);
+    if (d->kind == DDE_DYN_KIND_CTR8) memcpy(pl, dde_142_phase[phase < DDE_142_NPH ? phase : DDE_142_P2], plen);
+    else memcpy(pl, preign ? d->payload_pre : d->payload, plen);
     uint8_t hi = preign ? d->hi_pre : d->hi;
-    if (d->kind == DDE_DYN_KIND_E2E) {
+    if (d->kind == DDE_DYN_KIND_CTR8) {
+        pl[0] = (uint8_t)(counter % 255u);
+    } else if (d->kind == DDE_DYN_KIND_E2E) {
         pl[1] = (uint8_t)(hi | (counter & 0x0Fu));
         pl[0] = (uint8_t)(dde_core_crc8(&pl[1], plen - 1u) ^ d->k);
     } else if (d->kind == DDE_DYN_KIND_CTR) {
@@ -321,12 +375,63 @@ unsigned DDE_RAM(dde_core_build_dyn_pdu)(unsigned p, unsigned cycle, unsigned co
 // the next frame's AP (frame end + idle detection, rounded up, + 2).
 unsigned DDE_RAM(dde_core_dyn_ms_used)(unsigned payload_bytes)
 {
-    switch (payload_bytes) {
-    case 2: case 4: return 4;
-    case 6: case 8: return 5;
-    case 14: return 6;
-    default: return 0;
+    if (!tables_ready) dde_core_init();
+    return payload_bytes < 256u ? ms_tab[payload_bytes] : 0u;
+}
+
+// ---------------------------------------------------------------------------
+// v1d KL15 / NM gate (see dde_emu_core.h)
+void DDE_RAM(dde_kl15_reset)(dde_kl15_t *k, uint32_t wake_us)
+{
+    memset(k, 0, sizeof(*k));
+    k->wake_us = wake_us;
+}
+
+void DDE_RAM(dde_kl15_f1)(dde_kl15_t *k, uint8_t b3, uint32_t now_us)
+{
+    k->f1_seen = true;
+    k->f1_us = now_us;
+    if (b3 == 0x20u) {
+        k->f1_on = true;
+        k->evid_seen = true;
+        k->evid_us = now_us;
+    } else if (b3 == 0xE0u) {
+        k->f1_on = false;
     }
+    // other values: keep the last state (only 0x20 / 0xE0 seen in runs 3-5)
+}
+
+void DDE_RAM(dde_kl15_103)(dde_kl15_t *k, uint32_t now_us)
+{
+    bool onset = !k->c103_seen || (uint32_t)(now_us - k->c103_us) > DDE_KL15_103_TIMEOUT_US;
+    k->c103_seen = true;
+    k->c103_us = now_us;
+    if (onset && !k->f1_seen) { k->evid_seen = true; k->evid_us = now_us; }
+}
+
+bool DDE_RAM(dde_kl15_eval)(dde_kl15_t *k, uint32_t now_us, uint32_t abs_cycle, bool use_f1)
+{
+    bool on;
+    if (use_f1 && k->f1_seen) on = k->f1_on && (uint32_t)(now_us - k->f1_us) < DDE_KL15_F1_TIMEOUT_US;
+    else on = k->c103_seen && (uint32_t)(now_us - k->c103_us) < DDE_KL15_103_TIMEOUT_US;
+    if (on && !k->on) { k->on_abs = abs_cycle; k->on_edges++; k->ever_on = true; }
+    if (!on && k->on) { k->off_abs = abs_cycle; k->off_edges++; }
+    k->on = on;
+    return on;
+}
+
+bool DDE_RAM(dde_nm_allowed)(const dde_kl15_t *k, uint32_t abs_cycle, uint32_t now_us, bool *ceiling)
+{
+    bool rule;
+    if (k->on) rule = true;
+    else if (k->ever_on) rule = abs_cycle - k->off_abs < DDE_NM_RELEASE_CYCLES;
+    else rule = abs_cycle < DDE_NM_WAKE_CYCLES;
+    // hard ceiling from the later of wake and the last KL15-on evidence
+    uint32_t ref = k->wake_us;
+    if (k->evid_seen && (int32_t)(k->evid_us - ref) > 0) ref = k->evid_us;
+    bool ceil_hit = (uint32_t)(now_us - ref) >= DDE_NM_CEIL_US;
+    if (ceiling) *ceiling = rule && ceil_hit;
+    return rule && !ceil_hit;
 }
 
 unsigned dde_core_dyn_dts_bits(unsigned nbytes, unsigned tss_bits)

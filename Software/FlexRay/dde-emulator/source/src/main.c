@@ -25,6 +25,9 @@
 #include "flexray_pins.h"
 #include "flexray_ts.h"
 #include "pico_fr_record.h"
+#if PICO_FLEXRAY_BOARD_V2
+#include "v2_cantest.h"
+#endif
 #if PICO_FLEXRAY_DDE_EMU
 #include "dde_emu.h"
 #endif
@@ -200,6 +203,7 @@ void setup_pins(void)
     gpio_pull_up(RXD_FR_3_PIN);
     gpio_pull_up(RXD_FR_4_PIN);
 
+#if !PICO_FLEXRAY_BOARD_V2
     gpio_init(RELAY_FR_1_2);
     gpio_set_dir(RELAY_FR_1_2, GPIO_OUT);
     gpio_put(RELAY_FR_1_2, 1);
@@ -207,6 +211,10 @@ void setup_pins(void)
     gpio_init(RELAY_FR_3_4);
     gpio_set_dir(RELAY_FR_3_4, GPIO_OUT);
     gpio_put(RELAY_FR_3_4, 1);
+#else
+    // V2 has no bypass relays (GP17/GP18 are the CAN SPI CS/SCK lines).
+    v2_leds_init();
+#endif
 
     // delay enabling pins to avoid glitch
     sleep_ms(100);
@@ -215,9 +223,11 @@ void setup_pins(void)
     gpio_put(BGE_PIN, 1);
     gpio_put(STBN_PIN, 1);
 
+#if !PICO_FLEXRAY_BOARD_V2
 		// On-board LED
 	gpio_init(LED_PIN);
 	gpio_set_dir(LED_PIN, GPIO_OUT);
+#endif
 }
 
 int main(void)
@@ -247,6 +257,12 @@ int main(void)
 
     printf("Actual system clock: %lu Hz\n", clock_get_hz(clk_sys));
     printf("\n--- FlexRay Continuous Streaming Bridge (Forwarder Mode) ---\n");
+#if PICO_FLEXRAY_BOARD_V2
+    printf("Board: Pi_Flex_V2 (FR3/FR4 parked on unconnected pins), LED1=GP%d LED2=GP%d\n", V2_LED1_PIN, V2_LED2_PIN);
+    printf("PT-CAN: MCP251863 LISTEN-ONLY 500 kbit/s classic, RX only (no TX), USB CAN records bus %d\n", V2_CAN_USB_BUS);
+    // CAN controller init on core0 before the FlexRay machinery (bounded, < ~30 ms).
+    v2_can_init();
+#endif
 
     multicore_launch_core1(core1_entry);
     sleep_ms(500);
@@ -264,6 +280,11 @@ int main(void)
 	absolute_time_t next_stats_print_time = make_timeout_time_ms(5000);
 	absolute_time_t next_led_toggle_time = make_timeout_time_ms(500);
 	bool led_on = false;
+#if PICO_FLEXRAY_BOARD_V2
+    (void)next_led_toggle_time;
+    (void)led_on;
+    v2_tick_start(); // 50 ms alarm-pool tick (core0): LED1 heartbeat, LED2, CAN housekeeping
+#endif
     // Track previous len_ok to compute parsed-frames FPS
     uint32_t prev_total = 0;
     uint32_t prev_valid = 0;
@@ -271,16 +292,23 @@ int main(void)
     while (true)
     {
         panda_usb_task();
+#if PICO_FLEXRAY_BOARD_V2
+        v2_cantest_poll(); // bounded CAN RX drain + 50 ms housekeeping, never waits on USB
+#else
 		if (time_reached(next_led_toggle_time))
 		{
 			next_led_toggle_time = make_timeout_time_ms(500);
 			led_on = !led_on;
 			gpio_put(LED_PIN, led_on);
 		}
+#endif
         if (time_reached(next_stats_print_time))
         {
             next_stats_print_time = make_timeout_time_ms(5000);
             stats_print(&stats, prev_total, prev_valid);
+#if PICO_FLEXRAY_BOARD_V2
+            v2_cantest_print_status();
+#endif
             prev_total = stats.len_ok;
             prev_valid = stats.valid;
             print_ram_usage();
@@ -382,6 +410,12 @@ int main(void)
                         flexray_unknown_source_ids[idx & 31u] = frame.frame_id;
                     }
                     try_cache_last_target_frame(frame.frame_id, frame.cycle_count, expected_len, header);
+#if PICO_FLEXRAY_DDE_EMU
+                    // v1d: KL15 state from the vehicle's 0xF1 (FR1 only; core1 polls it once per cycle)
+                    if (!info.is_fr2)
+                        dde_emu_on_frame(frame.frame_id, frame.cycle_count, frame.payload,
+                                         (unsigned)frame.payload_length_words * 2u);
+#endif
 
                     // TS-CAPTURE: hardware frame-start timestamp, matched by byte-ring position.
                     flexray_ts_t ts;

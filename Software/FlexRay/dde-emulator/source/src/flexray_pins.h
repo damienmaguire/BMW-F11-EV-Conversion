@@ -1,6 +1,12 @@
 #ifndef FLEXRAY_PINS_H
 #define FLEXRAY_PINS_H
 
+#if PICO_FLEXRAY_BOARD_V2
+// Pi_Flex_V2 carrier: same FR1/FR2/BGE/STBN pins, FR3/FR4 parked, no relays,
+// LEDs on GP8/GP9, MCP251863 CAN on spi0 (GP16-21).
+#include "board_pico_flexray_v2.h"
+#else
+
 // -- Streamer Pins --
 #define BGE_PIN 2
 #define STBN_PIN 3
@@ -25,4 +31,5 @@
 #define TXEN_FR_4_PIN 22
 #define RXD_FR_4_PIN 21
 
+#endif // PICO_FLEXRAY_BOARD_V2
 #endif // FLEXRAY_PINS_H

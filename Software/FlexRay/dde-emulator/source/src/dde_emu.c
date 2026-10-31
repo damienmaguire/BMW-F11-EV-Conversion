@@ -39,7 +39,20 @@
 #include "dde_emu_tx.pio.h"
 
 #ifndef EMU_DYN_5C
-#define EMU_DYN_5C 0
+#define EMU_DYN_5C 1          // v1d: on, gated by KL15 / NM rules + 60 s hard ceiling
+#endif
+// v1d dynamic frames
+#ifndef EMU_142
+#define EMU_142 1
+#endif
+#ifndef EMU_10A
+#define EMU_10A 1
+#endif
+#ifndef EMU_68
+#define EMU_68 1
+#endif
+#ifndef EMU_KL15_F1
+#define EMU_KL15_F1 1         // 1 = KL15 from 0xF1 b3 (fallback 0x103 until the first 0xF1); 0 = 0x103 only
 #endif
 // v1c dynamic frames (one switch per frame ID / slot) and pre-ign content
 #ifndef EMU_DYN_E6
@@ -64,11 +77,22 @@
 #define DDE_EMU_IGN_TIMEOUT_US 500000u  // 0x103 every 200-220 ms while ign is on
 static inline bool dyn_enabled(unsigned ds)
 {
-    return ds == DDE_DSLOT_E6 ? EMU_DYN_E6 != 0 : ds == DDE_DSLOT_E8 ? EMU_DYN_E8 != 0 : EMU_DYN_FB != 0;
+    switch (ds) {
+    case DDE_DSLOT_E6: return EMU_DYN_E6 != 0;
+    case DDE_DSLOT_E8: return EMU_DYN_E8 != 0;
+    case DDE_DSLOT_FB: return EMU_DYN_FB != 0;
+    case DDE_DSLOT_10A: return EMU_10A != 0;
+    case DDE_DSLOT_142: return EMU_142 != 0;
+    case DDE_DSLOT_68: return EMU_68 != 0;
+    default: return false;
+    }
 }
 
 #define DDE_EMU_PIO pio0
 #define DDE_EMU_LEAD_US 6u              // alarm this long before the TXEN target
+#define DDE_EMU_LEAD_DYN_US 10u         // v1d: dynamic slots (run 3 FB7 lates: more ISR-entry margin)
+#define DDE_EMU_HK_GUARD_US 200u        // v1d: no housekeeping alarm in the 200 us before an armed fire
+#define DDE_EMU_TOPUP_US 50u            // v1d: > 8-word frames: rest of the words within 50 us of the fire
 #define DDE_EMU_R_MIN 20                // fire SM delay window (ticks)
 #define DDE_EMU_R_PRECHECK 120          // must still have 1.2 us left before loading the TX FIFO (v1: 2.5 us;
                                         // loading 8 words takes < 0.3 us, r is re-checked after)
@@ -178,7 +202,7 @@ static int32_t dref_off;
 static uint32_t abs_cycle;                   // cycles since wake
 static uint8_t abs_last_cycle;
 static uint32_t pdu_due[DDE_DYN_N_PDU];      // abs cycle from which the PDU is due
-static uint8_t pdu_ctr[DDE_DYN_N_PDU];       // 0..14, starts at 1 after wake
+static uint8_t pdu_ctr[DDE_DYN_N_PDU];       // 0..14 (0x142: 0..254), starts at 1 after wake
 static bool pdu_started[DDE_DYN_N_PDU];      // sent since wake (period grid running)
 static int8_t dyn_due[DDE_DYN_N_SLOT];       // PDU due in this cycle (-1 none)
 static uint8_t dyn_reason[DDE_DYN_N_SLOT];   // why not (yet) armed in this cycle
@@ -187,6 +211,18 @@ static bool ign_seen;                        // 0x103 seen since wake
 static uint32_t ign_abs;                     // abs cycle of the first 0x103
 static uint32_t last_103_us;
 static bool tx_parked_ok;                    // last frame had nbytes % 4 == 2: SM parks at idle+1
+// v1d KL15 / NM
+static dde_kl15_t kl15;
+static bool nm_ok, nm_ceiling;               // 0x5C allowed in this cycle / stopped by the ceiling
+static volatile struct { uint8_t b3; uint32_t us; uint32_t seq; } f1mb;   // core0 -> core1 (0xF1)
+static uint32_t f1_seq_seen;
+static uint8_t f1_last_b3;
+static struct {
+    int16_t isr_late_min, isr_late_max;      // dynamic fires: alarm ISR entry - alarm time (us)
+    int16_t r_entry_min, r_final_min;        // dynamic fires: fire delay at ISR entry / after the final check
+    uint16_t topup_timeouts, hk_deferred, nm_ceiling_stops;
+    bool any;
+} lat;
 static volatile struct {
     uint32_t sent[DDE_DYN_N_PDU];
     uint16_t skip[DDE_DYN_N_PDU];
@@ -194,6 +230,13 @@ static volatile struct {
     uint16_t defer, parks;
     uint16_t last_ms[DDE_DYN_N_SLOT];
 } dcnt;
+// 0x142 content phase for this cycle (see dde_emu_core.h)
+static unsigned ph142(void)
+{
+    if (kl15.on && abs_cycle >= kl15.on_abs + DDE_142_P2_CYCLES) return DDE_142_P2;
+    if (kl15.ever_on && !kl15.on) return DDE_142_P2;   // ign was on in this wake: settled content
+    return abs_cycle >= DDE_142_P1_CYCLES ? DDE_142_P1 : DDE_142_P0;
+}
 #ifdef DDE_EMU_TEST_HOOKS
 // host test: pick the PDU of dynamic slot ds for this cycle (-1 none, -2 = normal scheduler)
 int (*dde_emu_test_dyn_pick)(unsigned ds, unsigned cycle);
@@ -302,13 +345,26 @@ static inline void __time_critical_func(alarm_arm)(uint32_t t)
 
 static void __time_critical_func(alarm_rearm_next)(uint32_t now)
 {
-    uint32_t best = now + DDE_EMU_HK_US;
+    uint32_t hk = now + DDE_EMU_HK_US;
     if (tx_expect) {   // one housekeeping pass right after the frame's expected end
         uint32_t t = tx_deadline_us + DDE_EMU_WD_MARGIN_US + 1u;
-        if ((int32_t)(t - best) < 0) best = t;
+        if ((int32_t)(t - hk) < 0) hk = t;
     }
+    bool have = false;
+    uint32_t sl = 0;
     for (unsigned i = 0; i < N_ALL; i++) {
-        if (slots[i].state == SL_ARMED && (int32_t)(slots[i].alarm_us - best) < 0) best = slots[i].alarm_us;
+        if (slots[i].state == SL_ARMED && (!have || (int32_t)(slots[i].alarm_us - sl) < 0)) {
+            sl = slots[i].alarm_us;
+            have = true;
+        }
+    }
+    uint32_t best = hk;
+    if (have && (int32_t)(sl - hk) <= 0) best = sl;
+    else if (have && (int32_t)(sl - hk) < (int32_t)DDE_EMU_HK_GUARD_US) {
+        // v1d: a housekeeping pass just before a fire delays the fire ISR (run 3 FB7 lates):
+        // run it right after that fire instead (the fire ISR does housekeeping too)
+        best = sl;
+        sat16_inc(&lat.hk_deferred);
     }
     alarm_arm(best);
 }
@@ -444,6 +500,14 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
     if (!tx_sm_ready(now)) { count_late(i, DDE_EMU_LATE_TX_BUSY, 0); return; }
     if (!fire_sm_idle()) { count_late(i, DDE_EMU_LATE_FIRE_BUSY, 0); return; }
     int32_t r0 = dde_core_fire_delay(s->txen_fine, fine_now(), k);
+    if (i >= DDE_EMU_N_SLOTS) {
+        int32_t il = (int32_t)(now - s->alarm_us);
+        if (!lat.any || il < lat.isr_late_min) lat.isr_late_min = (int16_t)clamp32(il, -32768, 32767);
+        if (!lat.any || il > lat.isr_late_max) lat.isr_late_max = (int16_t)clamp32(il, -32768, 32767);
+        if (!lat.any || r0 < lat.r_entry_min) lat.r_entry_min = (int16_t)clamp32(r0, -32768, 32767);
+        if (!lat.any) lat.r_final_min = 32767;
+        lat.any = true;
+    }
     if (r0 < DDE_EMU_R_PRECHECK) { count_late(i, DDE_EMU_LATE_SHORT, r0); return; }
     uint32_t seq1 = 0;
     flexray_ts_t t1;
@@ -451,7 +515,9 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
     flexray_ts_peek_latest(1, &t1, &pos1, &seq1);
 
     pio_interrupt_clear(DDE_EMU_PIO, 5);
-    for (unsigned w = 0; w < s->nwords; w++) pio_sm_put(DDE_EMU_PIO, sm_tx, s->words[w]);
+    // the joined TX FIFO holds 8 words: longer frames (0x142, 12 words) get the rest after the fire
+    unsigned npre = s->nwords < 8u ? s->nwords : 8u;
+    for (unsigned w = 0; w < npre; w++) pio_sm_put(DDE_EMU_PIO, sm_tx, s->words[w]);
     int32_t r = dde_core_fire_delay(s->txen_fine, fine_now(), k);
     if (i >= DDE_EMU_N_SLOTS) {
         // dynamic: wait until the latest possible start of a lower-ID frame has
@@ -484,6 +550,23 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
         return;
     }
     pio_sm_put(DDE_EMU_PIO, sm_fire, (uint32_t)r);
+    if (i >= DDE_EMU_N_SLOTS && r < lat.r_final_min) lat.r_final_min = (int16_t)r;
+    if (s->nwords > npre) {
+        // top-up: the SM drains a word per 3.2 us once the frame runs; the FIFO always has
+        // >= 6 words queued here, so this never underruns unless the core stalls > 20 us.
+        // Time guard: a stuck SM must never keep this ISR spinning (then: hard stop, pins high).
+        uint32_t t0 = time_us_32();
+        for (unsigned w = npre; w < s->nwords; w++) {
+            while (pio_sm_is_tx_fifo_full(DDE_EMU_PIO, sm_tx)) {
+                if ((uint32_t)(time_us_32() - t0) > DDE_EMU_TOPUP_US) {
+                    sat16_inc(&lat.topup_timeouts);
+                    enter_fault(DDE_EMU_FAULT_TX_STUCK, (int)i, -(int32_t)w);
+                    return;
+                }
+            }
+            pio_sm_put(DDE_EMU_PIO, sm_tx, s->words[w]);
+        }
+    }
     // committed: the frame is on the wire from now + (r + k) ticks for frame_bits * 100 ns
     {
         unsigned nbytes = (s->words[0] & 0xFFFFu) + 1u;
@@ -504,7 +587,7 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
         dcnt.sent[p]++;
         dcnt.last_ms[ds] = s->ms;
         dyn_sent_cyc[ds] = true;
-        pdu_ctr[p] = (uint8_t)((pdu_ctr[p] + 1u) % 15u);
+        pdu_ctr[p] = (uint8_t)((pdu_ctr[p] + 1u) % dde_core_dyn_ctr_mod(p));
         // periodic grid from the first TX after wake; a retry (skip, +8 cycles) keeps the
         // grid, anything later than half a period restarts it from now
         uint32_t per = dde_dyn_pdu[p].period;
@@ -543,7 +626,29 @@ static void __time_critical_func(alarm_isr)(void)
 // Pre-ign content until DDE_IGN_STATIC_CYCLES after the first 0x103 since wake.
 static inline bool preign_static(void)
 {
+    // v1e: KL15 on (0xF1) also ends the pre-ign content, not only the first 0x103.
+    if (kl15.on && abs_cycle >= kl15.on_abs + DDE_IGN_STATIC_CYCLES) return false;
     return EMU_PREIGN && (!ign_seen || abs_cycle < ign_abs + DDE_IGN_STATIC_CYCLES);
+}
+
+// v1e: content follows KL15, not only the (sticky) "0x103 seen in this wake" flag:
+// after KL15 off the real DDE moves 0x29 c%4==3 b8 to c0 (+30 ms) and 0xFB L9 back to
+// 1f 00 ff 7f (+0.23 s); 0x142 already has its own after-off phase (ph142).
+static inline bool kl15_off_for(uint32_t cycles)
+{
+    return kl15.ever_on && !kl15.on && abs_cycle >= kl15.off_abs + cycles;
+}
+
+static inline unsigned static_phase(void)
+{
+    if (kl15_off_for(DDE_OFF_29_CYCLES)) return DDE_PH_OFF;
+    return preign_static() ? DDE_PH_PREIGN : DDE_PH_ON;
+}
+
+static inline unsigned dyn_phase(unsigned p)
+{
+    if (p == DDE_PDU_FB9 && kl15_off_for(DDE_OFF_FB9_CYCLES)) return 0u; // pre-ign content = ff 7f
+    return preign_static() ? 0u : 1u;
 }
 
 static void __time_critical_func(prepare_slot)(unsigned i, unsigned cycle)
@@ -553,11 +658,12 @@ static void __time_critical_func(prepare_slot)(unsigned i, unsigned cycle)
     unsigned n, dts = 0;
     s->pdu = -1;
     if (i < DDE_EMU_N_STATIC) {
-        n = dde_core_build_static_ex(i, cycle, counter[i][cycle & 3u], EMU_SYNC_BITS != 0, preign_static(), frame);
+        n = dde_core_build_static_ph(i, cycle, counter[i][cycle & 3u], EMU_SYNC_BITS != 0, static_phase(), frame);
         s->is_data = (dde_core_emu_indicators(i, cycle, false) & 0x04u) != 0;
     } else if (i >= DDE_EMU_N_SLOTS) {
         unsigned p = (unsigned)dyn_due[i - DDE_EMU_N_SLOTS];
-        n = dde_core_build_dyn_pdu(p, cycle, pdu_ctr[p], preign_static(), frame);
+        unsigned ph = p == DDE_PDU_142 ? ph142() : dyn_phase(p);
+        n = dde_core_build_dyn_pdu_ph(p, cycle, pdu_ctr[p], ph, frame);
         dts = dde_core_dyn_dts_bits(n, EMU_TSS_BITS);
         s->is_data = 1;
         s->pdu = (int8_t)p;
@@ -642,14 +748,30 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t 
         dyn_due[ds] = -1;
         dyn_sent_cyc[ds] = false;
     }
+    uint32_t now = time_us_32();
     if (ev == DDE_LOCK_NEW_WAKE) {
         abs_cycle = 0;
         ign_seen = false;
         for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { pdu_due[p] = 0; pdu_ctr[p] = 1; pdu_started[p] = false; }
+        dde_kl15_reset(&kl15, now);
+        f1_seq_seen = f1mb.seq;   // an 0xF1 of the previous wake does not count
     } else {
         abs_cycle += (cycle - abs_last_cycle) & 63u;
     }
     abs_last_cycle = (uint8_t)cycle;
+    // v1d KL15 (0xF1 b3 from core0, 0x103 from the header hook) and the 0x5C NM gate
+    uint32_t sq = f1mb.seq;
+    if (sq != f1_seq_seen) {
+        __dmb();
+        uint8_t b3 = f1mb.b3;
+        uint32_t fus = f1mb.us;
+        f1_seq_seen = sq;
+        if (EMU_KL15_F1) dde_kl15_f1(&kl15, b3, fus);
+        f1_last_b3 = b3;
+    }
+    dde_kl15_eval(&kl15, now, abs_cycle, EMU_KL15_F1 != 0);
+    nm_ok = dde_nm_allowed(&kl15, abs_cycle, now, &nm_ceiling);
+    if (nm_ceiling && dde_core_dyn_cycle(cycle)) sat16_inc(&lat.nm_ceiling_stops);
     dde_dyn_track_start(&trk, cycle, true, seq0);
     if (!tx_allowed()) return;
     for (unsigned ds = 0; ds < DDE_DYN_N_SLOT; ds++) {
@@ -663,7 +785,8 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t 
             p = dde_core_dyn_pdu_for(ds, cycle);
             if (p < 0) continue;
             bool due = (int32_t)(abs_cycle - pdu_due[p]) >= 0;
-            if (due && dde_dyn_pdu[p].ign_only) due = ign_seen && abs_cycle >= ign_abs + DDE_IGN_E8L5_CYCLES;
+            // KL15-gated PDUs (0xE8 L5, 0x10A): only while KL15 is on, from start_cyc after the on edge
+            if (due && dde_dyn_pdu[p].ign_only) due = kl15.on && abs_cycle >= kl15.on_abs + dde_dyn_pdu[p].start_cyc;
             if (!due) continue;
         }
         dyn_due[ds] = (int8_t)p;
@@ -695,7 +818,7 @@ static bool __time_critical_func(dyn_plan)(void)
         int32_t delta = dde_core_dyn_ap_q8(m) - dref_off;
         if (delta < DDE_EMU_MIN_DELTA_Q8 / 4) { s->state = SL_WAIT; dyn_reason[ds] = DDE_SKIP_LATE; continue; }
         dde_sched_t sc;
-        dde_core_schedule(dref_fine, dref_us, delta, loop, DDE_EMU_LEAD_US, &sc);
+        dde_core_schedule(dref_fine, dref_us, delta, loop, DDE_EMU_LEAD_DYN_US, &sc);
         // a late header (IRQ latency) can move the slot to a time already passed: not a "late"
         if ((int32_t)(sc.alarm_us - time_us_32()) < 0) {
             if (s->state == SL_ARMED) changed = true;
@@ -739,6 +862,7 @@ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t st
         uint32_t irq = save_and_disable_interrupts();
         last_103_us = time_us_32();
         if (!ign_seen && lock.have) { ign_seen = true; ign_abs = abs_cycle; }
+        if (lock.have) dde_kl15_103(&kl15, last_103_us);
         restore_interrupts(irq);
     }
 
@@ -801,7 +925,8 @@ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t st
             int32_t tgt;
             if (i < DDE_EMU_N_STATIC) tgt = dde_emu_static_off_q8[i];
             else {
-                if (!EMU_DYN_5C || !dde_core_dyn_cycle(cycle)) continue;
+                // v1d: NM rules + hard ceiling (dyn_new_cycle) - never wakes / holds the bus
+                if (!EMU_DYN_5C || !dde_core_dyn_cycle(cycle) || !nm_ok || !trk.active || trk.cycle != cycle) continue;
                 tgt = dde_emu_dyn_off_q8;
             }
             int32_t delta = tgt - ref_off;
@@ -891,9 +1016,11 @@ void dde_emu_host_set(uint16_t wvalue)
     if (!host_enabled) {
         host_epoch++;
         host_enabled = true;
-        printf("emu: TX enabled by host (TSS %u, sync bits %u, dyn 0x5C %u, E6 %u, FB %u, E8 %u, pre-ign %u)\n",
+        printf("emu: TX enabled by host (TSS %u, sync bits %u, dyn 0x5C %u, E6 %u, FB %u, E8 %u, pre-ign %u, "
+               "10A %u, 142 %u, 68 %u, KL15 F1 %u)\n",
                (unsigned)EMU_TSS_BITS, (unsigned)EMU_SYNC_BITS, (unsigned)EMU_DYN_5C, (unsigned)EMU_DYN_E6,
-               (unsigned)EMU_DYN_FB, (unsigned)EMU_DYN_E8, (unsigned)EMU_PREIGN);
+               (unsigned)EMU_DYN_FB, (unsigned)EMU_DYN_E8, (unsigned)EMU_PREIGN, (unsigned)EMU_10A,
+               (unsigned)EMU_142, (unsigned)EMU_68, (unsigned)EMU_KL15_F1);
     }
 }
 
@@ -947,16 +1074,56 @@ void dde_emu_fill_stats(dde_emu_stats_t *st)
     st->last_fault_us = last_fault_us;
     st->now_us = time_us_32();
     // v3
-    for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { st->dyn_sent[p] = dcnt.sent[p]; st->dyn_skip[p] = dcnt.skip[p]; }
+    for (unsigned p = 0; p < DDE_DYN_V3_N_PDU; p++) { st->dyn_sent[p] = dcnt.sent[p]; st->dyn_skip[p] = dcnt.skip[p]; }
     for (unsigned r = 1; r < DDE_SKIP_N; r++) st->dyn_skip_reason[r - 1] = dcnt.reason[r];
     st->dyn_defer = dcnt.defer;
-    for (unsigned d = 0; d < DDE_DYN_N_SLOT; d++) st->dyn_last_ms[d] = dcnt.last_ms[d];
+    for (unsigned d = 0; d < DDE_DYN_V3_N_SLOT; d++) st->dyn_last_ms[d] = dcnt.last_ms[d];
     bool ign_now = ign_seen && (uint32_t)(st->now_us - last_103_us) < DDE_EMU_IGN_TIMEOUT_US;
     st->ign = (uint8_t)((ign_seen ? 1u : 0u) | (!preign_static() ? 2u : 0u) |
-                        (ign_seen && abs_cycle >= ign_abs + DDE_IGN_E8L5_CYCLES ? 4u : 0u) | (ign_now ? 8u : 0u));
+                        (kl15.on && abs_cycle >= kl15.on_abs + DDE_IGN_E8L5_CYCLES ? 4u : 0u) | (ign_now ? 8u : 0u));
     st->dyn_flags = (uint8_t)((EMU_DYN_E6 ? 1u : 0u) | (EMU_DYN_FB ? 2u : 0u) | (EMU_DYN_E8 ? 4u : 0u) |
                               (EMU_PREIGN ? 8u : 0u));
     st->dyn_parks = dcnt.parks;
+    // v4
+    for (unsigned j = 0; j < 3; j++) {
+        st->dyn_sent2[j] = dcnt.sent[DDE_PDU_10A + j];
+        st->dyn_skip2[j] = dcnt.skip[DDE_PDU_10A + j];
+        st->dyn_last_ms2[j] = dcnt.last_ms[DDE_DSLOT_10A + j];
+    }
+    st->kl15 = (uint8_t)((kl15.on ? 1u : 0u) | (kl15.ever_on ? 2u : 0u) | (kl15.f1_seen ? 4u : 0u) |
+                         (kl15.c103_seen ? 8u : 0u) | (nm_ok ? 16u : 0u) | (nm_ceiling ? 32u : 0u) |
+                         (kl15.evid_seen ? 64u : 0u));
+    st->f1_b3 = f1_last_b3;
+    st->kl15_on_edges = (uint16_t)(kl15.on_edges > 0xFFFFu ? 0xFFFFu : kl15.on_edges);
+    st->kl15_off_edges = (uint16_t)(kl15.off_edges > 0xFFFFu ? 0xFFFFu : kl15.off_edges);
+    st->nm_ceiling_stops = lat.nm_ceiling_stops;
+    st->kl15_off_ago_ms = (kl15.off_edges && !kl15.on) ? (abs_cycle - kl15.off_abs) * 5u : 0xFFFFFFFFu;
+    {
+        uint32_t ref = kl15.wake_us;
+        if (kl15.evid_seen && (int32_t)(kl15.evid_us - ref) > 0) ref = kl15.evid_us;
+        uint32_t el = st->now_us - ref;
+        st->ceil_left_ms = el >= DDE_NM_CEIL_US ? 0u : (DDE_NM_CEIL_US - el) / 1000u;
+    }
+    st->isr_late_min_us = lat.isr_late_min;
+    st->isr_late_max_us = lat.isr_late_max;
+    st->r_entry_min = lat.r_entry_min;
+    st->r_final_min = lat.any ? lat.r_final_min : 0;
+    st->topup_timeouts = lat.topup_timeouts;
+    st->hk_deferred = lat.hk_deferred;
+    st->dyn_flags2 = (uint8_t)((EMU_10A ? 1u : 0u) | (EMU_142 ? 2u : 0u) | (EMU_68 ? 4u : 0u) |
+                               (EMU_KL15_F1 ? 8u : 0u) | (EMU_DYN_5C ? 16u : 0u));
+    st->ph142 = (uint8_t)ph142();
+    st->abs_cycle = abs_cycle;
+}
+
+void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes)
+{
+    (void)cycle;
+    if (id != 0xF1u || nbytes < 3u) return;
+    f1mb.b3 = payload[2];
+    f1mb.us = time_us_32();
+    __dmb();
+    f1mb.seq = f1mb.seq + 1u;
 }
 
 const char *dde_emu_fault_name(unsigned code)
@@ -1000,4 +1167,13 @@ void dde_emu_print_stats(void)
            s.dyn_skip_reason[0], s.dyn_skip_reason[1], s.dyn_skip_reason[2], s.dyn_skip_reason[3],
            s.dyn_skip_reason[4], s.dyn_skip_reason[5], s.dyn_skip_reason[6], s.dyn_defer,
            s.dyn_last_ms[0], s.dyn_last_ms[1], s.dyn_last_ms[2], s.ign, s.dyn_flags, s.dyn_parks);
+    printf("emu: v1d 10A=%lu/%u 142=%lu/%u 68=%lu/%u ms[10A=%u 142=%u 68=%u] kl15=0x%02X f1=%02X edges=%u/%u "
+           "off_ago=%ldms ceil_left=%lums ceil_stops=%u ph142=%u isr_late=%d..%dus r_entry_min=%d r_final_min=%d "
+           "topup_to=%u hk_def=%u build2=0x%X\n",
+           (unsigned long)s.dyn_sent2[0], s.dyn_skip2[0], (unsigned long)s.dyn_sent2[1], s.dyn_skip2[1],
+           (unsigned long)s.dyn_sent2[2], s.dyn_skip2[2], s.dyn_last_ms2[0], s.dyn_last_ms2[1], s.dyn_last_ms2[2],
+           s.kl15, s.f1_b3, s.kl15_on_edges, s.kl15_off_edges,
+           s.kl15_off_ago_ms == 0xFFFFFFFFu ? -1L : (long)s.kl15_off_ago_ms, (unsigned long)s.ceil_left_ms,
+           s.nm_ceiling_stops, s.ph142, s.isr_late_min_us, s.isr_late_max_us, s.r_entry_min, s.r_final_min,
+           s.topup_timeouts, s.hk_deferred, s.dyn_flags2);
 }

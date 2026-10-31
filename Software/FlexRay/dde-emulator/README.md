@@ -1,5 +1,9 @@
 # DDE emulator for the F11 EV conversion (pico-flexray V1)
 
+> **Latest: v1e** (FlexRay + PT-CAN DDE/EGS emulation, car run 6 clean). See
+> [`v1e/README.md`](v1e/README.md). The `source/` tree below is now at v1e;
+> the v1c notes below are kept as history.
+
 > **Status: v1c, not yet tested on the car.** Car test 2 (v1b) showed the
 > static frames are now right: their DTCs are gone and there was no emulator
 > fault. But the DSC still degraded at ign + 1.15 s, and the remaining DTCs

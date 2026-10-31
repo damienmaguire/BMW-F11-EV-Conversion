@@ -9,13 +9,13 @@
 #include "dde_emu_core.h"
 
 #define PICOFLEX_SET_EMU   0xa3u   // vendor OUT, wValue 1 = enable/keepalive, 0 = disable + clear fault
-#define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 192 bytes: dde_emu_stats_t (first 64 = v1, 128 = v2 layout)
+#define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 256 bytes: dde_emu_stats_t (first 64 = v1, 128 = v2, 192 = v3 layout)
 
 // Pin used as the FR1 streamer's private frame-start mark (side-set) in the emu
 // build: GP25 = Pico 2 on-board LED, not on any header pin.
 #define DDE_EMU_MARK_PIN 25u
 
-#define DDE_EMU_STATS_VERSION 3u
+#define DDE_EMU_STATS_VERSION 4u
 enum {
     DDE_EMU_ST_DISABLED = 0,   // host has not enabled TX (boot state)
     DDE_EMU_ST_NO_LOCK  = 1,   // enabled, waiting for 8 good reference cycles
@@ -93,18 +93,49 @@ typedef struct __attribute__((packed)) {
     uint32_t reserved;
     // ---- v3 (bytes 128..191): v1c dynamic frames. A host asking for 128 bytes gets v2.
     // PDU order: 0xE6 L9, 0xFB L5, 0xFB L7, 0xFB L9, 0xE8 L9, 0xE8 L5
-    uint32_t dyn_sent[DDE_DYN_N_PDU];
-    uint16_t dyn_skip[DDE_DYN_N_PDU];      // due but not sent in that cycle (retried 8 cycles later)
+    uint32_t dyn_sent[DDE_DYN_V3_N_PDU];
+    uint16_t dyn_skip[DDE_DYN_V3_N_PDU];      // due but not sent in that cycle (retried 8 cycles later)
     uint16_t dyn_skip_reason[DDE_SKIP_N - 1];   // DDE_SKIP_* 1..7: noanchor, mark, passed, len, grid, limit, late
     uint16_t dyn_defer;              // final check found an unexplained frame start: not sent (re-planned if possible)
-    uint16_t dyn_last_ms[DDE_DYN_N_SLOT];   // minislot of the last TX: 0xE6, 0xE8, 0xFB
+    uint16_t dyn_last_ms[DDE_DYN_V3_N_SLOT];   // minislot of the last TX: 0xE6, 0xE8, 0xFB
     uint8_t ign;                     // bit0 0x103 seen since wake, bit1 ign-on content, bit2 0xE8 L5 allowed,
                                      // bit3 0x103 seen within 500 ms
     uint8_t dyn_flags;               // build: bit0 EMU_DYN_E6, bit1 EMU_DYN_FB, bit2 EMU_DYN_E8, bit3 EMU_PREIGN
     uint16_t dyn_parks;              // TX SM restarts after 14-byte frames (expected, one per 0xFB L7)
     uint16_t reserved3;
+    // ---- v4 (bytes 192..255): v1d. PDU / slot order: 0x10A L5, 0x142 L31, 0x68 L3
+    uint32_t dyn_sent2[3];
+    uint16_t dyn_skip2[3];
+    uint16_t dyn_last_ms2[3];        // minislot of the last TX: 0x10A, 0x142, 0x68
+    uint8_t kl15;                    // bit0 KL15 on, bit1 on earlier in this wake, bit2 0xF1 seen this wake,
+                                     // bit3 0x103 seen this wake, bit4 0x5C allowed now (NM), bit5 0x5C stopped
+                                     // by the 60 s ceiling now, bit6 KL15 on-evidence seen this wake
+    uint8_t f1_b3;                   // last 0xF1 "byte 3" = payload[2] (1-based B3; 0x20 KL15 on, 0xE0 off)
+    uint16_t kl15_on_edges;
+    uint16_t kl15_off_edges;
+    uint16_t nm_ceiling_stops;       // 0x5C cycles stopped by the hard ceiling (should stay 0)
+    uint32_t kl15_off_ago_ms;        // since the last KL15 off edge (0xFFFFFFFF = none this wake)
+    uint32_t ceil_left_ms;           // time left before the 60 s hard ceiling (0 = reached)
+    int16_t isr_late_min_us;         // dynamic fires: alarm ISR entry - alarm time, min / max (us)
+    int16_t isr_late_max_us;
+    int16_t r_entry_min;             // dynamic fires: fire delay at ISR entry, min (ticks; < 120 = SHORT late)
+    int16_t r_final_min;             // dynamic fires: fire delay after the final frame-start check, min (ticks)
+    uint16_t topup_timeouts;         // > 8-word frame not fed in time (TX_STUCK fault, should stay 0)
+    uint16_t hk_deferred;            // housekeeping moved after a fire (expected, frequent)
+    uint8_t dyn_flags2;              // build: bit0 EMU_10A, bit1 EMU_142, bit2 EMU_68, bit3 EMU_KL15_F1,
+                                     // bit4 EMU_DYN_5C
+    uint8_t ph142;                   // current 0x142 content phase (0 wake, 1 +2.59 s, 2 ign settled)
+    uint16_t reserved4;
+    uint32_t abs_cycle;              // cycles since wake
+    uint32_t reserved5;
 } dde_emu_stats_t;
-_Static_assert(sizeof(dde_emu_stats_t) == 192, "emu stats size");
+_Static_assert(sizeof(dde_emu_stats_t) == 256, "emu stats size");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_sent2) == 192, "v4 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, kl15) == 216, "v4 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, kl15_off_ago_ms) == 224, "v4 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, isr_late_min_us) == 232, "v4 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_flags2) == 244, "v4 layout");
+_Static_assert(__builtin_offsetof(dde_emu_stats_t, abs_cycle) == 248, "v4 layout");
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_sent) == 128, "v3 layout");
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_skip) == 152, "v3 layout");
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, dyn_skip_reason) == 164, "v3 layout");
@@ -119,12 +150,15 @@ _Static_assert(__builtin_offsetof(dde_emu_stats_t, last_late_r) == 112, "v2 layo
 _Static_assert(__builtin_offsetof(dde_emu_stats_t, now_us) == 120, "v2 layout");
 #define DDE_EMU_STATS_V1_SIZE 64u
 #define DDE_EMU_STATS_V2_SIZE 128u
+#define DDE_EMU_STATS_V3_SIZE 192u
 
 void dde_emu_early_pins(void);   // core0 setup_pins: all TXD/TXEN of FR1/FR2 = SIO output high
 void dde_emu_init_core1(void);   // core1, after setup_stream(): PIO0 TX + fire SMs, alarm IRQ
 // FR1/FR2 header ISR (core1), FR1 frames with a good header CRC.
 void dde_emu_on_fr1_header(const uint8_t header[5], uint32_t start_pos, uint32_t ring_mask);
 void dde_emu_host_set(uint16_t wvalue);         // USB 0xa3 (core0)
+// core0, every valid FR1 frame (payload bytes): v1d uses 0xF1 byte 3 as the KL15 state
+void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes);
 void dde_emu_fill_stats(dde_emu_stats_t *st);   // USB 0xa4 / UART (core0)
 void dde_emu_print_stats(void);                 // UART line (core0); "EMU FAULT ..." once per first fault
 const char *dde_emu_fault_name(unsigned code);

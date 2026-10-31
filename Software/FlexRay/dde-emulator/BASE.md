@@ -5,7 +5,7 @@
 | Upstream | https://github.com/dynm/pico-flexray, branch `feature/frame-blocker` | `5c77833ea0b1f9337de2973e54bc3378c0533d34` |
 | Local, not on any remote | pass-through build (the known-good firmware) | `9a9ddcc` |
 | Local, not on any remote | `ts-capture-fixed` (FIXED timestamped capture build) | `acf675e5693eadddcd28ed0d1cda9be54f53aaa5` |
-| Local, not on any remote | `dde-emulator` (this work, v1c) | `60e749b` (firmware commit `a256526`; v1b was `f120e10`, v1 was `954110e`) |
+| Local, not on any remote | `dde-emulator` (this work, v1e) | `a2f3321` (v1c was `60e749b`, v1b `f120e10`, v1 `954110e`) |
 
 History, oldest first:
 
@@ -27,6 +27,13 @@ a256526 dde-emu v1c: send dynamic 0xE6/0xFB/0xE8 and the pre-ign statics; stats 
 cd3f70d tests: v1c dynamic frames - run 5 bytes/minislots, run 1/2 replays, unsure cases
 64375c7 logger: read emu stats v3 (192 bytes), show the v1c dynamic frames on the emu line
 60e749b tests: cross-check v1c against the DDE flash decode (E2E ID 0x37, base/rep, periods, 0xFF fill, FB L7 0xFFF)
+fafdba3 dde_emu v1d: 0x5C NM (KL15/NM-gated, 60 s hard ceiling), 0x10A/0x142/0x68, KL15 from 0xF1, FIFO top-up, stats v4
+c1ac5fd tests: v1d - 0x142/0x10A/0x68 vs run 5, KL15/NM unit checks, replay KL15/NM model
+af3af72 V2 board (Pi_Flex_V2) for the DDE emulator: PT-CAN capture, MCP251863 RX ONLY
+366997d logger: emu stats v4 (v1d KL15/NM/ceiling, 0x10A/0x142/0x68), PT-CAN as bus 2, can= counts
+29eae7a dde-emu v1e: FlexRay content follows KL15 after off
+9653dc9 dde-emu v1e: PT-CAN DDE/EGS frame emulation on the V2 board (opt-in TX)
+a2f3321 logger: --can-tx / --can-tx-ids (v1e PT-CAN TX), cantx: status line; run.sh ptcan tests   (= v1e)
 ```
 
 `patches/` is the series ts-capture-fixed..dde-emulator. These are 11 patches:

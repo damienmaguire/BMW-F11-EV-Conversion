@@ -14,7 +14,7 @@
 #endif
 
 #define DDE_STATIC_FRAME_BYTES 24u      // 5 header + 16 payload + 3 CRC
-#define DDE_MAX_FRAME_BYTES 32u
+#define DDE_MAX_FRAME_BYTES 40u       // v1d: 0x142 = 5 + 30 + 3 = 38 bytes
 #define DDE_TX_MAX_WORDS (2u + DDE_MAX_FRAME_BYTES / 4u)
 
 void dde_core_init(void);                                   // CRC tables
@@ -95,14 +95,20 @@ bool dde_lock_poll(dde_lock_t *l, uint32_t now_us);
 #define DDE_DYN_MS_Q8 176017            // 6.87567 us per minislot, 1/256 ticks (10 ns)
 #define DDE_DYN_BASE_Q8 76879874        // minislot 0 (id 0x5C) = 0x07 ref + 2805.127 us
 #define DDE_DYN_FIRST_ID 0x5Cu
-#define DDE_DYN_MS_LIMIT 260u           // never TX beyond this minislot (run 5: DDE 0x142 30 B up to 275)
+#define DDE_DYN_MS_LIMIT 275u           // never TX beyond this minislot (run 5: DDE 0x142 30 B up to 275;
+                                        // flash ERay: NMS 289, pLatestTx 281)
 #define DDE_DYN_GRID_TOL_Q8 (150 * 256) // a dynamic header must sit within 1.5 us of the grid
 
-enum { DDE_DYN_KIND_CONST = 0, DDE_DYN_KIND_E2E = 1, DDE_DYN_KIND_CTR = 2 };
-// PDU index order (also the stats order): E6, FB L5, FB L7, FB L9, E8 L9, E8 L5
-enum { DDE_PDU_E6 = 0, DDE_PDU_FB5, DDE_PDU_FB7, DDE_PDU_FB9, DDE_PDU_E89, DDE_PDU_E85, DDE_DYN_N_PDU };
+enum { DDE_DYN_KIND_CONST = 0, DDE_DYN_KIND_E2E = 1, DDE_DYN_KIND_CTR = 2,
+       DDE_DYN_KIND_CTR8 = 3 };          // v1d 0x142: B0 = free counter 0..254 (+1 per TX), 3 content phases
+// PDU index order (also the stats order): E6, FB L5, FB L7, FB L9, E8 L9, E8 L5 (v1c, stats v3),
+// then v1d: 0x10A L5, 0x142 L31, 0x68 L3 (stats v4)
+enum { DDE_PDU_E6 = 0, DDE_PDU_FB5, DDE_PDU_FB7, DDE_PDU_FB9, DDE_PDU_E89, DDE_PDU_E85,
+       DDE_PDU_10A, DDE_PDU_142, DDE_PDU_68, DDE_DYN_N_PDU };
+#define DDE_DYN_V3_N_PDU 6
 // Dynamic emulator slots (one frame ID each)
-enum { DDE_DSLOT_E6 = 0, DDE_DSLOT_E8, DDE_DSLOT_FB, DDE_DYN_N_SLOT };
+enum { DDE_DSLOT_E6 = 0, DDE_DSLOT_E8, DDE_DSLOT_FB, DDE_DSLOT_10A, DDE_DSLOT_142, DDE_DSLOT_68, DDE_DYN_N_SLOT };
+#define DDE_DYN_V3_N_SLOT 3
 
 typedef struct {
     uint16_t id;
@@ -113,8 +119,10 @@ typedef struct {
     uint8_t k;            // E2E: crc8 xor constant (b1 = crc8(b2..bn) ^ k)
     uint8_t hi;           // counter byte high nibble (ign-on)
     uint8_t hi_pre;       // counter byte high nibble (pre-ign)
-    uint8_t ign_only;     // 1 = only after ign-on (+DDE_IGN_E8L5_CYCLES)
+    uint8_t ign_only;     // 1 = only while KL15 is on, from start_cyc cycles after the KL15-on edge
     uint16_t period;      // cycles between transmissions
+    uint8_t every4;       // 1 = due in every cycle with cycle % 4 == cyc_mod8 % 4 (0x142)
+    uint8_t start_cyc;    // ign_only: first TX this many cycles after the KL15-on edge
     uint8_t payload[8];       // ign-on content (counter/crc bytes are overwritten)
     uint8_t payload_pre[8];   // pre-ign content
     const char *name;
@@ -123,7 +131,55 @@ extern const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU];
 extern const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT];
 
 #define DDE_IGN_STATIC_CYCLES 12u       // switch to ign-on content 60 ms after the first 0x103 (DDE: 37-87 ms)
-#define DDE_IGN_E8L5_CYCLES 45u         // 0xE8 L5 starts 225 ms after the first 0x103
+#define DDE_IGN_E8L5_CYCLES 45u         // 0xE8 L5 starts 225 ms after the KL15-on edge
+#define DDE_IGN_10A_CYCLES 39u          // 0x10A starts 195 ms after the KL15-on edge (run 5: +0.195 s)
+
+// v1d 0x142 content phases (run 5 real DDE; Ian: B0 counter, B1/B3-B5 u8, B2 fill, B6-B29 6x u32 LE)
+enum { DDE_142_P0 = 0,     // wake .. wake + 2.59 s
+       DDE_142_P1 = 1,     // .. KL15 on + 1.6 s
+       DDE_142_P2 = 2,     // settled (ign on and after)
+       DDE_142_NPH };
+#define DDE_142_P1_CYCLES 518u          // run 5: B1/B5 0 -> 1 at wake + 2.592 s
+#define DDE_142_P2_CYCLES 320u          // run 5: u32 fields settled ~1.6 s after KL15 on
+#define DDE_142_PLEN 30u
+extern const uint8_t dde_142_phase[DDE_142_NPH][DDE_142_PLEN];
+// Content phase of a PDU: 0 = pre-ign, 1 = ign-on (0x142: DDE_142_P*).
+unsigned dde_core_build_dyn_pdu_ph(unsigned p, unsigned cycle, unsigned counter, unsigned phase, uint8_t *out);
+// Counter modulus of PDU p (15, 0x142: 255; 1 for PDUs without a counter).
+unsigned dde_core_dyn_ctr_mod(unsigned p);
+
+// ---------------------------------------------------------------------------
+// v1d: KL15 state and the 0x5C network-management gate (pure logic, host-tested).
+//  KL15: 0xF1 payload byte 3 (b3) = 0x20 on, 0xE0 off (vehicle, ~every 2 s while awake;
+//  Ian: the DDE itself does not use 0xF1, fine as the emulator's proxy). Once an 0xF1
+//  was seen in this wake it decides alone (0x103 keeps running after KL15 off).
+//  Before that (or EMU_KL15_F1 = 0): 0x103 seen within 500 ms = on.
+//  0x5C: wake -> 1.76 s (door wake, run 5), stop; KL15 on -> on; KL15 off -> +47 s
+//  (Ian, runs 4/5: 47.4/47.8 s), stop; restart at the next KL15 on / wake.
+//  Hard ceiling: never more than 60 s after the later of (wake, last KL15-on evidence).
+//  KL15-on evidence = 0xF1 b3 == 0x20, or (no 0xF1 in this wake) the onset of 0x103
+//  after a > 500 ms gap, so a 0x103 that keeps running cannot hold the bus awake.
+#define DDE_KL15_F1_TIMEOUT_US 5000000u   // no 0xF1 for 5 s (period ~2 s) = KL15 off
+#define DDE_KL15_103_TIMEOUT_US 500000u   // 0x103 every 200-220 ms while ign is on
+#define DDE_NM_WAKE_CYCLES 352u           // run 5: 22 x 0x5C (every 16 cycles) after wake = 1.76 s
+#define DDE_NM_RELEASE_CYCLES 9400u       // 47 s after KL15 off
+#define DDE_NM_CEIL_US 60000000u          // hard ceiling
+typedef struct {
+    bool f1_seen, f1_on;
+    bool c103_seen;
+    bool on, ever_on;
+    bool evid_seen;
+    uint32_t f1_us, c103_us, evid_us, wake_us;
+    uint32_t on_abs, off_abs;      // abs cycle of the last on / off edge
+    uint32_t on_edges, off_edges;
+} dde_kl15_t;
+void dde_kl15_reset(dde_kl15_t *k, uint32_t wake_us);
+void dde_kl15_f1(dde_kl15_t *k, uint8_t b3, uint32_t now_us);
+void dde_kl15_103(dde_kl15_t *k, uint32_t now_us);
+// Re-evaluate (once per cycle). use_f1 = EMU_KL15_F1. Returns the KL15 state.
+bool dde_kl15_eval(dde_kl15_t *k, uint32_t now_us, uint32_t abs_cycle, bool use_f1);
+// 0x5C allowed in this cycle (after dde_kl15_eval). *ceiling = the hard ceiling stopped it.
+bool dde_nm_allowed(const dde_kl15_t *k, uint32_t abs_cycle, uint32_t now_us, bool *ceiling);
 
 // PDU of dynamic slot `dslot` due in `cycle` (by cycle % 8), -1 = none.
 int dde_core_dyn_pdu_for(unsigned dslot, unsigned cycle);
@@ -133,7 +189,20 @@ unsigned dde_core_build_dyn_pdu(unsigned p, unsigned cycle, unsigned counter, bo
 // Static frame with optional pre-ign content (0x28 c%4==1 b3-b5, 0x29 c%4==3 b8).
 unsigned dde_core_build_static_ex(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
                                   bool preign, uint8_t *out);
+// v1e: content phase 0 = pre-ign, 1 = ign on, 2 = after KL15 off in this wake
+// (0x29 c%4==3 b8 = c0 instead of 10, E2E CRC recomputed).
+#define DDE_PH_PREIGN 0u
+#define DDE_PH_ON 1u
+#define DDE_PH_OFF 2u
+#define DDE_OFF_29_CYCLES 6u     // 0x29 c%4==3 b8 10 -> c0 at KL15 off + 30 ms (real DDE, ddecan run 4)
+#define DDE_OFF_FB9_CYCLES 46u   // 0xFB L9 back to 1f 00 ff 7f at KL15 off + 0.23 s (real DDE)
+unsigned dde_core_build_static_ph(unsigned target, unsigned cycle, unsigned counter, bool keep_sync,
+                                  unsigned phase, uint8_t *out);
 // Minislots a dynamic frame of `payload_bytes` occupies (0 = unknown length).
+// v1d: K = ceil((10 * (plen + 8) + o) bit times / minislot) + 2 with the frame overhead o
+// (TSS/FSS/FES/idle detection) fitted on run 5 to 12.5 < o <= 17.5 bits for all 10 observed
+// lengths (2 4 6 8 10 14 16 26 30 32 -> 4 4 5 5 5 6 6 8 8 9); 0 when that o range does not give
+// one K (never guessed).
 unsigned dde_core_dyn_ms_used(unsigned payload_bytes);
 // DTS low bits so that the frame (TSS + bytes) plus DTS ends on a minislot action point.
 unsigned dde_core_dyn_dts_bits(unsigned nbytes, unsigned tss_bits);

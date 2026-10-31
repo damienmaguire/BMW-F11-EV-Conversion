@@ -37,6 +37,7 @@ static inline void irq_set_priority(uint n, uint p) { (void)n; (void)p; }
 static inline void irq_set_enabled(uint n, bool e) { (void)n; (void)e; }
 static inline uint32_t save_and_disable_interrupts(void) { return 0; }
 static inline void restore_interrupts(uint32_t s) { (void)s; }
+static inline void __dmb(void) {}
 
 // timer
 typedef struct { volatile uint32_t alarm[4]; volatile uint32_t intr, inte, intf; } sim_timer_hw_t;
@@ -82,6 +83,8 @@ static inline void pio_interrupt_clear(PIO pio, uint n) { (void)pio; (void)n; }
 static inline void pio_sm_set_enabled(PIO pio, uint sm, bool en) { sim_pio_sm_set_enabled(pio, sm, en); }
 static inline uint8_t pio_sm_get_pc(PIO pio, uint sm) { return (uint8_t)sim_pio_sm_get_pc(pio, sm); }
 static inline bool pio_sm_is_tx_fifo_empty(PIO pio, uint sm) { return sim_pio_sm_tx_fifo_empty(pio, sm); }
+bool sim_pio_sm_tx_fifo_full(PIO pio, uint sm);
+static inline bool pio_sm_is_tx_fifo_full(PIO pio, uint sm) { return sim_pio_sm_tx_fifo_full(pio, sm); }
 static inline void pio_sm_clear_fifos(PIO pio, uint sm) { sim_pio_sm_reset(pio, sm); }
 static inline void pio_sm_restart(PIO pio, uint sm) { sim_pio_sm_reset(pio, sm); }
 static inline void pio_sm_exec(PIO pio, uint sm, uint instr) { (void)pio; (void)sm; (void)instr; }
