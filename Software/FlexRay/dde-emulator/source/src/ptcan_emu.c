@@ -1,5 +1,15 @@
 // PT-CAN DDE/EGS emulation TX glue, see ptcan_emu.h and ptcan_emu_core.h.
 //
+// In plain words
+// --------------
+// This is the part that switches the V2 board's CAN chip (MCP251863) between
+// "listen only" (it can hear the car but cannot send, acknowledge or disturb anything)
+// and "normal" (it can send), and hands the frames chosen by ptcan_emu_core.c to it.
+// Listen only is the default after power-up. It changes to normal ONLY while the
+// laptop logger is running with --can-tx / --can-tx-ids and keeps saying so (every
+// 2 s; 20 s without that = off). Any problem drops it straight back to listen only
+// and it stays there until the logger is restarted.
+//
 // Safety model
 // - The MCP251863 boots in Listen Only (v2_cantest.c). Only while the host has CAN TX
 //   enabled (and the keepalive is fresh, and no fault is latched) is it switched to

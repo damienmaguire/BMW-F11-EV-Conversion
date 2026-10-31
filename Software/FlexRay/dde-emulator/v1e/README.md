@@ -31,7 +31,7 @@ No engine runs in v1e. Everything is "ignition on, engine off, Park".
 
 Check them with `cd firmware && sha256sum -c SHA256SUMS`.
 
-Built from pico-flexray commit `a2f3321` (branch `dde-emulator`, local) with
+Built from pico-flexray commit `a2f3321` (source tree here at `d7e490a`, comments only on top: the V2 UF2 is byte-identical) (branch `dde-emulator`, local) with
 pico-sdk 2.2.0 and xPack arm-none-eabi-gcc 14.2.1-1.1, for `pico2` /
 `rp2350-arm-s`, Release.
 
@@ -43,8 +43,8 @@ pico-sdk 2.2.0 and xPack arm-none-eabi-gcc 14.2.1-1.1, for `pico2` /
 | `tools/fr_ts_logger.py`, `tools/frts.py` | Logger. Copy **both** files and replace older copies. Works with v1 to v1e firmware. |
 | `tools/reset_to_bootloader.py` | Puts the Pico into its USB bootloader |
 | `tools/check_ptcan_replay.py` | Offline check of PT-CAN frames against a capture |
-| `patches/0012..0018` | The v1d and v1e commits, on top of patches 0001..0011 in `../patches` |
-| `../source/` | Full emulator source tree at v1e (`a2f3321`) |
+| `patches/0012..0019` | The v1d and v1e commits (0019 = comments only), on top of patches 0001..0011 in `../patches` |
+| `../source/` | Full emulator source tree at v1e (`d7e490a`) |
 
 ## How to run it
 
@@ -129,10 +129,10 @@ Full analysis: `flexray-re-notes/analysis/f11_emu_run6.md` (not in this repo).
 
 - About 2.5 % of the fast PT-CAN frames (20/30/100 ms IDs) were not sent. The TX
   loop drops a slot rather than sending it late. Nothing in the car reacted.
-  This is fixed in v1f.
+  This is planned for v1f.
 - The capture does not contain our own PT-CAN TX frames, because the controller
   does not echo them. Run 6 TX was checked by replaying the run through the
-  emulator core. This is fixed in v1f.
+  emulator core. This is planned for v1f.
 - 0x397 is sent at a constant 1 s period. The real one runs at about 380 ms,
   with short blips and changes after ignition off.
 - 0x592: only the MIL-off check-control frame is sent. The real DDE's service
