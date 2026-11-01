@@ -1,0 +1,196 @@
+From 46535d5ef4d25a12fb37942866998621e9101fcd Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Sat, 31 Oct 2026 16:45:18 +0000
+Subject: [PATCH 22/27] dde-emu v1f: check_emu_capture.py (own-TX slots, 0x397,
+ foreign IDs, brake signals, v1g engine)
+
+---
+ tools/dde_emu/check_emu_capture.py | 176 +++++++++++++++++++++++++++++
+ 1 file changed, 176 insertions(+)
+ create mode 100644 tools/dde_emu/check_emu_capture.py
+
+diff --git a/tools/dde_emu/check_emu_capture.py b/tools/dde_emu/check_emu_capture.py
+new file mode 100644
+index 0000000..7283ce1
+--- /dev/null
++++ b/tools/dde_emu/check_emu_capture.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++"""Check a car capture taken with the v1f/v1g emulator (fr_ts_logger.py --can --can-tx).
++
++  check_emu_capture.py CAPTURE.csv            (reads CAPTURE.csv.can.csv next to it, if there)
++  check_emu_capture.py CAPTURE.csv --engine   (v1g: also report the fake start/stop)
++
++What it reports (and the pass criteria printed in the README):
++  1. Our own PT-CAN TX (dir=Tx rows, v1f firmware): per emulated ID the frames sent vs the
++     slots due between its first and last frame, the longest gap, and 0x397 (average
++     spacing, e3 blips, the df/de/dd walk after KL15 off).
++  2. Foreign copies: an emulated ID heard as dir=Rx (the real DDE/EGS still on the bus).
++  3. KL15 (0x12F ST_KL) and the brake signals: PT-CAN 0x173 d7 bits 0-1 and 0x12F d6
++     bits 0-1, FlexRay 0x74 b7 bits 0-1 on even cycles (bN = 1-based byte).
++  4. --engine: the v1g start/stop as sent (0x0A5 rpm, 0x0D9 crank nibble) and as seen on
++     FlexRay (0x28 rpm, 0xE6 b3 state, ST_KL C/D).
++Exit code 0 = all PASS lines passed (missing data is reported, not failed).
++"""
++import csv
++import os
++import sys
++
++EMU_IDS = [0x3F9, 0x3FD, 0x39A, 0x396, 0x518, 0x0A5, 0x0D9, 0x0DC, 0x0F3, 0x08F,
++           0x2C4, 0x281, 0x1B9, 0x381, 0x3B3, 0x397, 0x3FB, 0x512, 0x592]
++PERIOD_MS = {0x0A5: 20, 0x0D9: 20, 0x0DC: 20, 0x0F3: 20, 0x08F: 30, 0x3FD: 100, 0x2C4: 100, 0x281: 100}
++fails = []
++
++
++def res(ok, msg):
++    print(("  PASS " if ok else "  FAIL ") + msg)
++    if not ok:
++        fails.append(msg)
++
++
++def load_can(path):
++    rx, tx = [], []
++    for r in csv.DictReader(open(path)):
++        if r.get("ide", "0") == "1" or not r.get("t_us"):
++            continue
++        row = (float(r["t_us"]), int(r["can_id"], 16), bytes.fromhex(r["data_hex"]))
++        (tx if r.get("dir", "Rx") == "Tx" else rx).append(row)
++    rx.sort()
++    tx.sort()
++    return rx, tx
++
++
++def load_fr(path, slots):
++    out = []
++    with open(path) as f:
++        for r in csv.DictReader(f):
++            try:
++                sid = int(r["slot_id"], 0)
++            except (KeyError, ValueError):
++                continue
++            if sid in slots and r.get("t_us") and r.get("payload_hex"):
++                out.append((float(r["t_us"]), sid, int(r["cycle"]), bytes.fromhex(r["payload_hex"])))
++    out.sort()
++    return out
++
++
++def runs_of(ts, brk=1e6):
++    runs, a = [], 0
++    for k in range(1, len(ts) + 1):
++        if k == len(ts) or ts[k] - ts[k - 1] > brk:
++            runs.append(ts[a:k])
++            a = k
++    return runs
++
++
++def edges(seq):
++    """[(t, value)] -> only the changes."""
++    out, last = [], None
++    for t, v in seq:
++        if v != last:
++            out.append((t, v))
++            last = v
++    return out
++
++
++def main(argv):
++    if not argv:
++        print(__doc__)
++        return 2
++    cap = argv[0]
++    engine = "--engine" in argv
++    canp = cap + ".can.csv" if os.path.exists(cap + ".can.csv") else (cap if cap.endswith(".can.csv") else None)
++    if not canp:
++        print("no CAN CSV (%s.can.csv) - was the logger run with --can?" % cap)
++        return 2
++    rx, tx = load_can(canp)
++    t0 = min([x[0] for x in rx[:1] + tx[:1]] or [0])
++    T = lambda t: (t - t0) / 1e6  # noqa: E731
++    print("CAN: %d frames heard, %d own TX frames logged (dir=Tx), %.1f s" % (len(rx), len(tx), T(max(rx[-1][0], tx[-1][0] if tx else 0))))
++
++    # KL15 / ST_KL
++    stkl = edges([(t, p[2] & 15) for t, i, p in rx if i == 0x12F and len(p) > 2])
++    print("ST_KL (0x12F d2): " + " ".join("%X@%.2f" % (v, T(t)) for t, v in stkl[:30]) + (" ..." if len(stkl) > 30 else ""))
++    off_t = [t for (t, v), (tp, vp) in zip(stkl[1:], stkl) if vp >= 0xA and v < 0xA and v != 0xF]
++
++    # 1. own TX
++    print("\n1. own PT-CAN TX (needs v1f firmware + logger)")
++    if not tx:
++        res(False, "no dir=Tx rows: logger older than v1f, or firmware not v1f, or CAN TX was off")
++    by = {}
++    for t, i, p in tx:
++        by.setdefault(i, []).append((t, p))
++    for i in EMU_IDS:
++        v = by.get(i, [])
++        if not v:
++            continue
++        ts = [t for t, _ in v]
++        per = PERIOD_MS.get(i)
++        gaps = [b - a for a, b in zip(ts, ts[1:]) if b - a <= 1e6]
++        line = "0x%03X %6d frames, longest gap %.0f ms" % (i, len(ts), max(gaps) / 1000 if gaps else 0)
++        if per:
++            slots = sum(round((r[-1] - r[0]) / (per * 1000)) + 1 for r in runs_of(ts))
++            res(len(ts) >= 0.995 * slots and (max(gaps) if gaps else 0) <= 3 * per * 1000,
++                "%s; %d of %d slots (%.2f %%) [need >= 99.5 %%, gap <= %d ms]" % (line, len(ts), slots, 100.0 * len(ts) / slots, 3 * per))
++        else:
++            print("       " + line)
++    v397 = by.get(0x397, [])
++    if v397:
++        ts = [t for t, _ in v397]
++        on = [(t, p[1]) for t, p in v397]
++        blips = sum(1 for (t, b), (tp, bp) in zip(on[1:], on) if b == 0xE3 and bp != 0xE3)
++        mean = (ts[-1] - ts[0]) / (len(ts) - 1) / 1000 if len(ts) > 1 else 0
++        res(250 <= mean <= 600 and blips >= 3, "0x397: mean spacing %.0f ms (real DDE ~380), %d e3 blips" % (mean, blips))
++        for o in off_t[:2]:
++            walk = edges([(t, b) for t, b in on if o <= t <= o + 5e6])
++            s = " ".join("%02x@+%.2f" % (b, (t - o) / 1e6) for t, b in walk)
++            res(any(b == 0xDD for _, b in walk) and any(b == 0xDF for _, b in walk), "0x397 after KL15 off: " + s)
++    for i, lim in ((0x512, 46.0), (0x518, 30.0)):
++        if by.get(i) and off_t:
++            last = max(t for t, _ in by[i] if t >= off_t[0]) if any(t >= off_t[0] for t, _ in by[i]) else None
++            if last:
++                print("       0x%03X last frame OFF+%.2f s (real DDE/EGS: %.2f)" % (i, (last - off_t[0]) / 1e6, lim - 0.07))
++
++    # 2. foreign copies
++    print("\n2. emulated IDs heard from another node (dir=Rx)")
++    foreign = sorted({i for _, i, _ in rx if i in EMU_IDS})
++    res(not foreign, "none" if not foreign else "heard: " + " ".join("0x%03X" % i for i in foreign))
++
++    # 3. brake
++    print("\n3. brake signals")
++    b173 = edges([(t, p[6] & 3) for t, i, p in rx if i == 0x173 and len(p) > 6])
++    b12f = edges([(t, p[5] & 3) for t, i, p in rx if i == 0x12F and len(p) > 5])
++    print("  PT-CAN 0x173 d7&3: " + (" ".join("%d@%.2f" % (v, T(t)) for t, v in b173[:20]) or "not seen"))
++    print("  PT-CAN 0x12F d6&3: " + (" ".join("%d@%.2f" % (v, T(t)) for t, v in b12f[:20]) or "not seen"))
++    fr = load_fr(cap, {0x74, 0x28, 0xE6}) if os.path.exists(cap) and not cap.endswith(".can.csv") else []
++    if fr:
++        f74 = edges([(t, p[6] & 3) for t, s, c, p in fr if s == 0x74 and len(p) > 6 and c % 2 == 0])
++        btn = edges([(t, p[5]) for t, s, c, p in fr if s == 0x74 and len(p) > 5 and c % 2 == 0])
++        print("  FlexRay 0x74 b7&3 (even cycles): " + (" ".join("%d@%.2f" % (v, T(t)) for t, v in f74[:20]) or "not seen"))
++        print("  FlexRay 0x74 b6 (0x85 = START button): " + " ".join("%02X@%.2f" % (v, T(t)) for t, v in btn[:20]))
++    res(bool(b173 or b12f), "brake signals captured on PT-CAN")
++
++    # 4. engine (v1g)
++    if engine:
++        print("\n4. fake engine start/stop (v1g)")
++        rpm = [(t, (p[5] | p[6] << 8) / 4.0) for t, p in by.get(0x0A5, []) if len(p) > 6]
++        if rpm:
++            runs_ = [r for r in runs_of([t for t, v in rpm if v > 0], 0.3e6)]
++            for r in runs_:
++                vals = [v for t, v in rpm if r[0] <= t <= r[-1]]
++                print("  PT-CAN 0x0A5 rpm > 0 from %.2f to %.2f s, max %.0f, last %.0f" % (T(r[0]), T(r[-1]), max(vals), vals[-1]))
++            res(bool(runs_), "rpm sent on PT-CAN")
++        if fr:
++            e6 = edges([(t, p[2]) for t, s, c, p in fr if s == 0xE6 and len(p) > 2])
++            print("  FlexRay 0xE6 b3: " + " ".join("%02X@%.2f" % (v, T(t)) for t, v in e6[:30]))
++            res(any(v == 0x82 for _, v in e6), "0xE6 b3 reached 82 (running)")
++        res(any(v in (0xC, 0xD) for _, v in stkl), "ST_KL reached C/D (CAS start request)")
++    print("\n%s" % ("ALL PASS" if not fails else "%d FAIL(s)" % len(fails)))
++    return 1 if fails else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+-- 
+2.47.3
+

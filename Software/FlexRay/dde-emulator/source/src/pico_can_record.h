@@ -10,7 +10,9 @@
 //     0     1    type   = PICO_CAN_REC_TYPE (0x43)
 //     1     1    bus    = 2 on the V2 board (SavvyCAN bus number)
 //     2     1    flags  bit0 IDE (29-bit ID), bit1 RTR, bit2 FDF, bit3 BRS,
-//                       bit4 ESI, bit7 data truncated (fewer bytes than DLC says)
+//                       bit4 ESI, bit5 TX (v1f: a frame WE sent, from the MCP TX
+//                       event FIFO; only if the host asked for TX records),
+//                       bit7 data truncated (fewer bytes than DLC says)
 //     3     1    dlc    raw DLC 0..15 as received
 //     4     4    id     u32 LE, 11- or 29-bit identifier (no flag bits)
 //     8     4    time   u32 LE, device time in us at SOF (RP2350 time_us_32
@@ -22,7 +24,8 @@
 //
 // Bit 15 of the length marks an "extended" record; body[0] says which kind.
 // CAN records are only sent after the host opts in with the vendor control
-// request PICOFLEX_SET_CAN_RECORDS (0xa1, wValue 1 = on, 0 = off, OUT, no data),
+// request PICOFLEX_SET_CAN_RECORDS (0xa1, wValue bit0 1 = on, 0 = off, OUT, no data;
+// v1f: wValue bit1 = also send our own TX frames, flagged PICO_CAN_FLAG_TX),
 // so hosts that don't know them (older SavvyCAN, flexray_stream_recorder.py)
 // never receive one. The setting returns to off on USB unmount/reset.
 #ifndef PICO_CAN_RECORD_H
@@ -44,6 +47,7 @@
 #define PICO_CAN_FLAG_FDF        0x04u
 #define PICO_CAN_FLAG_BRS        0x08u
 #define PICO_CAN_FLAG_ESI        0x10u
+#define PICO_CAN_FLAG_TX         0x20u
 #define PICO_CAN_FLAG_TRUNCATED  0x80u
 
 typedef struct {

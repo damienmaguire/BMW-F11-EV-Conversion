@@ -2,6 +2,13 @@
 #include "pico_fr_record.h"
 #if PICO_FLEXRAY_DDE_EMU
 #include "dde_emu.h"
+#include "dde_standalone.h"
+#endif
+// v1h.1 standalone build: a switch from the laptop wins over the board's own settings
+#if PICO_FLEXRAY_DDE_EMU && EMU_STANDALONE
+#define SA_HOST_CMD() dde_standalone_host_cmd()
+#else
+#define SA_HOST_CMD() ((void)0)
 #endif
 #if PICO_FLEXRAY_BOARD_V2
 #include "v2_cantest.h"
@@ -59,10 +66,13 @@ extern void capture_fill_ts_info(pico_ts_info_t *ti); // main.c
 // CAN records (V2 board MCP251863) waiting for the bulk-IN endpoint. Core0
 // only: filled from the main loop, drained by try_send_from_fifo() (main loop
 // and tud_task callbacks). Never blocks: a full queue drops and counts.
-#define CAN_REC_QUEUE_LEN 256
+// v1g.2: 512 (was 256). Each slot is one CAN frame waiting for USB (76 bytes); since
+// v1f our own sent frames go through here too. 512 slots = 38 KB of RAM.
+#define CAN_REC_QUEUE_LEN 512
 static pico_can_record_t can_q[CAN_REC_QUEUE_LEN];
 static uint16_t can_q_w, can_q_r;
 static bool can_records_enabled = V2_CAN_RECORDS_DEFAULT_ON;
+static bool can_tx_records_enabled; // v1f: SET_CAN_RECORDS wValue bit1 = own TX frames too
 static panda_can_q_stats_t can_q_stats;
 static inline bool can_q_empty(void) { return can_q_w == can_q_r; }
 static void can_q_clear(void) { can_q_w = can_q_r = 0; }
@@ -164,8 +174,10 @@ static void handle_vendor_out_payload(const uint8_t *data, uint16_t len)
 }
 
 
-// Placeholder for git version
-const char *GITLESS_REVISION = "dev";
+// Version string answered to the panda "git version" request (0xd6). v1g.2: the real
+// firmware version (was "dev"), so the logger can check it belongs to the same release.
+#include "fw_version.h"
+const char *GITLESS_REVISION = FW_VERSION;
 
 void panda_usb_init(void)
 {
@@ -285,6 +297,24 @@ static bool handle_control_read(uint8_t rhport, tusb_control_request_t const *re
             static dde_emu_stats_t es;
             dde_emu_fill_stats(&es);
             return tud_control_xfer(rhport, request, &es, sizeof(es));
+        }
+    case PICOFLEX_GET_ENGINE:
+        {
+            static dde_engine_status_t eg;   // v1g fake engine status (static: read after return)
+            dde_engine_fill_status(&eg);
+            return tud_control_xfer(rhport, request, &eg, sizeof(eg));
+        }
+    case PICOFLEX_GET_GEAR:
+        {
+            static dde_gear_status_t gs;     // v1h.1 gear status (static: read after return)
+            dde_gear_fill_status(&gs);
+            return tud_control_xfer(rhport, request, &gs, sizeof(gs));
+        }
+    case PICOFLEX_GET_EMUDIAG:
+        {
+            static dde_emu_diag_t dg;        // v1h echo-miss diagnostics (static: read after return)
+            dde_emu_fill_diag(&dg);
+            return tud_control_xfer(rhport, request, &dg, sizeof(dg));
         }
 #endif
 #if PICO_FLEXRAY_BOARD_V2 && EMU_CAN_TX
@@ -459,7 +489,19 @@ static bool handle_control_write(uint8_t rhport, tusb_control_request_t const *r
         if (request->wValue > 1u) {
             return false;
         }
+        SA_HOST_CMD();
         dde_emu_host_set(request->wValue);
+        handled = true;
+        break;
+    case PICOFLEX_SET_ENGINE:
+        // v1g fake engine start: wValue low byte = mode (0 off, 1 CAS, 2 fallback),
+        // high byte = command (0 keepalive, 1 start, 2 stop). Off after every reset.
+        // v1h: wIndex = start profile (0 build default, 1 short, 2 realistic, 3 run8)
+        if ((request->wValue & 0xFFu) > 2u || (request->wValue >> 8) > 2u) return false;
+        // v1h.1: wIndex bit 8 = gear shifting off
+        if ((request->wIndex & 0xFFu) >= ENG_PROF_N || (request->wIndex & ~0x1FFu)) return false;
+        SA_HOST_CMD();
+        dde_engine_host_set(request->wValue, request->wIndex);
         handled = true;
         break;
 #endif
@@ -467,6 +509,7 @@ static bool handle_control_write(uint8_t rhport, tusb_control_request_t const *r
 #if PICO_FLEXRAY_BOARD_V2 && EMU_CAN_TX
     case PICOFLEX_SET_CANTX:
         // PT-CAN DDE/EGS TX: ID mask (repeat as keepalive), 0 = off + clear a latched fault.
+        SA_HOST_CMD();
         ptcan_emu_host_set((uint32_t)request->wValue | ((uint32_t)request->wIndex << 16));
         handled = true;
         break;
@@ -476,8 +519,10 @@ static bool handle_control_write(uint8_t rhport, tusb_control_request_t const *r
     case PICOFLEX_SET_CAN_RECORDS:
         // Host opts in to CAN records in the bulk-IN stream (see pico_can_record.h).
         can_records_enabled = (request->wValue & 1) != 0;
+        can_tx_records_enabled = can_records_enabled && (request->wValue & 2) != 0;
         if (!can_records_enabled) can_q_clear();
-        printf("Control Write: SET_CAN_RECORDS -> %s\n", can_records_enabled ? "on" : "off");
+        printf("Control Write: SET_CAN_RECORDS -> %s%s\n", can_records_enabled ? "on" : "off",
+               can_tx_records_enabled ? " (+ own TX)" : "");
         handled = true;
         break;
 #endif
@@ -637,6 +682,7 @@ void tud_umount_cb(void)
     record_format = PICO_FR_FORMAT_STOCK; // a new host gets stock records until it asks
 #if PICO_FLEXRAY_BOARD_V2
     can_records_enabled = V2_CAN_RECORDS_DEFAULT_ON; // a new host has to opt in again
+    can_tx_records_enabled = false;
     can_q_clear();
 #endif
 
@@ -705,6 +751,8 @@ void tud_vendor_tx_cb(uint8_t itf, uint32_t sent_bytes)
 }
 
 #if PICO_FLEXRAY_BOARD_V2
+bool panda_can_tx_records_enabled(void) { return can_records_enabled && can_tx_records_enabled; }
+
 bool panda_can_record_push(const pico_can_record_t *r)
 {
     if (!can_records_enabled || !tud_vendor_mounted()) {

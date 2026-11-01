@@ -238,4 +238,7 @@ void dde_dyn_track_header(dde_dyn_track_t *t, unsigned id, unsigned payload_byte
 // Predict the minislot for our frame id X. Returns DDE_DYN_OK or a skip reason.
 int dde_dyn_predict(const dde_dyn_track_t *t, unsigned id, unsigned *m_out);
 
+// v1g: fake-engine overlay used by the frame builders (NULL = off, the default).
+#include "dde_engine.h"
+extern const eng_out_t *volatile dde_core_eng;
 #endif

@@ -1,0 +1,682 @@
+From 7dec502dacad58f36cccffde501c8e89cfce47ab Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Sat, 31 Oct 2026 16:38:55 +0000
+Subject: [PATCH 20/27] dde-emu v1f WIP: non-blocking console, keep-grid
+ catch-up, NM release 46/30 s, 0x397 blips + OFF walk, run 6 rate replay
+
+---
+ CMakeLists.txt                      |   1 +
+ src/console.c                       | 105 ++++++++++++++++++++++++++++
+ src/console.h                       |  10 +++
+ src/main.c                          |   4 ++
+ src/ptcan_emu_core.c                |  72 +++++++++++++++++--
+ src/ptcan_emu_core.h                |  22 +++++-
+ tests/host/run.sh                   |  25 +++++++
+ tests/host/test_ptcan_emu.c         |  94 +++++++++++++++++++++++--
+ tools/dde_emu/check_ptcan_replay.py |  55 +++++++++++++--
+ 9 files changed, 368 insertions(+), 20 deletions(-)
+ create mode 100644 src/console.c
+ create mode 100644 src/console.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4a9c259..92689a3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -49,6 +49,7 @@ add_executable(pico_flexray
+      src/flexray_injector.c
+      src/flexray_fifo.c
+      src/flexray_ts.c
++     src/console.c
+      )
+ 
+ # TS-CAPTURE (FIXED): hardware frame-start timestamps on the stock pass-through repeater.
+diff --git a/src/console.c b/src/console.c
+new file mode 100644
+index 0000000..00502f7
+--- /dev/null
++++ b/src/console.c
+@@ -0,0 +1,105 @@
++// Non-blocking debug console (v1f).
++//
++// In plain words
++// --------------
++// Up to v1e every printf() waited until the UART (115200 baud, about 11.5 characters
++// per millisecond) had sent the text. The 5-second status print is 1.5-2 KB long, so
++// the main loop stood still for 120-160 ms every 5 s. During that time no PT-CAN frame
++// could be queued, and the 20 ms frames (0x0A5/0x0D9/0x0DC/0x0F3) lost about 6 frames
++// in every 5 s (run 6: 6,447 sent of 6,634 due).
++//
++// Now printf() only copies the text into a 16 KB memory ring and returns at once.
++// A 1 ms timer interrupt (and the main loop) move the text to the UART hardware FIFO,
++// only as much as fits without waiting. If the ring is ever full, the extra text is
++// dropped (counted, and reported by the next line that fits) - the program never waits.
++#include "console.h"
++
++#include <stdio.h>
++#include <string.h>
++#include "hardware/sync.h"
++#include "hardware/uart.h"
++#include "pico/stdio/driver.h"
++#include "pico/stdio_uart.h"
++#include "pico/time.h"
++
++#ifndef CONSOLE_RING_SIZE
++#define CONSOLE_RING_SIZE 16384u   // power of two
++#endif
++_Static_assert((CONSOLE_RING_SIZE & (CONSOLE_RING_SIZE - 1)) == 0, "ring size must be a power of two");
++
++static char ring[CONSOLE_RING_SIZE];
++static volatile uint32_t head, tail;     // head: next write, tail: next read (free-running)
++static volatile uint32_t dropped, dropped_reported;
++static spin_lock_t *lock;
++static repeating_timer_t drain_timer;
++static bool active;
++
++static void put_locked(const char *s, uint32_t n)
++{
++    uint32_t free_ = CONSOLE_RING_SIZE - (head - tail);
++    if (n > free_) { dropped += n - free_; n = free_; }
++    for (uint32_t i = 0; i < n; i++) ring[(head + i) & (CONSOLE_RING_SIZE - 1)] = s[i];
++    head += n;
++}
++
++static void out_chars(const char *buf, int len)
++{
++    if (len <= 0) return;
++    uint32_t irq = spin_lock_blocking(lock);
++    if (dropped != dropped_reported) {
++        char note[48];
++        int k = snprintf(note, sizeof note, "\r\n[console: %lu chars dropped]\r\n",
++                         (unsigned long)(dropped - dropped_reported));
++        if ((uint32_t)k + (uint32_t)len <= CONSOLE_RING_SIZE - (head - tail)) {
++            dropped_reported = dropped;
++            put_locked(note, (uint32_t)k);
++        }
++    }
++    put_locked(buf, (uint32_t)len);
++    spin_unlock(lock, irq);
++}
++
++static void out_flush(void) { console_drain(); }
++
++static stdio_driver_t console_driver = {
++    .out_chars = out_chars,
++    .out_flush = out_flush,
++#if PICO_STDIO_ENABLE_CRLF_SUPPORT
++    .crlf_enabled = PICO_STDIO_DEFAULT_CRLF,
++#endif
++};
++
++void console_drain(void)
++{
++    if (!active) return;
++    uart_inst_t *u = uart_get_instance(PICO_DEFAULT_UART);
++    uint32_t irq = spin_lock_blocking(lock);
++    while (tail != head && uart_is_writable(u)) {
++        uart_putc_raw(u, ring[tail & (CONSOLE_RING_SIZE - 1)]);
++        tail++;
++    }
++    spin_unlock(lock, irq);
++}
++
++static bool drain_cb(repeating_timer_t *t)
++{
++    (void)t;
++    console_drain();
++    return true;
++}
++
++void console_init(void)
++{
++    lock = spin_lock_init(spin_lock_claim_unused(true));
++    head = tail = dropped = dropped_reported = 0;
++    active = true;
++    // Swap the SDK's blocking UART driver for the ring (the UART itself and its pins
++    // were already set up by stdio_init_all()).
++    stdio_set_driver_enabled(&stdio_uart, false);
++    stdio_set_driver_enabled(&console_driver, true);
++    add_repeating_timer_ms(-1, drain_cb, NULL, &drain_timer);
++}
++
++uint32_t console_dropped(void) { return dropped; }
++
++uint32_t console_pending(void) { return head - tail; }
+diff --git a/src/console.h b/src/console.h
+new file mode 100644
+index 0000000..b9782e5
+--- /dev/null
++++ b/src/console.h
+@@ -0,0 +1,10 @@
++// Non-blocking debug console (v1f): printf() goes into a RAM ring, a 1 ms timer drains
++// it into the UART FIFO. See console.c.
++#ifndef CONSOLE_H
++#define CONSOLE_H
++#include <stdint.h>
++void console_init(void);       // call right after stdio_init_all()
++void console_drain(void);      // optional extra drain (main loop); never waits
++uint32_t console_dropped(void); // characters dropped because the ring was full
++uint32_t console_pending(void); // characters waiting
++#endif
+diff --git a/src/main.c b/src/main.c
+index 9d40159..6e020e1 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -25,6 +25,7 @@
+ #include "flexray_pins.h"
+ #include "flexray_ts.h"
+ #include "pico_fr_record.h"
++#include "console.h"
+ #if PICO_FLEXRAY_BOARD_V2
+ #include "v2_cantest.h"
+ #endif
+@@ -236,6 +237,9 @@ int main(void)
+ 
+     bool clock_configured = set_sys_clock_khz(100000, true);
+     stdio_init_all();
++    // v1f: printf() no longer waits for the 115200 baud UART (the 5 s status print used to
++    // stop this loop for 120-160 ms, which cost PT-CAN frames). See console.c.
++    console_init();
+     printf("static_used=%lu B\n", (unsigned long)((uintptr_t)&__end__ - (uintptr_t)SRAM_BASE));
+     print_ram_usage();
+     // Initialize Panda USB interface
+diff --git a/src/ptcan_emu_core.c b/src/ptcan_emu_core.c
+index 33f811d..5151f3b 100644
+--- a/src/ptcan_emu_core.c
++++ b/src/ptcan_emu_core.c
+@@ -243,6 +243,32 @@ void pte_on_rx(pte_t *p, uint16_t id, const uint8_t *data, uint8_t len, uint64_t
+ // ---- content ------------------------------------------------------------------
+ static inline uint64_t since(uint64_t now, uint64_t t) { return now >= t ? now - t : 0; }
+ 
++// 0x397 "e3" blips of the real DDE (run 4 ddecan): first at W+1.321 s, then these gaps
++// in ms (start to start), repeating. Each blip lasts 60 ms (shorter if the next one
++// starts sooner).
++static const uint16_t blip397_ms[] = {
++    4120, 840, 2240, 360, 540, 60, 780, 3260, 4040, 1380, 540, 1120, 1000, 420, 1760, 220,
++    180, 460, 1320, 1060, 1560, 1500, 1620, 3940, 260, 2020, 6420, 1560, 580, 2860, 1500,
++    840, 1660, 1620, 1540, 2440, 480, 4020, 1340, 120, 4019, 4040, 8660, 3820, 3560, 120,
++    720, 1300, 3939, 4140, 1920, 1000, 800, 220, 6220, 1860, 1340, 3160, 5180, 2440, 2560,
++    2000,
++};
++#define BLIP397_FIRST_US MS(1321)
++static bool blip397(uint64_t tw)
++{
++    static uint32_t cycle_ms;
++    if (!cycle_ms)
++        for (unsigned k = 0; k < sizeof blip397_ms / sizeof blip397_ms[0]; k++) cycle_ms += blip397_ms[k];
++    if (tw < BLIP397_FIRST_US) return false;
++    uint32_t pos = (uint32_t)(((tw - BLIP397_FIRST_US) / 1000u) % cycle_ms);
++    for (unsigned k = 0; k < sizeof blip397_ms / sizeof blip397_ms[0]; k++) {
++        uint32_t len = blip397_ms[k] < 80 ? blip397_ms[k] - 20u : 60u;
++        if (pos < blip397_ms[k]) return pos < len;
++        pos -= blip397_ms[k];
++    }
++    return false;
++}
++
+ // Is the frame active (allowed to be sent) at now? (Ignoring the bus gate.)
+ static bool frame_active(const pte_t *p, int i, uint64_t now)
+ {
+@@ -396,13 +422,29 @@ static void build(const pte_t *p, int i, uint64_t now, uint8_t *d)
+         break;
+     }
+     case PTE_F_397: {
+-        // wake ramp fe e8 e9 e6 e4 -> e2 (the occasional 60 ms e3 blips are not reproduced)
++        // v1f: as the real DDE in run 4 (ddecan). Byte 1:
++        //  - wake ramp fe e8 e9 e6 e4, then e2;
++        //  - short "e3" blips (e3 for 60 ms, then back to e2) at irregular intervals,
++        //    replayed from the capture (blip397_ms[], repeating); each change goes out
++        //    at once as an event copy, which is why the real frame averages ~380 ms;
++        //  - after KL15 off the d1 walk df de dd de dd de dd de dd (first 0.8 s), dd held,
++        //    df at OFF+4.073 s, back to e2 at OFF+4.133 s (no blips during the walk).
+         uint8_t b = 0xe2;
+         if (tw < MS(461)) b = 0xfe;
+         else if (tw < MS(481)) b = 0xe8;
+         else if (tw < MS(541)) b = 0xe9;
+         else if (tw < MS(601)) b = 0xe6;
+         else if (tw < MS(661)) b = 0xe4;
++        else if (blip397(tw)) b = 0xe3;
++        if (!on && ever && toff < MS(4133)) {
++            static const struct { uint16_t ms; uint8_t v; } walk[] = {
++                {93, 0xdf}, {153, 0xde}, {273, 0xdd}, {373, 0xde}, {434, 0xdd}, {513, 0xde},
++                {634, 0xdd}, {713, 0xde}, {773, 0xdd}, {4073, 0xdf},
++            };
++            for (unsigned k = 0; k < sizeof walk / sizeof walk[0]; k++)
++                if (toff >= MS(walk[k].ms)) b = walk[k].v;
++            if (toff < MS(93)) b = 0xe2;
++        }
+         d[0] = 0xc0; d[1] = b; d[2] = 0x00;
+         break;
+     }
+@@ -459,6 +501,7 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+     int best = -1;
+     uint64_t best_due = 0;
+     uint8_t best_d[8];
++    bool best_cyc = false;
+     for (int i = 0; i < PTE_N_FRAMES; i++) {
+         if (!(p->mask & (1u << i))) continue;
+         const pte_def_t *def = &pte_defs[i];
+@@ -466,6 +509,7 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+         if (pte_id_forbidden(def->id)) continue;
+         if (!frame_active(p, i, now)) continue;
+         uint64_t due;
++        bool cyc = true;
+         uint8_t d[8];
+         build(p, i, now, d);
+         if (def->kind == PTE_K_NM512 && !p->kl15_ever) {
+@@ -477,13 +521,16 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+         } else {
+             due = f->next_us;
+             if (def->kind == PTE_K_CYC_EVENT && payload_differs(def, d, f->last) &&
+-                now >= f->last_tx_us + MS(def->ev_gap_ms))
++                now >= f->last_tx_us + MS(def->ev_gap_ms) && now < due) {
+                 due = now;   // on change
++                cyc = false;
++            }
+         }
+         if (now < due) continue;
+         if (best < 0 || due < best_due) {
+             best = i;
+             best_due = due;
++            best_cyc = cyc;
+             memcpy(best_d, d, 8);
+         }
+     }
+@@ -492,6 +539,8 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+     out->idx = (uint8_t)best;
+     out->id = def->id;
+     out->dlc = def->dlc;
++    out->due_us = best_due;
++    out->cyclic_slot = best_cyc && (def->kind == PTE_K_CYCLIC || def->kind == PTE_K_CYC_EVENT) && p->f[best].started;
+     memcpy(out->data, best_d, 8);
+     if (def->data_id != NO_E2E) {
+         uint8_t c = p->f[best].ctr;
+@@ -515,7 +564,8 @@ void pte_commit(pte_t *p, const pte_tx_t *tx, uint64_t now)
+             f->nm_pre_idx++;
+             f->next_us = now + period;
+         } else {
+-            f->next_us = (f->next_us + period > now) ? f->next_us + period : now + period;
++            f->next_us += period;   // keep the NM grid (late slot still goes out)
++            if (f->next_us + PTE_CATCHUP_MAX_US <= now) { p->resyncs++; f->next_us = now + period; }
+         }
+         break;
+     case PTE_K_CC592:
+@@ -525,12 +575,24 @@ void pte_commit(pte_t *p, const pte_tx_t *tx, uint64_t now)
+     default:
+         if (!f->started) f->next_us = now + period;
+         else if (now >= f->next_us) {
+-            // cyclic slot (events do not move the grid); if far behind, restart the grid
++            // Cyclic slot (event copies do not move the grid). v1f: keep the grid even if
++            // we are late, so a frame that missed its slot still goes out (late) instead of
++            // being skipped; only if we are hopelessly behind, restart the grid from now.
+             f->next_us += period;
+-            if (f->next_us <= now) f->next_us = now + period;
++            if (f->next_us <= now) {
++                if (now - f->next_us > PTE_CATCHUP_MAX_US) {
++                    p->resyncs++;
++                    f->next_us = now + period;
++                }
++            }
+         }
+         break;
+     }
++    if (tx->cyclic_slot && now > tx->due_us) {
++        uint64_t late = now - tx->due_us;
++        if (late > PTE_LATE_US) p->late_sends++;
++        if (late > p->late_max_us) p->late_max_us = late > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)late;
++    }
+     f->started = true;
+     f->last_tx_us = now;
+     memcpy(f->last, tx->data, 8);
+diff --git a/src/ptcan_emu_core.h b/src/ptcan_emu_core.h
+index a28aef6..4933ce3 100644
+--- a/src/ptcan_emu_core.h
++++ b/src/ptcan_emu_core.h
+@@ -45,10 +45,22 @@ extern const pte_def_t pte_defs[PTE_N_FRAMES];
+ #define PTE_NEW_WAKE_US     1000000u  // silence >= 1 s: the next frame is a new wake (restart timelines)
+ #define PTE_SLEEP_PREP_US   1950000u  // KL15 off, own NM released, no foreign NM for 1.95 s: stop cyclics
+ #define PTE_NM_CEILING_US   60000000u // NM (0x512/0x518) never later than 60 s after max(wake, last KL15-on 0x12F)
+-#define PTE_512_RELEASE_US  45930000u // real DDE: last 0x512 at OFF+45.93 s
+-#define PTE_518_RELEASE_US  29910000u // real EGS: last 0x518 at OFF+29.91 s
++// NM release timers (v1f). The real DDE/EGS keep their 645 ms NM grid running through
++// KL15 off and stop at a fixed time after OFF; the last frame is simply the last grid
++// slot before that time. Run 4: last 0x512 OFF+45.929 (next slot would be +46.57),
++// last 0x518 OFF+29.915 (ddecan) / +29.428 (noddecan; next slot +30.07). So the timers
++// are 46.0 s and 30.0 s (v1e stopped at "last real frame" = 45.93/29.91 and therefore
++// sent its last frame up to one period, ~0.25 s in run 6, earlier than the real ECU).
++#define PTE_512_RELEASE_US  46000000u // DDE: no 0x512 from OFF+46.0 s
++#define PTE_518_RELEASE_US  30000000u // EGS: no 0x518 from OFF+30.0 s
+ #define PTE_518_NOKL15_US   30000000u // wake without KL15: 0x518 stops W+30 s (assumption, no capture)
+ #define PTE_3FD_P_HOLD_US   30164000u // 0x3FD b2 0x20 -> 0x00 at OFF+30.164 s
++// v1f: a cyclic frame that is due but could not be sent on time is sent late (the grid
++// is kept, so the missed copies go out back to back with continuous alive counters),
++// unless it is more than 250 ms behind; then the grid restarts from now (counted in
++// 'resyncs'). A send more than PTE_LATE_US after its slot counts as a late send.
++#define PTE_CATCHUP_MAX_US  250000u
++#define PTE_LATE_US         5000u
+ 
+ // ---- state --------------------------------------------------------------------
+ typedef enum {
+@@ -96,6 +108,10 @@ typedef struct {
+     uint32_t n12f, kl15_on_edges, kl15_off_edges;
+     pte_frame_t f[PTE_N_FRAMES];
+     uint32_t tx_total, refused;
++    // v1f timing health
++    uint32_t late_sends;   // cyclic sends more than PTE_LATE_US after their slot
++    uint32_t late_max_us;  // worst lateness of a cyclic send
++    uint32_t resyncs;      // grid restarts (frames skipped because too far behind)
+ } pte_t;
+ 
+ typedef struct {
+@@ -103,6 +119,8 @@ typedef struct {
+     uint16_t id;
+     uint8_t dlc;
+     uint8_t data[8];
++    uint64_t due_us;       // the slot this frame was due in (lateness = send time - due_us)
++    bool cyclic_slot;      // true = a cyclic slot, false = an on-change (event) copy
+ } pte_tx_t;
+ 
+ // ---- API ----------------------------------------------------------------------
+diff --git a/tests/host/run.sh b/tests/host/run.sh
+index ba61ace..b682618 100755
+--- a/tests/host/run.sh
++++ b/tests/host/run.sh
+@@ -184,6 +184,31 @@ if [ -f "$RUN5_NOEGS" ]; then
+         { cat /tmp/pico_flexray_pte_noegs.txt; exit 1; }
+     tail -n 1 /tmp/pico_flexray_pte_noegs.txt
+ fi
++# v1f: run 6 (full emulation) rate check - every 20/30/100 ms slot sent, with and without
++# the v1e main-loop stall modelled (150 ms every 5 s). Before the fix: the v1e core (git
++# PTE_V1E, 4 frames per pass) with the same stall must reproduce the run 6 loss
++# (0x0A5 ~6,446 of 6,628 vs 6,447 of 6,634 in the car).
++RUN6_FULLEMU="${PTE_RUN6_FULLEMU:-/workspace/f11-emu-run6/replay/f11_emu6_fullemu.csv.can.csv}"
++if [ -f "$RUN6_FULLEMU" ]; then
++    python3 $CHK /tmp/pico_flexray_test_pte rate "$RUN6_FULLEMU" > /tmp/pico_flexray_pte_rate.txt ||
++        { cat /tmp/pico_flexray_pte_rate.txt; exit 1; }
++    tail -n 1 /tmp/pico_flexray_pte_rate.txt
++    PTE_V1E="${PTE_V1E:-d7e490a}"
++    if git -C ../.. cat-file -e "$PTE_V1E:src/ptcan_emu_core.c" 2>/dev/null; then
++        V1E=/tmp/pico_flexray_pte_v1esrc
++        mkdir -p $V1E
++        git -C ../.. show "$PTE_V1E:src/ptcan_emu_core.c" > $V1E/ptcan_emu_core.c
++        git -C ../.. show "$PTE_V1E:src/ptcan_emu_core.h" > $V1E/ptcan_emu_core.h
++        gcc -std=c11 -Wall -Wextra -Werror -DPTE_V1E_COMPARE -Istubs -I$V1E -I../../src \
++            -o /tmp/pico_flexray_test_pte_v1e test_ptcan_emu.c $V1E/ptcan_emu_core.c
++        if python3 $CHK /tmp/pico_flexray_test_pte_v1e rate "$RUN6_FULLEMU" > /tmp/pico_flexray_pte_rate_v1e.txt; then
++            echo "v1e core unexpectedly passed the stall rate check"; exit 1
++        fi
++        echo "v1e core (before the fix), stall modelled: $(grep 'rate_stall_burst4: 0x0a5' /tmp/pico_flexray_pte_rate_v1e.txt | sed 's/^ *FAIL *//')"
++    fi
++else
++    echo "(run 6 capture not found: rate check skipped)"
++fi
+ /tmp/pico_flexray_test_pte stats /tmp/pico_flexray_pte_stats.bin > /dev/null
+ python3 test_cantx_logger.py /tmp/pico_flexray_pte_stats.bin > /tmp/pico_flexray_cantx_logger.txt 2>&1 ||
+     { cat /tmp/pico_flexray_cantx_logger.txt; exit 1; }
+diff --git a/tests/host/test_ptcan_emu.c b/tests/host/test_ptcan_emu.c
+index c9d37cf..09cfe6c 100644
+--- a/tests/host/test_ptcan_emu.c
++++ b/tests/host/test_ptcan_emu.c
+@@ -91,6 +91,12 @@ typedef struct {
+     uint32_t tx, tx_while_silent, tx_bad_id;
+ } sim_t;
+ 
++// Firmware loop model for the replay (v1f): at most g_burst frames per poll (v1e: 4,
++// v1f: 16 = the TX FIFO depth), and optionally a main-loop stall of g_stall_us every
++// g_stall_every_us (v1e: the blocking 5 s UART status print, ~120-160 ms).
++static int g_burst = 32;
++static uint64_t g_stall_every_us, g_stall_us;
++
+ static void step(pte_t *p, sim_t *s, uint64_t now)
+ {
+     pte_state_t st = pte_state(p, now);
+@@ -100,7 +106,7 @@ static void step(pte_t *p, sim_t *s, uint64_t now)
+     }
+     pte_tx_t tx;
+     int guard = 0;
+-    while (pte_next(p, now, &tx) && guard++ < 32) {
++    while (guard++ < g_burst && pte_next(p, now, &tx)) {
+         if (pte_id_forbidden(tx.id)) s->tx_bad_id++;
+         if (!p->have_rx || now - p->last_rx_us > PTE_SILENCE_US) s->tx_while_silent++;
+         pte_commit(p, &tx, now);
+@@ -124,7 +130,8 @@ static void simulate(pte_t *p, sim_t *s, const rx_t *v, size_t n, uint64_t t_fro
+             pte_on_rx(p, v[k].id, v[k].d, v[k].len, v[k].t);
+             k++;
+         }
+-        step(p, s, now);
++        bool stalled = g_stall_every_us && ((now - t_from) % g_stall_every_us) < g_stall_us;
++        if (!stalled) step(p, s, now);
+         now += 1000;
+     }
+ }
+@@ -141,8 +148,15 @@ static int run_replay(const char *path, uint32_t mask, const char *outp, double
+     sim_t s = {.out = out, .last_state = (pte_state_t)-1};
+     uint64_t t0 = v[0].t > 2000000 ? v[0].t - 2000000 : 0;   // 2 s of sleeping bus first
+     simulate(&p, &s, v, n, t0, v[n - 1].t + (uint64_t)(extra_s * 1e6));
++#ifndef PTE_V1E_COMPARE
++    fprintf(out, "E fault=%d fault_id=%03x wakes=%u kl15_on=%u kl15_off=%u tx=%u silent_tx=%u bad_id=%u "
++            "late=%u late_max_us=%u resyncs=%u\n",
++            p.fault, p.fault_id, p.wakes, p.kl15_on_edges, p.kl15_off_edges, s.tx, s.tx_while_silent, s.tx_bad_id,
++            p.late_sends, p.late_max_us, p.resyncs);
++#else   // replay only, built against the v1e core (git) to reproduce the run 6 loss
+     fprintf(out, "E fault=%d fault_id=%03x wakes=%u kl15_on=%u kl15_off=%u tx=%u silent_tx=%u bad_id=%u\n",
+             p.fault, p.fault_id, p.wakes, p.kl15_on_edges, p.kl15_off_edges, s.tx, s.tx_while_silent, s.tx_bad_id);
++#endif
+     fclose(out);
+     free(v);
+     CHECK(s.tx_while_silent == 0, "TX while PT-CAN silent: %u", s.tx_while_silent);
+@@ -271,8 +285,8 @@ static void unit(void)
+     uint64_t OFF = W + 10000000;
+     feed_bus(&p, &s, OFF, OFF + 50000000, 0x6, 0x510);    // others keep NM for 50 s
+     uint64_t l512 = p.f[PTE_F_512].last_tx_us, l518 = p.f[PTE_F_518].last_tx_us;
+-    CHECK(l518 >= OFF + 29000000 && l518 <= OFF + 29910000, "0x518 last OFF+%.2f", (double)(l518 - OFF) / 1e6);
+-    CHECK(l512 >= OFF + 45200000 && l512 <= OFF + 45930000, "0x512 last OFF+%.2f", (double)(l512 - OFF) / 1e6);
++    CHECK(l518 >= OFF + 29300000 && l518 < OFF + PTE_518_RELEASE_US, "0x518 last OFF+%.2f", (double)(l518 - OFF) / 1e6);
++    CHECK(l512 >= OFF + 45300000 && l512 < OFF + PTE_512_RELEASE_US, "0x512 last OFF+%.2f", (double)(l512 - OFF) / 1e6);
+     CHECK(pte_state(&p, OFF + 50000000) == PTE_ST_RUN, "still RUN while others hold NM");
+     feed_bus(&p, &s, OFF + 50000000, OFF + 53000000, 0x6, 0);
+     CHECK(pte_state(&p, OFF + 53000000 - 1000) == PTE_ST_PREP_SLEEP, "PREP_SLEEP 2 s after the last foreign NM");
+@@ -304,6 +318,70 @@ static void unit(void)
+ 
+     // 0x592: only ever 40 22 00 14
+     CHECK(p.f[PTE_F_592].tx > 0 && memcmp(p.f[PTE_F_592].last, "\x40\x22\x00\x14\xff\xff\xff\xff", 8) == 0, "0x592 content");
++
++#ifndef PTE_V1E_COMPARE
++    // v1f: a 150 ms main-loop stall must not cost frames: the late 0x0A5 slots are all
++    // sent (late, back to back) once the loop runs again, the counter stays continuous,
++    // and the grid is kept (next slots on time again).
++    {
++        pte_init(&p);
++        pte_set_mask(&p, 1u << PTE_F_0A5);
++        uint32_t n0 = 0, n_stall = 0;
++        uint8_t prev = 0;
++        bool cont = true;
++        for (uint64_t t = W; t < W + 3000000; t += 1000) {
++            if (t % 10000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x1A1, d, 8, t); }
++            if (t % 100000 == 0) { uint8_t d[8] = {0, 0, 0xA, 0, 0, 0, 0, 0}; pte_on_rx(&p, 0x12F, d, 8, t); }
++            if (t % 640000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x510, d, 8, t); }
++            if (t >= W + 1500000 && t < W + 1650000) continue;   // loop stalled 150 ms
++            while (pte_next(&p, t, &tx)) {
++                uint8_t c = tx.data[1] & 0xF;
++                if (n0 && c != (prev >= 14 ? 0 : prev + 1)) cont = false;
++                prev = c;
++                if (t == W + 1650000) n_stall++;
++                pte_commit(&p, &tx, t);
++                n0++;
++            }
++        }
++        // first slot W+0.459, period 20 ms: slots up to W+2.999
++        uint32_t want = (uint32_t)((3000000 - 459000 - 1) / 20000 + 1);
++        CHECK(n0 == want, "0x0A5 with a 150 ms stall: %u sent, %u slots", n0, want);
++        CHECK(n_stall >= 7 && cont, "catch-up burst %u frames, counter continuous %d", n_stall, cont);
++        CHECK(p.resyncs == 0 && p.late_sends >= 7 && p.late_max_us >= 120000, "late %u max %u resyncs %u",
++              p.late_sends, p.late_max_us, p.resyncs);
++        // a 400 ms stall (> PTE_CATCHUP_MAX_US) is hopeless: one late frame, then the grid
++        // restarts from now (no 20-frame burst)
++        pte_init(&p);
++        pte_set_mask(&p, 1u << PTE_F_0A5);
++        uint32_t burst = 0;
++        for (uint64_t t = W; t < W + 3000000; t += 1000) {
++            if (t % 10000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x1A1, d, 8, t); }
++            if (t % 100000 == 0) { uint8_t d[8] = {0, 0, 0xA, 0, 0, 0, 0, 0}; pte_on_rx(&p, 0x12F, d, 8, t); }
++            if (t % 640000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x510, d, 8, t); }
++            if (t >= W + 1500000 && t < W + 1900000) continue;
++            uint32_t k = 0;
++            while (pte_next(&p, t, &tx)) { pte_commit(&p, &tx, t); k++; }
++            if (k > burst) burst = k;
++        }
++        CHECK(burst == 1 && p.resyncs == 1, "burst after a 400 ms stall %u, resyncs %u", burst, p.resyncs);
++    }
++
++    // 0x397: e3 blips and the post-OFF walk
++    {
++        pte_init(&p);
++        pte_set_mask(&p, 1u << PTE_F_397);
++        memset(&s, 0, sizeof s);
++        feed_bus(&p, &s, W, W + 10000000, 0xA, 0x510);
++        uint32_t n_on = p.f[PTE_F_397].tx;
++        CHECK(n_on >= 18 && n_on <= 30, "0x397 frames in 10 s: %u (real ~26)", n_on);
++        uint64_t OFF2 = W + 10000000;
++        feed_bus(&p, &s, OFF2, OFF2 + 300000, 0x6, 0x510);
++        CHECK(p.f[PTE_F_397].last[1] == 0xdd, "0x397 OFF+0.3 s: %02x", p.f[PTE_F_397].last[1]);
++        feed_bus(&p, &s, OFF2 + 300000, OFF2 + 4200000, 0x6, 0x510);
++        CHECK(p.f[PTE_F_397].last[1] == 0xe2, "0x397 OFF+4.2 s: %02x", p.f[PTE_F_397].last[1]);
++    }
++#endif
++
+     printf("unit tests: %s\n", fails ? "FAILED" : "ok");
+ }
+ 
+@@ -331,8 +409,12 @@ int main(int argc, char **argv)
+     if (argc >= 3 && !strcmp(argv[1], "stats")) return write_stats(argv[2]);
+     if (argc >= 2 && !strcmp(argv[1], "unit")) { unit(); return fails ? 1 : 0; }
+     if (argc >= 3 && !strcmp(argv[1], "e2e")) return run_e2e(argv[2]);
+-    if (argc >= 5 && !strcmp(argv[1], "replay"))
++    if (argc >= 5 && !strcmp(argv[1], "replay")) {
++        // optional: burst per poll, stall every ms, stall length ms (firmware loop model)
++        if (argc >= 7) g_burst = atoi(argv[6]);
++        if (argc >= 9) { g_stall_every_us = 1000ull * strtoull(argv[7], NULL, 10); g_stall_us = 1000ull * strtoull(argv[8], NULL, 10); }
+         return run_replay(argv[2], (uint32_t)strtoul(argv[3], NULL, 16), argv[4], argc >= 6 ? atof(argv[5]) : 5.0);
+-    printf("usage: %s unit | e2e FILE | replay CANFILE MASK OUT [extra_s]\n", argv[0]);
++    }
++    printf("usage: %s unit | e2e FILE | replay CANFILE MASK OUT [extra_s [burst [stall_every_ms stall_ms]]]\n", argv[0]);
+     return 2;
+ }
+diff --git a/tools/dde_emu/check_ptcan_replay.py b/tools/dde_emu/check_ptcan_replay.py
+index 5830056..fb39a4f 100644
+--- a/tools/dde_emu/check_ptcan_replay.py
++++ b/tools/dde_emu/check_ptcan_replay.py
+@@ -8,6 +8,9 @@ real DDE/EGS frames.
+                                                the full set must stop on a foreign 0x3FD/...
+   check_ptcan_replay.py BIN noegs    CAN_CSV   EGS off / DDE on: EGS set clean, full set faults
+   check_ptcan_replay.py BIN vectors  CAN_CSV OUT   write E2E vectors (real frames) for 'e2e'
++  check_ptcan_replay.py BIN rate     CAN_CSV   v1f: run 6 (full emulation, no real DDE/EGS):
++                                               every cyclic slot is sent, also with the v1e
++                                               main-loop stall (150 ms every 5 s) modelled
+ """
+ import csv
+ import subprocess
+@@ -60,7 +63,7 @@ def kl15_edges(frames):
+     return ons, offs
+ 
+ 
+-def run(binary, frames, exclude, mask, tag, extra_s=5.0):
++def run(binary, frames, exclude, mask, tag, extra_s=5.0, loop=()):
+     rx = "/tmp/pte_rx_%s.txt" % tag
+     with open(rx, "w") as f:
+         for t, i, p in frames:
+@@ -68,7 +71,7 @@ def run(binary, frames, exclude, mask, tag, extra_s=5.0):
+                 continue
+             f.write("%d %03x %s\n" % (t, i, p.hex()))
+     out = "/tmp/pte_out_%s.txt" % tag
+-    r = subprocess.run([binary, "replay", rx, "%x" % mask, out, str(extra_s)], capture_output=True, text=True)
++    r = subprocess.run([binary, "replay", rx, "%x" % mask, out, str(extra_s)] + [str(x) for x in loop], capture_output=True, text=True)
+     print("  " + r.stdout.strip().replace("\n", "\n  "))
+     check(r.returncode == 0, "%s: replay ran clean (no TX while silent, no forbidden ID)" % tag)
+     tx, states, end = [], [], ""
+@@ -133,18 +136,18 @@ def ddecan(binary, path):
+         lim = {0x512: 700000, 0x518: 700000}.get(i, 250000 if pte_period(i) <= 100 else 1100000)
+         check(abs(o[-1][0] - r[-1][0]) <= lim, "0x%03x last frame within %.2f s of the real one (%+.3f s)"
+               % (i, lim / 1e6, (o[-1][0] - r[-1][0]) / 1e6))
+-        need = {0x397: 90, 0x3FB: 30, 0x281: 40, 0x3F9: 80, 0x0A5: 80}.get(i, 97)
++        need = {0x397: 95, 0x3FB: 30, 0x281: 40, 0x3F9: 80, 0x0A5: 80}.get(i, 97)
+         check(pct >= need, "0x%03x content matches the real frame %.1f%% (>= %d%%)" % (i, pct, need))
+         ratio = len(o) / max(1, len(r))
+-        lo = {0x3FB: 0.5, 0x397: 0.4, 0x3F9: 0.6, 0x381: 0.5, 0x3B3: 0.5}.get(i, 0.95)
++        lo = {0x3FB: 0.5, 0x397: 0.9, 0x3F9: 0.6, 0x381: 0.5, 0x3B3: 0.5}.get(i, 0.95)
+         check(lo <= ratio <= 1.05, "0x%03x frame count %d vs real %d" % (i, len(o), len(r)))
+     # 0x3F9 P-lock (bits 28-29 = 2) from W+0.61 s on
+     bad = [t for t, p in ours.get(0x3F9, []) if t > W + 610000 and ((p[3] >> 4) & 3) != 2]
+     check(not bad, "0x3F9 bits 28-29 = 2 (P) in every frame after W+0.61 s")
+     l518 = ours[0x518][-1][0] - OFF
+     l512 = ours[0x512][-1][0] - OFF
+-    check(29.0e6 <= l518 <= 29.91e6, "0x518 released OFF+%.2f s (real OFF+%.2f)" % (l518 / 1e6, (real[0x518][-1][0] - OFF) / 1e6))
+-    check(45.2e6 <= l512 <= 45.93e6, "0x512 released OFF+%.2f s (real OFF+%.2f)" % (l512 / 1e6, (real[0x512][-1][0] - OFF) / 1e6))
++    check(29.3e6 <= l518 < 30.0e6, "0x518 released OFF+%.2f s (real OFF+%.2f)" % (l518 / 1e6, (real[0x518][-1][0] - OFF) / 1e6))
++    check(45.3e6 <= l512 < 46.0e6, "0x512 released OFF+%.2f s (real OFF+%.2f)" % (l512 / 1e6, (real[0x512][-1][0] - OFF) / 1e6))
+     ps = [t for t, s in states if s == "PREP_SLEEP"]
+     lastnm = max(t for t, i, _ in fr if 0x500 <= i <= 0x57F and i not in (0x512, 0x518))
+     check(bool(ps) and abs(ps[0] - (lastnm + 1950000)) <= 2000,
+@@ -181,7 +184,7 @@ def absent_run(binary, path, tag, clean_mask, absent):
+     if offs and clean_mask & (1 << TABLE.index(0x512)):
+         o = [t for t, i, _ in tx if i == 0x512]
+         if fr[-1][0] - offs[0] > 46e6:
+-            check(o and 45.2e6 <= o[-1] - offs[0] <= 45.93e6, "%s: 0x512 released OFF+%.2f s" % (tag, (o[-1] - offs[0]) / 1e6))
++            check(o and 45.3e6 <= o[-1] - offs[0] < 46.0e6, "%s: 0x512 released OFF+%.2f s" % (tag, (o[-1] - offs[0]) / 1e6))
+     ps = [t for t, s in states if s == "PREP_SLEEP"]
+     print("  states: " + " ".join("%s@%+.2f" % (s, (t - W) / 1e6) for t, s in states))
+     print("  PREP_SLEEP %s; last frame W+%.2f s" % ("never" if not ps else "W+%.2f" % ((ps[0] - W) / 1e6), (fr[-1][0] - W) / 1e6))
+@@ -199,6 +202,42 @@ def absent_run(binary, path, tag, clean_mask, absent):
+         print("  full set states: " + " ".join("%s@%+.2f" % (s, (t - W) / 1e6) for t, s in st2))
+ 
+ 
++def rate(binary, path):
++    """v1f: run 6 lost ~2.8 % of the 20 ms frames (6,447 of 6,634 0x0A5): the v1e loop
++    stalled 120-160 ms every 5 s (blocking UART status print) and the core then skipped
++    the missed slots. v1f: non-blocking console (no stall) + late slots sent late +
++    16 frames per pass. Check: every cyclic slot between the first and last frame of
++    each ID is sent, with no stall and with the v1e stall modelled."""
++    fr = load(path)
++    W = fr[0][0]
++    present = {i for _, i, _ in fr if i in TABLE}
++    check(not present, "rate: no real DDE/EGS ID on the bus (full emulation)")
++    ons, offs = kl15_edges(fr)
++    for tag, loop, need in (("rate_nostall", (5.0, 16), 0.999), ("rate_stall", (5.0, 16, 5000, 150), 0.995),
++                            ("rate_stall_burst4", (5.0, 4, 5000, 150), 0.995)):
++        tx, states, end = run(binary, fr, set(), MASK_ALL, tag, loop[0], loop[1:])
++        check("fault=0" in end, "%s: no fault (%s)" % (tag, end))
++        ids = by_id([(t, i, p) for t, i, p in tx])
++        worst = []
++        for i in (0x0A5, 0x0D9, 0x0DC, 0x0F3, 0x08F, 0x2C4, 0x281, 0x3FD):
++            ts = [t for t, _ in ids.get(i, [])]
++            # count slots inside the stretch where this frame runs (ON window for 20/30 ms ones)
++            per = pte_period(i) * 1000
++            # split into continuous runs (a gap > 1 s = frame stopped on purpose)
++            runs, a = [], 0
++            for k in range(1, len(ts) + 1):
++                if k == len(ts) or ts[k] - ts[k - 1] > 1000000:
++                    runs.append((ts[a], ts[k - 1], k - a))
++                    a = k
++            slots = sum(round((b - a0) / per) + 1 for a0, b, _ in runs)
++            sent = sum(n for _, _, n in runs)
++            gaps = [ts[k] - ts[k - 1] for k in range(1, len(ts)) if ts[k] - ts[k - 1] <= 1000000]
++            worst.append((sent / slots if slots else 0, i, sent, slots, max(gaps) / 1000 if gaps else 0))
++        for r, i, sent, slots, g in worst:
++            check(r >= need, "%s: 0x%03x %d of %d slots (%.2f %%), longest gap %.0f ms" % (tag, i, sent, slots, 100 * r, g))
++        print("  " + end)
++
++
+ def vectors(path, out):
+     fr = load(path)
+     n = 0
+@@ -221,6 +260,8 @@ def main():
+         absent_run(binary, path, "noddecan", MASK_DDE, DDE)
+     elif mode == "noegs":
+         absent_run(binary, path, "noegs", MASK_EGS, EGS)
++    elif mode == "rate":
++        rate(binary, path)
+     print("%s: %s" % (mode, "all checks passed" if not fails else "%d FAILED" % len(fails)))
+     return 1 if fails else 0
+ 
+-- 
+2.47.3
+

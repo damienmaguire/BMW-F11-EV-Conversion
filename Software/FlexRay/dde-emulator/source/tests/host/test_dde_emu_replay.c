@@ -35,6 +35,10 @@
 //                              Car frames with a higher ID move back by our frame's minislots.
 //              dyn-run5 DDE    run 5 (FR1 + the real DDE's other FR2 frames), each PDU sent in
 //                              the cycles the real DDE sent it: our placement vs the real DDE's
+//              dyn-engine      v1g: dyn-run2 with the fake engine (CAS mode): ST_KL/brake in
+//                              injected 0x74 frames (A, D at 8 s, C, 9 + 8 at 22 s, D again at
+//                              26 s, 8 at KL15 off). Placement/order/counters as dyn-run2; E6
+//                              state changes sent as events, E2E CRCs valid, E8/FB9 rates.
 //              dyn-unsure      dyn-run2 plus: an unexplained frame start just before 0xE6
 //                              (no header), an unknown-length frame before it, and headers
 //                              without their mark: 0xE6 must be skipped (counted), not sent
@@ -50,6 +54,27 @@
 // v1d: core 0 hands decoded frames (0xF1 KL15) to the emulator. Weak so that older
 // sources without it (the v1 before-the-fix build) still link; then never called.
 extern void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes) __attribute__((weak));
+// v1g fake engine (weak: older sources do not have it)
+#ifdef PICOFLEX_GET_ENGINE
+#define HAVE_ENGINE 1
+#ifdef PICOFLEX_GET_EMUDIAG   // v1h: wIndex = start profile
+extern void dde_engine_host_set(uint16_t wvalue, uint16_t windex) __attribute__((weak));
+#define ENGINE_HOST_SET(m) dde_engine_host_set((m), (uint16_t)engine_prof)
+#else
+extern void dde_engine_host_set(uint16_t wvalue) __attribute__((weak));
+#define ENGINE_HOST_SET(m) dde_engine_host_set(m)
+#endif
+extern void dde_engine_fill_status(dde_engine_status_t *st) __attribute__((weak));
+#endif
+// v1h.2: the engine/gear step runs in core 1's background loop (weak: older sources run it in the ISR)
+extern void dde_emu_core1_poll(void) __attribute__((weak));
+static bool engine_sc __attribute__((unused));   // scenario dyn-engine
+#if EMU_STANDALONE
+#include "dde_standalone.h"
+static unsigned sa_polls;          // standalone: core-0 polls (the only "host" there is)
+static uint64_t sa_t_emulating;    // standalone: when the LED state first said "emulating"
+#endif
+static unsigned engine_prof __attribute__((unused));   // v1h: env DDE_ENGINE_PROFILE (0 = build default)
 
 #define K_TRUE 34       // ticks: fire-delay counter read -> TXEN mark (car test 1: K=34)
 #define LOOP_TRUE 34    // ticks: TXEN mark -> FR1 RX echo mark (car test 1: loop=338 ns)
@@ -64,7 +89,7 @@ static uint64_t T;   // 10 ns ticks
 uint32_t time_us_32(void) { return (uint32_t)(T / 100u) + US_OFF; }
 static uint64_t us_to_tick(uint32_t us) { return (uint64_t)(uint32_t)(us - US_OFF) * 100u; }
 
-enum { EV_CAR, EV_HDR, EV_ALARM_MATCH, EV_ALARM_FORCE, EV_TXEN, EV_ECHO, EV_TXEND, EV_HOST, EV_CORE0 };
+enum { EV_CAR, EV_HDR, EV_ALARM_MATCH, EV_ALARM_FORCE, EV_TXEN, EV_ECHO, EV_TXEND, EV_HOST, EV_CORE0, EV_ENG74 };
 typedef struct { uint64_t t; uint32_t seq; int type; uint32_t gen; uint32_t pos; uint8_t h[5]; uint8_t ours; uint8_t flags; uint32_t mpos; uint16_t b3p1; } ev_t;   // b3p1: 0xF1 payload[2] + 1 (0 = none)
 #define EVF_NOMARK 1u     // header whose mark is not the latest one (capture row without a hw timestamp)
 #define EVF_MARKONLY 2u   // frame start without a decoded header
@@ -369,7 +394,31 @@ static void handle(ev_t e)
             dde_emu_on_frame(0xF1, e.h[4] & 63u, pl, 4);
         }
         break;
+    case EV_ENG74: {   // v1g: vehicle 0x74 (even cycle): b3 low nibble ST_KL, b7 & 3 = 3 brake
+        static const struct { uint32_t ms; uint8_t k; } plan[] = {
+            {0, 0xA}, {8000, 0xD}, {10000, 0xC}, {22000, 0x9}, {22500, 0x8}, {25000, 0xA}, {26000, 0xD},
+            {28000, 0xC}, {34700, 0x8}};
+        uint32_t ms = (uint32_t)(e.t / 100000u);
+        uint8_t k = 0xA;
+        for (unsigned i = 0; i < sizeof plan / sizeof plan[0]; i++) if (ms >= plan[i].ms) k = plan[i].k;
+        uint8_t pl[8] = {0x00, 0x00, (uint8_t)(0xF0u | k), 0x00, 0x00, 0x85, 0x03, 0x00};
+        if (dde_emu_on_frame) dde_emu_on_frame(0x74, 0, pl, 8);
+        { ev_t n = e; n.t = e.t + 10000000ull; push(n); }   // every 100 ms
+        break; }
     case EV_HOST:
+#if EMU_STANDALONE
+        // v1h.1 standalone build: no laptop at all. Only the board's own core-0 poll runs
+        // (main loop, at least every 50 ms); it switches the emulator, the fake start (cas,
+        // short) and gear on by itself and repeats them every second.
+        dde_standalone_poll();
+        sa_polls++;
+        if (!sa_t_emulating && dde_standalone_led_state() == SA_LED_EMULATING) sa_t_emulating = e.t;
+        { ev_t n = e; n.t = e.t + 5000000ull; push(n); }   // 50 ms
+        break;
+#endif
+#ifdef HAVE_ENGINE
+        if (engine_sc && dde_engine_host_set) ENGINE_HOST_SET(ENG_MODE_CAS);   // logger keepalive
+#endif
         dde_emu_host_set(1);
         { ev_t n = e; n.t = e.t + 100000000ull; push(n); }   // keepalive 1 s
         break;
@@ -430,6 +479,7 @@ static void run_until(uint64_t tend)
         if (!hv && !cv) break;
         if (cv && (!hv || car[cfeed].t <= heap[0].t)) handle(car_ev(cfeed++));
         else handle(pop());
+        if (dde_emu_core1_poll) dde_emu_core1_poll();   // v1h.2: core 1 background after every interrupt
     }
 }
 
@@ -726,9 +776,11 @@ static dynchk_t check_dyn(bool picked)
             dde_core_build_dyn_pdu((unsigned)p, cyc, ctr >= 0 ? (unsigned)ctr : 0, pre != 0, fr);
             okc = memcmp(fr + 5, txl[k].pl, plen) == 0;
         }
+        if (engine_sc && (p == 0 || p == 2 || p == 3 || p == 4 || p == DDE_DYN_N_PDU - 2 || p == DDE_PDU_FB9 || p == DDE_PDU_E89 || p == DDE_PDU_142))
+            okc = true;   // v1g: engine bytes are checked in check_engine()
         if (!okc) { if (d.bytes_bad + d.preign_bad < 5) printf("    0x%02X L%u cycle %u: bytes differ (ign +%.0f ms)\n", X, plen + 1, cyc, since / 1e5); if (pre_must || post_must) d.preign_bad++; else d.bytes_bad++; }
         // the spec's ign-on 0xE6 bytes, independent of the builder
-        if (p == 0 && post_must) {
+        if (p == 0 && post_must && !engine_sc) {
             static const uint8_t e6[6] = {0x80, 0x64, 0x45, 0x44, 0x23, 0x47};
             if ((txl[k].pl[1] & 0xF0) != 0x10 || memcmp(txl[k].pl + 2, e6, 6) != 0 ||
                 txl[k].pl[0] != (dde_core_crc8(txl[k].pl + 1, 7) ^ 0x04)) d.spec_bad++;
@@ -743,7 +795,7 @@ static dynchk_t check_dyn(bool picked)
                 d.e85_early++;
             }
         }
-        if (!picked) {
+        if (!picked && !(engine_sc && (p == 0 || p == 3 || p == 4))) {
             if (pd->every4 ? (cyc & 3u) != (pd->cyc_mod8 & 3u) : (cyc & 7u) != pd->cyc_mod8) d.cyc_bad++;
             // period grid: a send that was late (retry after a skip / no lock) is followed by
             // one that is early by the same amount (the grid is kept)
@@ -1056,6 +1108,98 @@ static void check_unsure(void)
 static void shift_after_ours(uint64_t txen, unsigned id, unsigned cyc, unsigned plen) { (void)txen; (void)id; (void)cyc; (void)plen; }
 #endif
 
+#ifdef HAVE_ENGINE
+// v1g dyn-engine: what the fake engine put on the bus
+static void __attribute__((unused)) check_engine(void)
+{
+    unsigned n_e6 = 0, e6_crc_bad = 0, e6_offgrid = 0, e2e_bad = 0, nstat = 0, n_fb9 = 0, n_e89 = 0;
+    unsigned seen81 = 0, seen82 = 0, seen92 = 0, seen80 = 0, rpm_max = 0, hi3 = 0, e8_crank = 0;
+    static unsigned hic[DDE_EMU_N_STATIC][16];   // v1h.2: E2E CounterHi histogram per static ID (Fred: no 0x3D c3 on the bus in run 9)
+    bool cranking = false;
+    uint64_t t_rpm950 = 0, t_e6_82 = 0, t_fast0 = 0, t_fast1 = 0; unsigned n_fast = 0;
+    for (unsigned k = 0; k < ntx; k++) {
+        const uint8_t *pl = txl[k].pl;
+        unsigned id = txl[k].id, cyc = txl[k].cycle;
+        int tg = dde_core_target_index(id);
+        if (tg >= 0) {
+            for (unsigned g = 0; g < DDE_EMU_N_E2E; g++) {
+                const uint8_t *e = dde_emu_e2e[g];
+                if (e[0] != (unsigned)tg || e[1] != (cyc & 3u)) continue;
+                nstat++;
+                if (pl[e[2]] != (uint8_t)(dde_core_crc8(&pl[e[2] + 1], e[3] - e[2]) ^ e[4])) e2e_bad++;
+                if ((pl[e[2] + 1] >> 4) == 3) hi3++;
+                hic[tg][(pl[e[2] + 1] >> 4) & 15u]++;
+            }
+            if (id == 0x28 && (cyc & 3u) == 1) {
+                unsigned r = (unsigned)(pl[5] | pl[6] << 8) / 4u;
+                if (r > rpm_max) rpm_max = r;
+                if (!t_rpm950 && r >= 950) t_rpm950 = txl[k].txen;
+            }
+        }
+        if (id == 0xE6) {
+            n_e6++;
+            if (pl[0] != (uint8_t)(dde_core_crc8(pl + 1, 7) ^ 0x04)) e6_crc_bad++;
+            if ((cyc & 7u) != 2u) e6_offgrid++;
+            seen81 += pl[2] == 0x81; seen92 += pl[2] == 0x92; seen80 += pl[2] == 0x80 && seen92;
+            cranking = pl[2] == 0x81;
+            if (pl[2] == 0x82) { seen82++; if (!t_e6_82) t_e6_82 = txl[k].txen; }
+        }
+        if (id == 0xFB && txl[k].plen == 8) {
+            n_fb9++;
+            if (getenv("FB9_TRACE")) printf("    FB9 %.3f s cycle %u: %02X %02X %02X %02X\n", txl[k].txen / 1e8, cyc, pl[0], pl[1], pl[2], pl[3]);
+        }
+        if (id == 0xE8 && txl[k].plen == 8) {
+            n_e89++;
+            if (cranking) e8_crank++;
+            if (pl[0] == 0x25 && pl[1] == 0x14) {   // mean gap between running-content frames of one run
+                if (t_fast1 && txl[k].txen - t_fast1 < 20000000ull) { t_fast0 += txl[k].txen - t_fast1; n_fast++; }
+                t_fast1 = txl[k].txen;
+            }
+        }
+    }
+    double e8_iv = n_fast ? (double)t_fast0 / 1e5 / n_fast : 0;
+    printf("  engine: rpm max %u, 0x28 c1 >= 950 rpm at %.3f s, E6 82 on the bus at %.3f s (+%.1f ms); E6 frames %u "
+           "(%u outside cycle%%8==2 = events), 81/82/92/80 seen %u/%u/%u/%u, E6 CRC bad %u; static E2E groups %u, bad %u, "
+           "CounterHi=3 %u; FB L9 %u, E8 L9 %u (running content %u, mean interval %.1f ms, %u while E6=81)\n",
+           rpm_max, t_rpm950 / 1e8, t_e6_82 / 1e8, ((double)t_e6_82 - (double)t_rpm950) / 1e5, n_e6, e6_offgrid,
+           seen81, seen82, seen92, seen80, e6_crc_bad, nstat, e2e_bad, hi3, n_fb9, n_e89, n_fast, e8_iv, e8_crank);
+    for (unsigned tg = 0; tg < DDE_EMU_N_STATIC; tg++) {
+        unsigned mn = ~0u, mx = 0, nz = 0;
+        printf("  0x%02X E2E CounterHi 0..3:", dde_emu_static_id[tg]);
+        for (unsigned h = 0; h < 4; h++) { printf(" %u", hic[tg][h]); if (hic[tg][h] < mn) mn = hic[tg][h]; if (hic[tg][h] > mx) mx = hic[tg][h]; }
+        for (unsigned h = 4; h < 16; h++) nz += hic[tg][h];
+        printf("\n");
+        (void)mn; (void)mx;
+        (void)nz;
+    }
+    {   // v1h.2 (Fred, run 9): the start-time CounterHi 3 window must reach 0x3D like 0x29 (run 9: 28c3/0x29 had it, 0x3D none)
+        int t29 = dde_core_target_index(0x29), t3d = dde_core_target_index(0x3D), t28 = dde_core_target_index(0x28);
+        CHECK(hic[t28][3] > 0 && hic[t3d][3] > 0 && hic[t3d][3] == hic[t29][3],
+              "CounterHi 3 window: 0x28 %u 0x29 %u 0x3D %u", hic[t28][3], hic[t29][3], hic[t3d][3]);
+    }
+    CHECK(rpm_max >= 1000 && rpm_max < 1100, "rpm max %u", rpm_max);
+    // v1h: 0x28 c1 (rpm) goes out only every 4th cycle (20 ms), the 0xE6 82 event in the next
+    // possible cycle: with the short start 82 can be on the bus up to 20 ms before the first
+    // 0x28 c1 frame that shows >= 950 rpm (the engine model itself is >= 950 rpm then).
+    {
+        double d82 = ((double)t_e6_82 - (double)t_rpm950) / 1e5;
+        CHECK(t_e6_82 && d82 >= -20.5 && d82 <= 15.0, "E6 82 within -20..+15 ms of rpm 950 on 0x28 (%.1f)", d82);
+    }
+    CHECK(seen81 && seen82 && seen92 && seen80, "E6 state sequence");
+    CHECK(e6_offgrid >= 4, "E6 state changes sent as events (%u)", e6_offgrid);
+    CHECK(e6_crc_bad == 0 && e2e_bad == 0, "E2E CRCs");
+    CHECK(hi3 >= 8, "CounterHi=3 crank marker on the bus (%u)", hi3);
+    CHECK(n_fast > 50 && e8_iv > 50 && e8_iv < 70, "E8 L9 ~15/s while running (%u, %.1f ms)", n_fast, e8_iv);
+    CHECK(n_fb9 >= 60, "FB L9 sent on change while ramping (%u)", n_fb9);
+    dde_engine_status_t es; dde_engine_fill_status(&es);
+    printf("  engine status: mode %u phase %u starts %u stops %u rejects %u stkl %X\n", es.mode, es.phase,
+           (unsigned)es.starts, (unsigned)es.stops, (unsigned)es.rejects, es.stkl);
+    CHECK(es.starts == 2 && es.stops == 2 && es.rejects == 0, "two starts, two stops");
+}
+#else
+static void __attribute__((unused)) check_engine(void) { CHECK(0, "no engine in this build"); }
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: %s VECTORS [run1|run1-v1|foreign|stuck|noecho|lateecho]\n", argv[0]); return 2; }
@@ -1094,6 +1238,9 @@ int main(int argc, char **argv)
             dde_emu_test_dyn_pick = pick_real;
         } else if (argc >= 4) load_dde(argv[3]);   // dyn-mitm: the real DDE's frames, for the 0x5C comparison only
         if (unsure) setup_unsure();
+        engine_sc = strcmp(sc, "dyn-engine") == 0;
+        engine_prof = getenv("DDE_ENGINE_PROFILE") ? (unsigned)atoi(getenv("DDE_ENGINE_PROFILE")) : 0u;
+        if (engine_sc) { ev_t e = {0}; e.t = 20; e.type = EV_ENG74; push(e); }
         run_until(tend);
         print_stats("end");
         dde_emu_stats_t s = st();
@@ -1125,7 +1272,7 @@ int main(int argc, char **argv)
         for (unsigned k = 0; k < ntx; k++) nfb7 += (txl[k].plen & 3u) == 2u;
         CHECK((unsigned)s.dyn_parks + 1u >= nfb7 && (unsigned)s.dyn_parks <= nfb7, "parks %u vs %u 14-byte frames", (unsigned)s.dyn_parks, nfb7);
         if (!r5) {
-            CHECK(check_preign_static() == 0, "static pre-ign content");
+            if (!engine_sc) CHECK(check_preign_static() == 0, "static pre-ign content");   // v1g: engine bytes in check_engine()
             // every PDU sent about as often as its period allows (bus time after the first lock)
             double cyc = (double)(t_capture_end - car[0].t) / CYC_T;
             for (int p = 0; p < DDE_DYN_N_PDU; p++) {
@@ -1143,12 +1290,47 @@ int main(int argc, char **argv)
                 unsigned got = d.per_pdu[p];
                 printf("  %s: sent %u, period allows %.1f\n", dde_dyn_pdu[p].name, got, want);
                 if (!unsure && want >= 3) CHECK(got + 2 >= (unsigned)(want * 0.9), "%s sent %u of ~%.0f", dde_dyn_pdu[p].name, got, want);
-                CHECK(got <= (unsigned)want + 2, "%s sent too often", dde_dyn_pdu[p].name);
+                if (engine_sc && dde_dyn_slot_id[dde_dyn_pdu[p].dslot] == 0xE6) {
+                    // v1h.2: E6 events (off the cycle%8==2 grid) come on top of the 1 s grid,
+                    // which an event no longer shifts (run 9: shifted grid -> 1.9-2.6 s gaps, EPS D51744)
+                    unsigned ev = 0; uint64_t prev = 0, gmax = 0;
+                    for (unsigned k = 0; k < ntx; k++) {
+                        if (txl[k].id != 0xE6) continue;
+                        if ((txl[k].cycle & 7u) != 2u) ev++;
+                        bool on_seg = false;   // gap only counts when both frames are in one KL15-on segment
+                        for (unsigned i = 0; i < nks; i++) {
+                            if (!kseg[i].v) continue;
+                            uint64_t e = i + 1 < nks ? kseg[i + 1].t : t_capture_end;
+                            if (prev >= kseg[i].t && txl[k].txen < e) on_seg = true;
+                        }
+                        if (prev && on_seg && txl[k].txen - prev > gmax) gmax = txl[k].txen - prev;
+                        prev = txl[k].txen;
+                    }
+                    printf("  E6: %u events on top of the grid, %u on the grid, max gap while KL15 on %.3f s\n",
+                           ev, got - ev, gmax / 1e8);
+                    // an event can fall on a cycle%8==2 cycle by chance (1 in 8): allow for those
+                    CHECK(got - ev <= (unsigned)want + 2 + (ev + 3) / 4, "E6 grid frames sent too often (%u)", got - ev);
+                    CHECK(gmax <= 105000000ull, "E6 gap %.3f s > 1.05 s", gmax / 1e8);
+                } else if (!(engine_sc && (p == 3 || p == 4)))   // v1g: FB9 on change, E8 L9 15/s while running
+                    CHECK(got <= (unsigned)want + 2, "%s sent too often", dde_dyn_pdu[p].name);
             }
         } else {
             compare_real();
         }
         if (unsure) check_unsure();
+        if (engine_sc) check_engine();
+#if EMU_STANDALONE
+        // standalone: emulating from power-up with no host call at all
+        CHECK(sa_t_emulating > 0, "standalone: never reached 'emulating' without a host");
+        printf("  standalone: no host calls, %u core-0 polls, emulating (LED slow blink) from %.3f s, "
+               "LED state at the end %u\n", sa_polls, sa_t_emulating / 1e8, (unsigned)dde_standalone_led_state());
+        for (unsigned st = 0; st < 3; st++) {   // LED patterns: flash every 2 s / 0.5 s blink / 0.1 s blink
+            unsigned on = 0, edges = 0; bool prev = false;
+            for (uint32_t ms = 0; ms < 10000; ms++) { bool v = dde_standalone_led((uint8_t)st, ms); on += v; edges += v != prev; prev = v; }
+            static const unsigned want_on[3] = {500, 5000, 5000}, want_edges[3] = {10, 20, 100};
+            CHECK(on == want_on[st] && edges == want_edges[st], "standalone LED state %u: on %u ms, edges %u", st, on, edges);
+        }
+#endif
         printf("%s: %s\n", sc, fails ? "FAILED" : "ok");
         return fails ? 1 : 0;
     }

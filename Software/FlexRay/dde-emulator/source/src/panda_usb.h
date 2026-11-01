@@ -142,6 +142,7 @@ typedef struct {
 // the host hasn't enabled CAN records (not_streamed++) or the queue is full
 // (dropped++).
 bool panda_can_record_push(const pico_can_record_t *r);
+bool panda_can_tx_records_enabled(void); // v1f: host asked for our own TX frames too
 void panda_can_get_q_stats(panda_can_q_stats_t *st);
 #endif
 

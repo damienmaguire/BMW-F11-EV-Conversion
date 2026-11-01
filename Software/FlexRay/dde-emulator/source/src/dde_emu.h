@@ -5,11 +5,29 @@
 // See Software/FlexRay/dde-emulator/README.md.
 #ifndef DDE_EMU_H
 #define DDE_EMU_H
+#include <stdbool.h>
 #include <stdint.h>
 #include "dde_emu_core.h"
+#include "dde_engine.h"
+#include "dde_gear.h"
 
 #define PICOFLEX_SET_EMU   0xa3u   // vendor OUT, wValue 1 = enable/keepalive, 0 = disable + clear fault
 #define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 256 bytes: dde_emu_stats_t (first 64 = v1, 128 = v2, 192 = v3 layout)
+// v1g fake engine start (opt-in, OFF after every reset):
+//   SET_ENGINE (vendor OUT) wValue low byte = mode (0 off, 1 CAS start, 2 fallback start),
+//   high byte = command (0 none / keepalive, 1 start, 2 stop). Repeat at least every 3 s
+//   (the logger sends it every second) or the mode falls back to off (engine "stops").
+//   GET_ENGINE (vendor IN) = dde_engine_status_t.
+//   v1h: SET_ENGINE wIndex = start profile (0 = build default, 1 short, 2 realistic,
+//   3 run8; see dde_engine.h). Used from the next start. GET_ENGINE is 56 bytes
+//   (version 2; a host asking for 40 gets the v1g layout).
+#define PICOFLEX_SET_ENGINE 0xa7u
+#define PICOFLEX_GET_ENGINE 0xa9u
+// v1h: echo-miss diagnostics (vendor IN, 64 bytes: dde_emu_diag_t). Read only.
+#define PICOFLEX_GET_EMUDIAG 0xaau
+// v1h.1: gear status (vendor IN, 64 bytes: dde_gear_status_t, dde_gear.h). Read only.
+// Gear shifting on/off: SET_ENGINE wIndex bit 8 (1 = off, fixed P as v1h).
+#define PICOFLEX_GET_GEAR 0xabu
 
 // Pin used as the FR1 streamer's private frame-start mark (side-set) in the emu
 // build: GP25 = Pico 2 on-board LED, not on any header pin.
@@ -153,13 +171,93 @@ _Static_assert(__builtin_offsetof(dde_emu_stats_t, now_us) == 120, "v2 layout");
 #define DDE_EMU_STATS_V3_SIZE 192u
 
 void dde_emu_early_pins(void);   // core0 setup_pins: all TXD/TXEN of FR1/FR2 = SIO output high
+typedef struct __attribute__((packed)) {
+    uint8_t version;         // 1
+    uint8_t mode;            // ENG_MODE_*
+    uint8_t phase;           // ENG_* (0 off, 1 crank, 2 run, 3 stop, 4 stopped)
+    uint8_t stkl;            // last ST_KL nibble (0xFF = none yet)
+    uint8_t stkl_src;        // 0 = FlexRay 0x74, 1 = PT-CAN 0x12F
+    uint8_t brake;           // 1 = brake pressed in the last 300 ms
+    uint8_t last_reject;     // ENG_REJ_*
+    uint8_t e6_b3;           // 0xE6 state sent (0 = not overridden)
+    uint16_t rpm;            // engine speed sent (rpm)
+    uint16_t torque_raw;
+    uint32_t starts, stops, rejects;
+    uint32_t ms_since_start; // since the last start trigger (0xFFFFFFFF = none)
+    uint32_t ms_since_stkl;  // since the last ST_KL input
+    uint8_t cnt_hi, fb9_b2, e6_b4, e6_ready;
+    uint32_t seq;            // engine steps (one per FlexRay cycle)
+    // ---- v1h (version 2) ----
+    uint8_t profile;         // ENG_PROF_* of the current / last start
+    uint8_t profile_req;     // profile asked for by the PC (0 = build default)
+    uint8_t cas_flags;       // ENG_CAS_* : what the CAS did with our last start
+    uint8_t out_flags;       // bit0 = "injecting" (0x3FB d4 f0), bit1 = 0xE8 crank rate, bit2 = e8 fast
+    uint16_t d_to_82_ms;     // start trigger -> our 82 (0xFFFF = not reached)
+    uint16_t d_len_ms;       // start trigger -> ST_KL left D (0xFFFF = still D / not a D start)
+    int16_t d_end_after_82_ms;   // ST_KL left D this long after our 82 (<0 = before; 0x7FFF = n/a)
+    uint16_t t_rpm_ms;       // start trigger -> first rpm (0xFFFF = none)
+    uint32_t aborts;         // starts abandoned because D ended before our 82
+} dde_engine_status_t;
+#define DDE_ENGINE_STATUS_V1_SIZE 40u
+_Static_assert(sizeof(dde_engine_status_t) == 56, "engine status size");
+_Static_assert(__builtin_offsetof(dde_engine_status_t, profile) == DDE_ENGINE_STATUS_V1_SIZE, "v1 layout kept");
+
+// v1h echo-miss diagnostics (USB 0xaa, console "emu: diag ..."). Static slots 0..3 =
+// 0x26, 0x28, 0x29, 0x3D. "lm_" = snapshot of the LAST static frame that we fired but
+// never saw come back (echo miss). r = fire delay left (10 ns ticks) when the alarm ISR
+// loaded the frame; the fire happens r ticks later.
+typedef struct __attribute__((packed)) {
+    uint8_t version;             // 1 (v1h.1), 2 (v1h.2: snap_fail + bg_max_us)
+    uint8_t lm_slot;             // frame ID (low byte) of the last miss, 0 = none yet
+    uint8_t lm_cycle;
+    uint8_t lm_flags;            // bit0 alarm ISR interrupted a header ISR, bit1 slot re-armed by a
+                                 // reference < 40 us before its alarm, bit2 header CRC fail between fire
+                                 // and verdict, bit3 "no candidate" header IRQ in that window,
+                                 // bit4 the previous frame (ours) was still expected on the wire
+    uint16_t miss[4];            // echo misses per static slot
+    uint16_t late[4];            // not sent (late / busy) per static slot
+    int16_t lm_r_entry;          // fire delay at alarm ISR entry (ticks)
+    int16_t lm_r_final;          // fire delay handed to the fire SM (ticks)
+    int16_t lm_isr_late_us;      // alarm ISR entry - alarm time (us)
+    int16_t lm_sched_lead_us;    // alarm time - time of the last (re)schedule (us)
+    uint16_t lm_sched_ref;       // reference frame ID that last scheduled the slot
+    uint16_t lm_hdr_us;          // duration of the last header ISR before the fire (us)
+    uint16_t hdr_isr_max_us;     // longest FR1 header ISR (emu part) since reset
+    uint16_t alarm_isr_max_us;   // longest alarm ISR since reset
+    uint16_t miss_resched_close; // misses whose slot was re-armed < 40 us before its alarm
+    uint16_t miss_crc_near;      // misses with a header CRC fail between fire and verdict
+    uint16_t miss_preempt;       // misses whose alarm ISR interrupted a header ISR
+    uint16_t resched_guard_skips;// DDE_EMU_RESCHED_MIN_US kept the earlier schedule (0 when off)
+    uint32_t crc_fail;           // streamer: FR1/FR2 header CRC failures (total)
+    uint32_t no_cand;            // streamer: header IRQ with no 5 new bytes (total)
+    uint32_t static_fired;       // static frames handed to the fire SM
+    uint16_t hdr_over_10us;      // header ISR runs > 10 us
+    uint16_t resched_min_us;     // build setting DDE_EMU_RESCHED_MIN_US (0 = off)
+    uint16_t snap_fail;          // v1h.2: core 0 snapshot reads that failed / tore (last good one reused)
+    uint16_t bg_max_us;          // v1h.2: longest engine/gear step in the core 1 background
+} dde_emu_diag_t;
+_Static_assert(sizeof(dde_emu_diag_t) == 64, "emu diag size");
+
 void dde_emu_init_core1(void);   // core1, after setup_stream(): PIO0 TX + fire SMs, alarm IRQ
+// v1h.2: core1 background loop (after every interrupt): engine story + gear, never in an ISR
+void dde_emu_core1_poll(void);
 // FR1/FR2 header ISR (core1), FR1 frames with a good header CRC.
 void dde_emu_on_fr1_header(const uint8_t header[5], uint32_t start_pos, uint32_t ring_mask);
 void dde_emu_host_set(uint16_t wvalue);         // USB 0xa3 (core0)
 // core0, every valid FR1 frame (payload bytes): v1d uses 0xF1 byte 3 as the KL15 state
 void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes);
-void dde_emu_fill_stats(dde_emu_stats_t *st);   // USB 0xa4 / UART (core0)
+void dde_emu_fill_stats(dde_emu_stats_t *st);
+// v1g fake engine (see dde_engine.h). core0 calls.
+void dde_engine_host_set(uint16_t wvalue, uint16_t windex);    // USB 0xa7 (v1h: wIndex = profile)
+void dde_emu_fill_diag(dde_emu_diag_t *d);                      // USB 0xaa (core0)
+void dde_emu_stream_counts(uint32_t *crc_fail, uint32_t *no_cand);   // v1h: streamer header counters
+void dde_engine_fill_status(dde_engine_status_t *st);           // USB 0xa9 / UART
+void dde_engine_on_can(uint16_t id, const uint8_t *d, uint8_t len);   // PT-CAN 0x12F / 0x173 RX
+// Latest engine overlay for the PT-CAN emulator (core0). false = none / stale.
+bool dde_engine_snapshot(eng_out_t *out);
+void dde_engine_print(void);
+void dde_gear_fill_status(dde_gear_status_t *gs);   // v1h.1: USB 0xab (core0)
+void dde_gear_console_poll(void);   // v1h.1: core0 main loop, prints "GEAR: ..." lines   // USB 0xa4 / UART (core0)
 void dde_emu_print_stats(void);                 // UART line (core0); "EMU FAULT ..." once per first fault
 const char *dde_emu_fault_name(unsigned code);
 #endif

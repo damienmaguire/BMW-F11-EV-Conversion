@@ -23,6 +23,9 @@
 #define REG_C1MASK0    0x1F4
 #define REG_C1TREC     0x034
 #define REG_C1BDIAG1   0x03C
+#define REG_C1TEFCON   0x040
+#define REG_C1TEFSTA   0x044
+#define REG_C1TEFUA    0x048
 #define REG_C1FIFOCON1 0x05C
 #define REG_C1FIFOSTA1 0x060
 #define REG_C1FIFOUA1  0x064
@@ -69,6 +72,7 @@
 
 static const mcp251863_cfg_t *g_cfg;
 static uint32_t g_tx_seq;
+static bool g_tef_on;
 static uint8_t g_rx_plsize_bytes = 8;
 
 // nCS setup/hold: >= TSCK/2 before first SCK, >= TSCK high between frames
@@ -225,6 +229,7 @@ mcp_status_t mcp251863_init(const mcp251863_cfg_t *cfg, mcp_bittiming_t *bt_out,
     // Restricted retransmissions so an un-ACKed test frame is dropped after 3
     // retries instead of retrying forever. ISO CRC, BRS allowed.
     con &= ~(CON_STEF | CON_TXQEN | CON_BRSDIS);
+    if (cfg->tef_depth) con |= CON_STEF;  // v1f: TX event FIFO (our own TX, time stamped)
     con |= CON_RTXAT | CON_ISOCRCEN;
     con = (con & ~(7u << CON_REQOP_SHIFT)) | ((uint32_t)OPMOD_CONFIG << CON_REQOP_SHIFT);
     wr32(REG_C1CON, con);
@@ -233,6 +238,14 @@ mcp_status_t mcp251863_init(const mcp251863_cfg_t *cfg, mcp_bittiming_t *bt_out,
     uint32_t pre = cfg->osc_hz / 1000000u;
     if (pre < 1) pre = 1;
     wr32(REG_C1TSCON, TSCON_TBCEN | ((pre - 1) & 0x3FF));
+
+    // TEF (v1f, optional): tef_depth objects of 12 B (ID, flags+SEQ, SOF time stamp).
+    // No interrupt; polled by the PT-CAN emulation.
+    g_tef_on = cfg->tef_depth != 0;
+    if (g_tef_on) {
+        uint32_t d = cfg->tef_depth > 32 ? 32u : cfg->tef_depth;
+        wr32(REG_C1TEFCON, (1u << 5) | ((d - 1u) << 24)); // TEFTSEN, FSIZE
+    }
 
     // FIFO1: receive, time stamped, interrupt on not-empty and on overflow.
     g_rx_plsize_bytes = fd ? 64 : 8;
@@ -309,6 +322,32 @@ mcp_status_t mcp251863_send_fd_std(uint16_t id, const uint8_t *data, uint8_t len
 {
     if (len > 64) len = 64;
     return send_obj(MCP_FIFO_FD, id, data, len, true, brs);
+}
+
+uint32_t mcp251863_next_seq(void) { return g_tx_seq & 0x7FFFFFu; }
+
+int mcp251863_tef_read(mcp_tef_t *e, bool *overflow)
+{
+    if (!g_tef_on || !g_cfg) return 0;
+    uint8_t b[8];
+    mcp_read(REG_C1TEFSTA, b, 8); // C1TEFSTA + C1TEFUA in one transfer
+    uint32_t ua = b[4] | (b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+    if (ua == 0xFFFFFFFFu) return MCP_ERR_SPI;
+    if (b[0] & (1u << 3)) {                  // TEFOVIF
+        if (overflow) *overflow = true;
+        wr8(REG_C1TEFSTA, 0x00);             // clear (the other bits are read-only)
+    }
+    if (!(b[0] & 1u)) return 0;              // TEFNEIF: not empty
+    uint8_t o[12];
+    mcp_read((uint16_t)(RAM_START + (ua & 0xFFF)), o, sizeof o);
+    uint32_t te0 = o[0] | (o[1] << 8) | ((uint32_t)o[2] << 16) | ((uint32_t)o[3] << 24);
+    uint32_t te1 = o[4] | (o[5] << 8) | ((uint32_t)o[6] << 16) | ((uint32_t)o[7] << 24);
+    e->id = te0 & 0x7FFu;
+    e->dlc = (uint8_t)(te1 & 0xF);
+    e->seq = te1 >> 9;
+    e->ts = o[8] | (o[9] << 8) | ((uint32_t)o[10] << 16) | ((uint32_t)o[11] << 24);
+    wr8((uint16_t)(REG_C1TEFCON + 1), 0x01); // UINC: release the event
+    return 1;
 }
 
 mcp_status_t mcp251863_set_normal(bool normal)

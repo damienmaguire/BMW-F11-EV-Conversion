@@ -8,6 +8,7 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/clocks.h"
+#include "fw_version.h"
 #include "hardware/regs/io_bank0.h"
 #include "hardware/structs/iobank0.h"
 #include "hardware/pll.h"
@@ -25,6 +26,11 @@
 #include "flexray_pins.h"
 #include "flexray_ts.h"
 #include "pico_fr_record.h"
+#include "console.h"
+#if PICO_FLEXRAY_DDE_EMU
+#include "dde_emu.h"
+#include "dde_standalone.h"
+#endif
 #if PICO_FLEXRAY_BOARD_V2
 #include "v2_cantest.h"
 #endif
@@ -123,6 +129,7 @@ static void stats_print(const stream_stats_t *s, uint32_t prev_total, uint32_t p
            (unsigned long)s->usb_fifo_dropped, (unsigned long)flexray_ts_fine_hz());
 #if PICO_FLEXRAY_DDE_EMU
     dde_emu_print_stats();
+    dde_engine_print();
 #endif
 }
 
@@ -162,10 +169,21 @@ void core1_entry(void)
 
     setup_stream(pio1);
 #endif
+#if PICO_FLEXRAY_DDE_EMU
+    // v1h.2: the emulator's engine story + gear run here, outside the ISRs. WFE: the FR1
+    // header ISR raises SEV for a new cycle (latched, so none is lost between the poll and
+    // the WFE); any interrupt also wakes it (1 ms housekeeping alarm = >= 1 kHz).
+    while (1)
+    {
+        dde_emu_core1_poll();
+        __wfe();
+    }
+#else
     while (1)
     {
         __wfi();
     }
+#endif
 }
 
 void setup_pins(void)
@@ -236,6 +254,10 @@ int main(void)
 
     bool clock_configured = set_sys_clock_khz(100000, true);
     stdio_init_all();
+    // v1f: printf() no longer waits for the 115200 baud UART (the 5 s status print used to
+    // stop this loop for 120-160 ms, which cost PT-CAN frames). See console.c.
+    console_init();
+    printf("\n=== pico-flexray firmware %s (built %s) ===\n", FW_VERSION, __DATE__);
     printf("static_used=%lu B\n", (unsigned long)((uintptr_t)&__end__ - (uintptr_t)SRAM_BASE));
     print_ram_usage();
     // Initialize Panda USB interface
@@ -271,7 +293,11 @@ int main(void)
 #if !PICO_FLEXRAY_DDE_EMU
     setup_forwarder_with_injector(pio2);
 #else
+#if EMU_STANDALONE
+    dde_standalone_start();   // v1h.1: emulate from power-up, no host needed (see dde_standalone.h)
+#else
     printf("--- DDE EMULATOR build: TX on FR1 disabled until host enables it (vendor 0xa3) ---\n");
+#endif
 #endif
 
 
@@ -292,8 +318,18 @@ int main(void)
     while (true)
     {
         panda_usb_task();
+#if PICO_FLEXRAY_DDE_EMU
+        dde_gear_console_poll();   // v1h.1: "GEAR: P -> R (brake on) ..." lines on the console
+#if EMU_STANDALONE
+        dde_standalone_poll();     // v1h.1: re-send the standalone settings every 1 s, LED state
+#endif
+#endif
 #if PICO_FLEXRAY_BOARD_V2
         v2_cantest_poll(); // bounded CAN RX drain + 50 ms housekeeping, never waits on USB
+#elif PICO_FLEXRAY_DDE_EMU && EMU_STANDALONE
+        // V1 standalone: the LED is driven by dde_standalone.c (50 ms timer)
+        (void)next_led_toggle_time;
+        (void)led_on;
 #else
 		if (time_reached(next_led_toggle_time))
 		{
@@ -434,8 +470,11 @@ int main(void)
                     if (!panda_flexray_fifo_push(&frame)) {
                         stats.usb_fifo_dropped++;
                     }
-#if PICO_FR_USB_FAST
-                    // keep USB transfers re-armed during long notify bursts
+#if PICO_FR_USB_FAST || PICO_FLEXRAY_DDE_EMU
+                    // Keep the USB link moving during long bursts of FlexRay frames: USB
+                    // only sends the next 64-byte packet when panda_usb_task() runs, and
+                    // this loop can otherwise run for a while without calling it.
+                    // v1g.2: also in the DDE emulator builds (cheap: a few us, every 8 frames).
                     if ((capture_seq & 7u) == 0) panda_usb_task();
 #endif
                 }

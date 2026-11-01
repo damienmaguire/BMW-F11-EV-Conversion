@@ -59,8 +59,20 @@
 #define V2_CAN_SPI_MOSI_PIN 19 // SPI0 TX
 #define V2_CAN_INT_PIN 20      // nINT, active low (push-pull by default)
 #define V2_CAN_STBY_PIN 21     // transceiver STBY, high = standby
-// SPI clock: datasheet requires FSCK <= 0.85 * SYSCLK / 2 (6.8 MHz at 16 MHz).
+// SPI clock (the wires between the pico and the CAN chip).
+// The chip's limit depends on its own clock: FSCK <= 0.85 * SYSCLK / 2 (MCP2518FD /
+// MCP251863 data sheet, SPI timing). With the 16 MHz crystal on this board (no PLL:
+// the chip's x10 PLL is only for a 4 MHz crystal) the limit is 6.8 MHz, so 10 MHz is
+// NOT allowed. 4 MHz is what every car run so far used. v1g.2 keeps 4 MHz: the TX log
+// fix (ptcan_emu.c, tef_service) removed most of the SPI traffic, so a faster clock is
+// not needed, and it would be an untested electrical change. For a bench test only:
+// cmake -DV2_CAN_SPI_HZ=6250000 (the pico can make exactly 6.25 MHz from 100 MHz).
+#ifndef V2_CAN_SPI_HZ
 #define V2_CAN_SPI_HZ 4000000u
+#endif
+#if V2_CAN_SPI_HZ > 6800000u
+#error "V2_CAN_SPI_HZ above the MCP251863 limit for a 16 MHz crystal (0.85 * 16 MHz / 2 = 6.8 MHz)"
+#endif
 
 // Oscillator fitted on the controller (X1). Datasheet only specifies 4/20/40
 // MHz crystals; the V2 BOM has 16 MHz. Change here if X1 is replaced.

@@ -8,6 +8,9 @@ real DDE/EGS frames.
                                                the full set must stop on a foreign 0x3FD/...
   check_ptcan_replay.py BIN noegs    CAN_CSV   EGS off / DDE on: EGS set clean, full set faults
   check_ptcan_replay.py BIN vectors  CAN_CSV OUT   write E2E vectors (real frames) for 'e2e'
+  check_ptcan_replay.py BIN rate     CAN_CSV   v1f: run 6 (full emulation, no real DDE/EGS):
+                                               every cyclic slot is sent, also with the v1e
+                                               main-loop stall (150 ms every 5 s) modelled
 """
 import csv
 import subprocess
@@ -34,7 +37,7 @@ def check(ok, msg):
 def load(path):
     out = []
     for r in csv.DictReader(open(path)):
-        if r.get("ide", "0") == "1":
+        if r.get("ide", "0") == "1" or r.get("dir", "Rx") == "Tx":   # v1f logs: own TX rows are not bus input
             continue
         out.append((int(float(r["t_us"])), int(r["can_id"], 16), bytes.fromhex(r["data_hex"])))
     out.sort(key=lambda x: x[0])
@@ -60,7 +63,7 @@ def kl15_edges(frames):
     return ons, offs
 
 
-def run(binary, frames, exclude, mask, tag, extra_s=5.0):
+def run(binary, frames, exclude, mask, tag, extra_s=5.0, loop=()):
     rx = "/tmp/pte_rx_%s.txt" % tag
     with open(rx, "w") as f:
         for t, i, p in frames:
@@ -68,7 +71,7 @@ def run(binary, frames, exclude, mask, tag, extra_s=5.0):
                 continue
             f.write("%d %03x %s\n" % (t, i, p.hex()))
     out = "/tmp/pte_out_%s.txt" % tag
-    r = subprocess.run([binary, "replay", rx, "%x" % mask, out, str(extra_s)], capture_output=True, text=True)
+    r = subprocess.run([binary, "replay", rx, "%x" % mask, out, str(extra_s)] + [str(x) for x in loop], capture_output=True, text=True)
     print("  " + r.stdout.strip().replace("\n", "\n  "))
     check(r.returncode == 0, "%s: replay ran clean (no TX while silent, no forbidden ID)" % tag)
     tx, states, end = [], [], ""
@@ -133,18 +136,18 @@ def ddecan(binary, path):
         lim = {0x512: 700000, 0x518: 700000}.get(i, 250000 if pte_period(i) <= 100 else 1100000)
         check(abs(o[-1][0] - r[-1][0]) <= lim, "0x%03x last frame within %.2f s of the real one (%+.3f s)"
               % (i, lim / 1e6, (o[-1][0] - r[-1][0]) / 1e6))
-        need = {0x397: 90, 0x3FB: 30, 0x281: 40, 0x3F9: 80, 0x0A5: 80}.get(i, 97)
+        need = {0x397: 95, 0x3FB: 30, 0x281: 40, 0x3F9: 80, 0x0A5: 80}.get(i, 97)
         check(pct >= need, "0x%03x content matches the real frame %.1f%% (>= %d%%)" % (i, pct, need))
         ratio = len(o) / max(1, len(r))
-        lo = {0x3FB: 0.5, 0x397: 0.4, 0x3F9: 0.6, 0x381: 0.5, 0x3B3: 0.5}.get(i, 0.95)
+        lo = {0x3FB: 0.5, 0x397: 0.9, 0x3F9: 0.6, 0x381: 0.5, 0x3B3: 0.5}.get(i, 0.95)
         check(lo <= ratio <= 1.05, "0x%03x frame count %d vs real %d" % (i, len(o), len(r)))
     # 0x3F9 P-lock (bits 28-29 = 2) from W+0.61 s on
     bad = [t for t, p in ours.get(0x3F9, []) if t > W + 610000 and ((p[3] >> 4) & 3) != 2]
     check(not bad, "0x3F9 bits 28-29 = 2 (P) in every frame after W+0.61 s")
     l518 = ours[0x518][-1][0] - OFF
     l512 = ours[0x512][-1][0] - OFF
-    check(29.0e6 <= l518 <= 29.91e6, "0x518 released OFF+%.2f s (real OFF+%.2f)" % (l518 / 1e6, (real[0x518][-1][0] - OFF) / 1e6))
-    check(45.2e6 <= l512 <= 45.93e6, "0x512 released OFF+%.2f s (real OFF+%.2f)" % (l512 / 1e6, (real[0x512][-1][0] - OFF) / 1e6))
+    check(29.3e6 <= l518 < 30.0e6, "0x518 released OFF+%.2f s (real OFF+%.2f)" % (l518 / 1e6, (real[0x518][-1][0] - OFF) / 1e6))
+    check(45.3e6 <= l512 < 46.0e6, "0x512 released OFF+%.2f s (real OFF+%.2f)" % (l512 / 1e6, (real[0x512][-1][0] - OFF) / 1e6))
     ps = [t for t, s in states if s == "PREP_SLEEP"]
     lastnm = max(t for t, i, _ in fr if 0x500 <= i <= 0x57F and i not in (0x512, 0x518))
     check(bool(ps) and abs(ps[0] - (lastnm + 1950000)) <= 2000,
@@ -181,7 +184,7 @@ def absent_run(binary, path, tag, clean_mask, absent):
     if offs and clean_mask & (1 << TABLE.index(0x512)):
         o = [t for t, i, _ in tx if i == 0x512]
         if fr[-1][0] - offs[0] > 46e6:
-            check(o and 45.2e6 <= o[-1] - offs[0] <= 45.93e6, "%s: 0x512 released OFF+%.2f s" % (tag, (o[-1] - offs[0]) / 1e6))
+            check(o and 45.3e6 <= o[-1] - offs[0] < 46.0e6, "%s: 0x512 released OFF+%.2f s" % (tag, (o[-1] - offs[0]) / 1e6))
     ps = [t for t, s in states if s == "PREP_SLEEP"]
     print("  states: " + " ".join("%s@%+.2f" % (s, (t - W) / 1e6) for t, s in states))
     print("  PREP_SLEEP %s; last frame W+%.2f s" % ("never" if not ps else "W+%.2f" % ((ps[0] - W) / 1e6), (fr[-1][0] - W) / 1e6))
@@ -197,6 +200,42 @@ def absent_run(binary, path, tag, clean_mask, absent):
         ids = sorted({i for _, i, _ in tx2})
         check(len(ids) == len(TABLE), "%s: all %d IDs sent" % (tag, len(ids)))
         print("  full set states: " + " ".join("%s@%+.2f" % (s, (t - W) / 1e6) for t, s in st2))
+
+
+def rate(binary, path):
+    """v1f: run 6 lost ~2.8 % of the 20 ms frames (6,447 of 6,634 0x0A5): the v1e loop
+    stalled 120-160 ms every 5 s (blocking UART status print) and the core then skipped
+    the missed slots. v1f: non-blocking console (no stall) + late slots sent late +
+    16 frames per pass. Check: every cyclic slot between the first and last frame of
+    each ID is sent, with no stall and with the v1e stall modelled."""
+    fr = load(path)
+    W = fr[0][0]
+    present = {i for _, i, _ in fr if i in TABLE}
+    check(not present, "rate: no real DDE/EGS ID on the bus (full emulation)")
+    ons, offs = kl15_edges(fr)
+    for tag, loop, need in (("rate_nostall", (5.0, 16), 0.999), ("rate_stall", (5.0, 16, 5000, 150), 0.995),
+                            ("rate_stall_burst4", (5.0, 4, 5000, 150), 0.995)):
+        tx, states, end = run(binary, fr, set(), MASK_ALL, tag, loop[0], loop[1:])
+        check("fault=0" in end, "%s: no fault (%s)" % (tag, end))
+        ids = by_id([(t, i, p) for t, i, p in tx])
+        worst = []
+        for i in (0x0A5, 0x0D9, 0x0DC, 0x0F3, 0x08F, 0x2C4, 0x281, 0x3FD):
+            ts = [t for t, _ in ids.get(i, [])]
+            # count slots inside the stretch where this frame runs (ON window for 20/30 ms ones)
+            per = pte_period(i) * 1000
+            # split into continuous runs (a gap > 1 s = frame stopped on purpose)
+            runs, a = [], 0
+            for k in range(1, len(ts) + 1):
+                if k == len(ts) or ts[k] - ts[k - 1] > 1000000:
+                    runs.append((ts[a], ts[k - 1], k - a))
+                    a = k
+            slots = sum(round((b - a0) / per) + 1 for a0, b, _ in runs)
+            sent = sum(n for _, _, n in runs)
+            gaps = [ts[k] - ts[k - 1] for k in range(1, len(ts)) if ts[k] - ts[k - 1] <= 1000000]
+            worst.append((sent / slots if slots else 0, i, sent, slots, max(gaps) / 1000 if gaps else 0))
+        for r, i, sent, slots, g in worst:
+            check(r >= need, "%s: 0x%03x %d of %d slots (%.2f %%), longest gap %.0f ms" % (tag, i, sent, slots, 100 * r, g))
+        print("  " + end)
 
 
 def vectors(path, out):
@@ -221,6 +260,8 @@ def main():
         absent_run(binary, path, "noddecan", MASK_DDE, DDE)
     elif mode == "noegs":
         absent_run(binary, path, "noegs", MASK_EGS, EGS)
+    elif mode == "rate":
+        rate(binary, path)
     print("%s: %s" % (mode, "all checks passed" if not fails else "%d FAILED" % len(fails)))
     return 1 if fails else 0
 

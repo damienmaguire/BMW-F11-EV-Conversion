@@ -91,4 +91,15 @@ static inline void pio_sm_exec(PIO pio, uint sm, uint instr) { (void)pio; (void)
 static inline uint pio_encode_set(enum pio_src_dest d, uint v) { (void)d; return v; }
 static inline uint pio_encode_jmp(uint a) { return a; }
 static inline void pio_sm_put(PIO pio, uint sm, uint32_t v) { sim_pio_sm_put(pio, sm, v); }
+
+// v1h.1 standalone (src/dde_standalone.c): ms clock, repeating timer (not simulated), __sev
+typedef uint64_t absolute_time_t;
+static inline absolute_time_t get_absolute_time(void) { return time_us_32(); }
+static inline uint32_t to_ms_since_boot(absolute_time_t t) { return (uint32_t)(t / 1000u); }
+typedef struct repeating_timer repeating_timer_t;
+struct repeating_timer { int dummy; };
+typedef bool (*repeating_timer_callback_t)(repeating_timer_t *t);
+static inline bool add_repeating_timer_ms(int32_t ms, repeating_timer_callback_t cb, void *u, repeating_timer_t *t)
+{ (void)ms; (void)cb; (void)u; (void)t; return true; }
+static inline void __sev(void) {}
 #endif

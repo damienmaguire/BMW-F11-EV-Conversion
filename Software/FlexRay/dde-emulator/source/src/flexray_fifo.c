@@ -4,7 +4,11 @@
 #include <stdio.h>
 
 void flexray_fifo_init(flexray_fifo_t *fifo) {
-    memset(fifo, 0, sizeof(*fifo));
+    // v1g.2: only empty the queue (positions and counters). Clearing all 287 KB of
+    // frame memory is not needed and would hold up the USB request for a moment.
+    fifo->write_pos = 0;
+    fifo->read_pos = 0;
+    memset(&fifo->stats, 0, sizeof fifo->stats);
     printf("FlexRay FIFO initialized\n");
 }
 

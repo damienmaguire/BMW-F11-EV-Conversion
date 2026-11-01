@@ -1,6 +1,10 @@
 #include "dde_emu_core.h"
 #include <string.h>
 #include "dde_emu_tables.h"
+#include "dde_engine.h"
+
+// v1g: fake-engine overlay (NULL = off). Set by dde_emu.c (core 1) / the host tests.
+const eng_out_t *volatile dde_core_eng;
 
 // v1b: everything the header ISR / alarm ISR calls runs from RAM on the target
 // (no XIP cache misses with interrupts disabled). Host builds: plain functions.
@@ -10,6 +14,14 @@
 #else
 #define DDE_RAM(f) f
 #endif
+
+// v1h.2: byte copy for the ISR frame builders. A variable-length memcpy() is a call into
+// newlib's memcpy in flash (XIP), which can stall behind core 0's flash/USB traffic; the
+// empty asm keeps the compiler from turning the loop back into a memcpy call.
+static inline void dde_copy(uint8_t *d, const uint8_t *s, unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) { d[i] = s[i]; __asm__ volatile("" ::: "memory"); }
+}
 
 _Static_assert(5u + DDE_EMU_STATIC_PAYLOAD_BYTES + 3u == DDE_STATIC_FRAME_BYTES, "static frame size");
 _Static_assert(DDE_STATIC_FRAME_BYTES % 4u == 0, "PIO packs whole words");
@@ -130,6 +142,9 @@ unsigned DDE_RAM(dde_core_build_static_ph)(unsigned target, unsigned cycle, unsi
         if (target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0x80;
     }
     if (phase == DDE_PH_OFF && (ind & 0x04u) && target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0xC0;
+    // v1g: engine bytes go in before the alive counter + E2E CRC + frame CRC are computed
+    const eng_out_t *eo = dde_core_eng;
+    if (eo && (ind & 0x04u)) eng_patch_fr_static(eo, target, cycle, out + 5);
     if (ind & 0x04u) dde_core_e2e_apply(out + 5, target, cycle, counter);
     uint32_t c = dde_core_frame_crc(out, 5u + plen);
     out[5 + plen] = (uint8_t)(c >> 16);
@@ -147,7 +162,7 @@ unsigned DDE_RAM(dde_core_build_dyn)(unsigned cycle, uint8_t *out)
 {
     const unsigned plen = DDE_EMU_DYN_PAYLOAD_BYTES;
     dde_core_header((uint8_t)(DDE_EMU_DYN_IND & 0x1Cu), DDE_EMU_DYN_ID, plen / 2u, cycle, out);
-    memcpy(out + 5, dde_emu_dyn_payload, plen);
+    dde_copy(out + 5, dde_emu_dyn_payload, plen);   // v1h.2: from RAM (not a flash literal pool)
     uint32_t c = dde_core_frame_crc(out, 5u + plen);
     out[5 + plen] = (uint8_t)(c >> 16);
     out[6 + plen] = (uint8_t)(c >> 8);
@@ -281,9 +296,9 @@ bool DDE_RAM(dde_lock_poll)(dde_lock_t *l, uint32_t now_us)
 // ---------------------------------------------------------------------------
 // v1c dynamic PDUs. Content from run 4/5 real DDE ign-on (engine off), Fred's
 // dde_dynamic_ignon_template.csv (v1c_rank_after_emu2 1..6).
-const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT] = {0xE6, 0xE8, 0xFB, 0x10A, 0x142, 0x68};
+const uint16_t dde_dyn_slot_id[DDE_DYN_N_SLOT] DDE_TAB_RAM = {0xE6, 0xE8, 0xFB, 0x10A, 0x142, 0x68};
 
-const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU] = {
+const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU] DDE_TAB_RAM = {
     // Content = Fred's v1c spec (f11_emu2_dsc.md). Pre-ign: the real DDE (runs 4 and 5) sends
     // the same layout before ign after a ~0.3 s start-up, except 0xFB L9 = 1f 00 ff 7f 00 f3 ff ff.
     // id   slot           plen %8 kind               k     hi    hi_pre ign  period every4 start
@@ -313,7 +328,7 @@ const dde_dyn_pdu_t dde_dyn_pdu[DDE_DYN_N_PDU] = {
 // 0x142 payload B0..B29 per phase (B0 = counter, overwritten). Run 5 real DDE (FR2):
 // P0 0.06 s, P1 2.592 s, P2 13.592 s (ign on, engine off; B1/B5 are slow event counters that
 // went 03 -> 06 later in run 5 and differ in run 4 / the MITM capture: situational).
-const uint8_t dde_142_phase[DDE_142_NPH][DDE_142_PLEN] = {
+const uint8_t dde_142_phase[DDE_142_NPH][DDE_142_PLEN] DDE_TAB_RAM = {
     {0x00, 0x00, 0xFF, 0x00, 0x00, 0x00},
     {0x00, 0x01, 0xFF, 0x00, 0x00, 0x01},
     {0x00, 0x03, 0xFF, 0x00, 0x00, 0x03, 0x00, 0xA4, 0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x01, 0x00,
@@ -353,17 +368,20 @@ unsigned DDE_RAM(dde_core_build_dyn_pdu_ph)(unsigned p, unsigned cycle, unsigned
     bool preign = phase == 0;
     dde_core_header(0x04u, d->id, plen / 2u, cycle, out);
     uint8_t *pl = out + 5;
-    if (d->kind == DDE_DYN_KIND_CTR8) memcpy(pl, dde_142_phase[phase < DDE_142_NPH ? phase : DDE_142_P2], plen);
-    else memcpy(pl, preign ? d->payload_pre : d->payload, plen);
+    if (d->kind == DDE_DYN_KIND_CTR8) dde_copy(pl, dde_142_phase[phase < DDE_142_NPH ? phase : DDE_142_P2], plen);
+    else dde_copy(pl, preign ? d->payload_pre : d->payload, plen);
     uint8_t hi = preign ? d->hi_pre : d->hi;
     if (d->kind == DDE_DYN_KIND_CTR8) {
         pl[0] = (uint8_t)(counter % 255u);
     } else if (d->kind == DDE_DYN_KIND_E2E) {
         pl[1] = (uint8_t)(hi | (counter & 0x0Fu));
-        pl[0] = (uint8_t)(dde_core_crc8(&pl[1], plen - 1u) ^ d->k);
     } else if (d->kind == DDE_DYN_KIND_CTR) {
         pl[0] = (uint8_t)(hi | (counter & 0x0Fu));
     }
+    // v1g: engine bytes (may change the CounterHi nibble of 0xE6) before the E2E CRC
+    const eng_out_t *eo = dde_core_eng;
+    if (eo && !preign) eng_patch_fr_dyn(eo, p, pl);
+    if (d->kind == DDE_DYN_KIND_E2E) pl[0] = (uint8_t)(dde_core_crc8(&pl[1], plen - 1u) ^ d->k);
     uint32_t c = dde_core_frame_crc(out, 5u + plen);
     out[5 + plen] = (uint8_t)(c >> 16);
     out[6 + plen] = (uint8_t)(c >> 8);
@@ -434,7 +452,7 @@ bool DDE_RAM(dde_nm_allowed)(const dde_kl15_t *k, uint32_t abs_cycle, uint32_t n
     return rule && !ceil_hit;
 }
 
-unsigned dde_core_dyn_dts_bits(unsigned nbytes, unsigned tss_bits)
+unsigned DDE_RAM(dde_core_dyn_dts_bits)(unsigned nbytes, unsigned tss_bits)   // v1h.2: RAM (prepare_slot)
 {
     // frame bits: TSS + FSS + 10 per byte + FES(2); 10 ticks per bit
     uint32_t frame_q8 = (uint32_t)(tss_bits + 1u + 10u * nbytes + 2u) * 10u * 256u;
