@@ -28,6 +28,8 @@
 
 #define MS(x) ((uint64_t)(x) * 1000u)
 #define NO_E2E 0xFFFFu
+#define PTE_3FD_GEAR_EV_GAP_MS 5u    // v1h.1: min gap of the extra 0x3FD frame on a gear change
+                                     // (v1h.2: 20 -> 5 ms; a cyclic 0x3FD just before P delayed it +12 ms)
 
 // The 19 emulated frames, one line each. Columns:
 //   id     CAN identifier
@@ -51,7 +53,7 @@ const pte_def_t pte_defs[PTE_N_FRAMES] = {
     //            id  dlc kind             dataID  hi egs period first  evgap
     [PTE_F_3F9] = {0x3F9, 8, PTE_K_CYC_EVENT, 0x0037, 1, 0, 1000, 439, 1},
     [PTE_F_3FD] = {0x3FD, 5, PTE_K_CYCLIC, 0x0039, 0, 1, 100, 462, 0},
-    [PTE_F_39A] = {0x39A, 6, PTE_K_CYC_EVENT, NO_E2E, 0, 1, 1000, 462, 20},
+    [PTE_F_39A] = {0x39A, 6, PTE_K_CYC_EVENT, NO_E2E, 0, 1, 1000, 462, 5},   // v1h.2: event gap 20 -> 5 ms (Ian: the 20 ms gap delayed E1 / 01 / 03)
     [PTE_F_396] = {0x396, 2, PTE_K_CYCLIC, NO_E2E, 0, 1, 1000, 600, 0},
     [PTE_F_518] = {0x518, 8, PTE_K_NM518, NO_E2E, 0, 1, 645, 543, 0},
     [PTE_F_0A5] = {0x0A5, 8, PTE_K_CYCLIC, 0x0009, 0xF, 0, 20, 459, 0},
@@ -102,6 +104,8 @@ bool pte_id_forbidden(uint16_t id)
     case 0x380: case 0x580: case 0x5C0:
     case 0x27A:
     case 0x598:                                 // EGS service / its own CC 419 rides on it
+    case 0x197:                                 // v1h.1: the gear lever (GWS) - we only READ it
+    case 0x1AF:                                 // v1h.1: EGS range frame, PT-CAN2 only - never ours
         return true;
     default:
         return false;
@@ -242,6 +246,32 @@ void pte_on_rx(pte_t *p, uint16_t id, const uint8_t *data, uint8_t len, uint64_t
 
 // ---- content ------------------------------------------------------------------
 static inline uint64_t since(uint64_t now, uint64_t t) { return now >= t ? now - t : 0; }
+
+// 0x397 "e3" blips of the real DDE (run 4 ddecan): first at W+1.321 s, then these gaps
+// in ms (start to start), repeating. Each blip lasts 60 ms (shorter if the next one
+// starts sooner).
+static const uint16_t blip397_ms[] = {
+    4120, 840, 2240, 360, 540, 60, 780, 3260, 4040, 1380, 540, 1120, 1000, 420, 1760, 220,
+    180, 460, 1320, 1060, 1560, 1500, 1620, 3940, 260, 2020, 6420, 1560, 580, 2860, 1500,
+    840, 1660, 1620, 1540, 2440, 480, 4020, 1340, 120, 4019, 4040, 8660, 3820, 3560, 120,
+    720, 1300, 3939, 4140, 1920, 1000, 800, 220, 6220, 1860, 1340, 3160, 5180, 2440, 2560,
+    2000,
+};
+#define BLIP397_FIRST_US MS(1321)
+static bool blip397(uint64_t tw)
+{
+    static uint32_t cycle_ms;
+    if (!cycle_ms)
+        for (unsigned k = 0; k < sizeof blip397_ms / sizeof blip397_ms[0]; k++) cycle_ms += blip397_ms[k];
+    if (tw < BLIP397_FIRST_US) return false;
+    uint32_t pos = (uint32_t)(((tw - BLIP397_FIRST_US) / 1000u) % cycle_ms);
+    for (unsigned k = 0; k < sizeof blip397_ms / sizeof blip397_ms[0]; k++) {
+        uint32_t len = blip397_ms[k] < 80 ? blip397_ms[k] - 20u : 60u;
+        if (pos < blip397_ms[k]) return pos < len;
+        pos -= blip397_ms[k];
+    }
+    return false;
+}
 
 // Is the frame active (allowed to be sent) at now? (Ignoring the bus gate.)
 static bool frame_active(const pte_t *p, int i, uint64_t now)
@@ -396,13 +426,30 @@ static void build(const pte_t *p, int i, uint64_t now, uint8_t *d)
         break;
     }
     case PTE_F_397: {
-        // wake ramp fe e8 e9 e6 e4 -> e2 (the occasional 60 ms e3 blips are not reproduced)
+        // v1f: as the real DDE in run 4 (ddecan). Byte 1:
+        //  - wake ramp fe e8 e9 e6 e4, then e2;
+        //  - short "e3" blips (e3 for 60 ms, then back to e2) at irregular intervals,
+        //    replayed from the capture (blip397_ms[], repeating); each change goes out
+        //    at once as an event copy, which is why the real frame averages ~380 ms;
+        //  - after KL15 off the d1 walk df de dd de dd de dd de dd (first 0.8 s), dd held,
+        //    df at OFF+4.073 s, back to e2 at OFF+4.133 s (no blips during the walk).
         uint8_t b = 0xe2;
         if (tw < MS(461)) b = 0xfe;
         else if (tw < MS(481)) b = 0xe8;
         else if (tw < MS(541)) b = 0xe9;
         else if (tw < MS(601)) b = 0xe6;
         else if (tw < MS(661)) b = 0xe4;
+        else if (blip397(tw)) b = 0xe3;
+        // v1g: after a fake engine run the stop walk comes from the engine overlay instead
+        if (!on && ever && toff < MS(4133) && !(p->eng && p->eng->active)) {
+            static const struct { uint16_t ms; uint8_t v; } walk[] = {
+                {93, 0xdf}, {153, 0xde}, {273, 0xdd}, {373, 0xde}, {434, 0xdd}, {513, 0xde},
+                {634, 0xdd}, {713, 0xde}, {773, 0xdd}, {4073, 0xdf},
+            };
+            for (unsigned k = 0; k < sizeof walk / sizeof walk[0]; k++)
+                if (toff >= MS(walk[k].ms)) b = walk[k].v;
+            if (toff < MS(93)) b = 0xe2;
+        }
         d[0] = 0xc0; d[1] = b; d[2] = 0x00;
         break;
     }
@@ -459,6 +506,8 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
     int best = -1;
     uint64_t best_due = 0;
     uint8_t best_d[8];
+    bool best_cyc = false;
+    uint8_t best_chi = 0;
     for (int i = 0; i < PTE_N_FRAMES; i++) {
         if (!(p->mask & (1u << i))) continue;
         const pte_def_t *def = &pte_defs[i];
@@ -466,8 +515,11 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
         if (pte_id_forbidden(def->id)) continue;
         if (!frame_active(p, i, now)) continue;
         uint64_t due;
+        bool cyc = true;
         uint8_t d[8];
+        uint8_t chi = def->ctr_hi;
         build(p, i, now, d);
+        if (p->eng) eng_patch_can(p->eng, def->id, d, &chi);   // v1g fake engine bytes
         if (def->kind == PTE_K_NM512 && !p->kl15_ever) {
             due = p->wake_us + MS(nm512_pre_ms[f->nm_pre_idx]);
         } else if (def->kind == PTE_K_NM512 || def->kind == PTE_K_CC592) {
@@ -476,14 +528,25 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
             due = p->wake_us + MS(def->first_ms);
         } else {
             due = f->next_us;
-            if (def->kind == PTE_K_CYC_EVENT && payload_differs(def, d, f->last) &&
-                now >= f->last_tx_us + MS(def->ev_gap_ms))
+            // v1h.1: 0x3FD (gear display) also gets an extra frame when the gear changes, as the
+            // real EGS does (only while a gear is patched in, so fixed P stays exactly v1h)
+            const bool evk = def->kind == PTE_K_CYC_EVENT || (i == PTE_F_3FD && p->eng && p->eng->g_set);
+            const uint32_t gap = def->kind == PTE_K_CYC_EVENT ? def->ev_gap_ms : PTE_3FD_GEAR_EV_GAP_MS;
+            // v1h.2: the change is detected against the last INTENDED payload, not the last one
+            // sent: a wrong frame that went out (run 9: a stale snapshot showed the pawl locked
+            // at 76.83 s) must not swallow the real change event when it comes.
+            if (evk && payload_differs(def, d, f->want)) { memcpy(f->want, d, 8); f->ev_pend = true; }
+            if (evk && f->ev_pend && now >= f->last_tx_us + MS(gap) && now < due) {
                 due = now;   // on change
+                cyc = false;
+            }
         }
         if (now < due) continue;
         if (best < 0 || due < best_due) {
             best = i;
             best_due = due;
+            best_cyc = cyc;
+            best_chi = chi;
             memcpy(best_d, d, 8);
         }
     }
@@ -492,11 +555,13 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
     out->idx = (uint8_t)best;
     out->id = def->id;
     out->dlc = def->dlc;
+    out->due_us = best_due;
+    out->cyclic_slot = best_cyc && (def->kind == PTE_K_CYCLIC || def->kind == PTE_K_CYC_EVENT) && p->f[best].started;
     memcpy(out->data, best_d, 8);
     if (def->data_id != NO_E2E) {
         uint8_t c = p->f[best].ctr;
         c = (c >= 14) ? 0 : (uint8_t)(c + 1);
-        out->data[1] = (uint8_t)((def->ctr_hi << 4) | c);
+        out->data[1] = (uint8_t)(((best_chi & 0x0Fu) << 4) | c);
         out->data[0] = pte_e2e_crc(def->data_id, out->data, def->dlc);
     }
     return true;
@@ -515,7 +580,8 @@ void pte_commit(pte_t *p, const pte_tx_t *tx, uint64_t now)
             f->nm_pre_idx++;
             f->next_us = now + period;
         } else {
-            f->next_us = (f->next_us + period > now) ? f->next_us + period : now + period;
+            f->next_us += period;   // keep the NM grid (late slot still goes out)
+            if (f->next_us + PTE_CATCHUP_MAX_US <= now) { p->resyncs++; f->next_us = now + period; }
         }
         break;
     case PTE_K_CC592:
@@ -525,15 +591,29 @@ void pte_commit(pte_t *p, const pte_tx_t *tx, uint64_t now)
     default:
         if (!f->started) f->next_us = now + period;
         else if (now >= f->next_us) {
-            // cyclic slot (events do not move the grid); if far behind, restart the grid
+            // Cyclic slot (event copies do not move the grid). v1f: keep the grid even if
+            // we are late, so a frame that missed its slot still goes out (late) instead of
+            // being skipped; only if we are hopelessly behind, restart the grid from now.
             f->next_us += period;
-            if (f->next_us <= now) f->next_us = now + period;
+            if (f->next_us <= now) {
+                if (now - f->next_us > PTE_CATCHUP_MAX_US) {
+                    p->resyncs++;
+                    f->next_us = now + period;
+                }
+            }
         }
         break;
+    }
+    if (tx->cyclic_slot && now > tx->due_us) {
+        uint64_t late = now - tx->due_us;
+        if (late > PTE_LATE_US) p->late_sends++;
+        if (late > p->late_max_us) p->late_max_us = late > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)late;
     }
     f->started = true;
     f->last_tx_us = now;
     memcpy(f->last, tx->data, 8);
+    memcpy(f->want, tx->data, 8);   // v1h.2: this frame carries the current intent
+    f->ev_pend = false;
     f->tx++;
     p->tx_total++;
 }

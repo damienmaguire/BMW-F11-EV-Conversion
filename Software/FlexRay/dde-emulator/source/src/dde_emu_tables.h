@@ -8,13 +8,23 @@
 #define DDE_EMU_TABLES_H
 #include <stdint.h>
 
+// v1h.2: tables read by the core-1 FlexRay ISRs live in RAM on the target (no XIP
+// cache misses behind core 0's USB/flash traffic). Host builds: plain const.
+#ifndef DDE_TAB_RAM
+#if defined(__arm__)
+#define DDE_TAB_RAM __attribute__((section(".time_critical.ddetab")))
+#else
+#define DDE_TAB_RAM
+#endif
+#endif
+
 #define DDE_EMU_N_STATIC 4
 #define DDE_EMU_STATIC_PAYLOAD_BYTES 16
-static const uint16_t dde_emu_static_id[DDE_EMU_N_STATIC] = {0x26, 0x28, 0x29, 0x3D};
+static const uint16_t dde_emu_static_id[DDE_EMU_N_STATIC] DDE_TAB_RAM = {0x26, 0x28, 0x29, 0x3D};
 
 // Captured 5-bit header indicators per (target, cycle): bit4 reserved, bit3 payload
 // preamble, bit2 null-frame indicator (1 = data), bit1 sync, bit0 startup.
-static const uint8_t dde_emu_static_ind[DDE_EMU_N_STATIC][64] = {
+static const uint8_t dde_emu_static_ind[DDE_EMU_N_STATIC][64] DDE_TAB_RAM = {
     {0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0},
     {0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4},
     {0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 4},
@@ -22,7 +32,7 @@ static const uint8_t dde_emu_static_ind[DDE_EMU_N_STATIC][64] = {
 };
 
 // Captured payload per (target, cycle). Null frames are all zero.
-static const uint8_t dde_emu_static_payload[DDE_EMU_N_STATIC][64][DDE_EMU_STATIC_PAYLOAD_BYTES] = {
+static const uint8_t dde_emu_static_payload[DDE_EMU_N_STATIC][64][DDE_EMU_STATIC_PAYLOAD_BYTES] DDE_TAB_RAM = {
     { // 0x26
         {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // c0
         {0xED, 0xFE, 0xD0, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // c1
@@ -296,7 +306,7 @@ static const uint16_t dde_emu_static_captured_hcrc[DDE_EMU_N_STATIC] = {0x44D, 0
 // E2E groups: {target index, cycle mod 4, crc byte, span end (incl), K}
 // CRC byte = CRC8_0x1D(payload[crc+1 .. end]) ^ K; payload[crc+1] low nibble = alive counter.
 #define DDE_EMU_N_E2E 9
-static const uint8_t dde_emu_e2e[DDE_EMU_N_E2E][5] = {
+static const uint8_t dde_emu_e2e[DDE_EMU_N_E2E][5] DDE_TAB_RAM = {
     {0, 1, 0, 3, 0xA8}, // 0x26 c1
     {1, 1, 0, 7, 0x6A}, // 0x28 c1
     {1, 1, 8, 15, 0xD7}, // 0x28 c1
@@ -315,8 +325,8 @@ static const uint8_t dde_emu_e2e[DDE_EMU_N_E2E][5] = {
 // aimed to look like an on-grid car node at the pico.
 #define DDE_EMU_N_REFS 14
 static const uint16_t dde_emu_ref_id[DDE_EMU_N_REFS] = {0x07, 0x21, 0x27, 0x34, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3C, 0x41, 0x42, 0x44, 0x5A};
-static const int32_t dde_emu_ref_off_q8[DDE_EMU_N_REFS] = {5068623, 27035555, 32104811, 43087811, 44777840, 45622661, 46467437, 47312350, 48157124, 49846763, 54071273, 54916069, 56605634, 75192835};
-static const int32_t dde_emu_static_off_q8[DDE_EMU_N_STATIC] = {31259694, 32949440, 33794313, 50691775};
+static const int32_t dde_emu_ref_off_q8[DDE_EMU_N_REFS] DDE_TAB_RAM = {5068623, 27035555, 32104811, 43087811, 44777840, 45622661, 46467437, 47312350, 48157124, 49846763, 54071273, 54916069, 56605634, 75192835};
+static const int32_t dde_emu_static_off_q8[DDE_EMU_N_STATIC] DDE_TAB_RAM = {31259694, 32949440, 33794313, 50691775};
 #define DDE_EMU_SLOT_Q8 844873  // static slot, 33.00285 us
 
 // Dynamic frame 0x5C (EMU_DYN_5C builds only): minislot 0, cycles 1 mod 16.
@@ -325,7 +335,7 @@ static const int32_t dde_emu_static_off_q8[DDE_EMU_N_STATIC] = {31259694, 329494
 #define DDE_EMU_DYN_CYCLE_MASK 15
 #define DDE_EMU_DYN_CYCLE_BASE 1
 #define DDE_EMU_DYN_PAYLOAD_BYTES 8
-static const uint8_t dde_emu_dyn_payload[DDE_EMU_DYN_PAYLOAD_BYTES] = {0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x12};
+static const uint8_t dde_emu_dyn_payload[DDE_EMU_DYN_PAYLOAD_BYTES] DDE_TAB_RAM = {0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x12};
 static const int32_t dde_emu_dyn_off_q8 = 76880482; // 3003.144 us
 #define DDE_EMU_DYN_DTS_BITS 36 // DTS low bits for TSS=7: frame ends at minislot 3 AP
 

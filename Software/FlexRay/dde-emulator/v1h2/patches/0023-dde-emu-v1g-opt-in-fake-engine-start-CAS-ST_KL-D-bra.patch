@@ -1,0 +1,2356 @@
+From 58cf388bb377560753e5d6c2cb70a783c1df8453 Mon Sep 17 00:00:00 2001
+From: Grok Bot <bot@localhost>
+Date: Sat, 31 Oct 2026 17:12:32 +0000
+Subject: [PATCH 23/27] dde-emu v1g: opt-in fake engine start (CAS ST_KL D +
+ brake, or fallback ST_KL A + brake + logger command): FR
+ 0x26/28/29/3D/E6/FB/E8/142 and PT-CAN A5/F3/2C4/281/381/3B3/397/3F9/D9/8F
+ bytes per Ian's start sequence + Fred's running diff, CRCs/counters
+ recomputed; SET/GET_ENGINE 0xa7/0xa9; logger --fake-start; checker --engine;
+ host tests (test_engine, dyn-engine replay, real start capture)
+
+---
+ CMakeLists.txt                     |   2 +-
+ src/dde_emu.c                      | 175 +++++++++-
+ src/dde_emu.h                      |  37 +-
+ src/dde_emu_core.c                 |  12 +-
+ src/dde_emu_core.h                 |   3 +
+ src/dde_engine.c                   | 535 +++++++++++++++++++++++++++++
+ src/dde_engine.h                   | 135 ++++++++
+ src/main.c                         |   1 +
+ src/panda_usb.c                    |  13 +
+ src/ptcan_emu.c                    |   9 +-
+ src/ptcan_emu_core.c               |   9 +-
+ src/ptcan_emu_core.h               |   4 +
+ tests/host/run.sh                  |  33 +-
+ tests/host/savvy_fr_to_frts.py     |  31 ++
+ tests/host/test_cantx_logger.py    |  57 ++-
+ tests/host/test_dde_emu_replay.c   | 108 +++++-
+ tests/host/test_engine.c           | 407 ++++++++++++++++++++++
+ tools/dde_emu/check_emu_capture.py |  47 ++-
+ tools/ts_capture/fr_ts_logger.py   | 107 ++++++
+ tools/ts_capture/frts.py           |  49 +++
+ 20 files changed, 1754 insertions(+), 20 deletions(-)
+ create mode 100644 src/dde_engine.c
+ create mode 100644 src/dde_engine.h
+ create mode 100644 tests/host/savvy_fr_to_frts.py
+ create mode 100644 tests/host/test_engine.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 92689a3..d894ca9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -105,7 +105,7 @@ set(EMU_10A 1 CACHE STRING "1 = send dynamic 0x10A L5 (cycle%8==2, every 200 cyc
+ set(EMU_68 1 CACHE STRING "1 = send dynamic 0x68 L3 (cycle%8==5, every 1000 cycles, from wake)")
+ set(EMU_KL15_F1 1 CACHE STRING "1 = KL15 from 0xF1 byte 3 (0x20 on / 0xE0 off), 0x103 fallback; 0 = 0x103 only")
+ if (PICO_FLEXRAY_DDE_EMU)
+-    target_sources(pico_flexray PRIVATE src/dde_emu.c src/dde_emu_core.c)
++    target_sources(pico_flexray PRIVATE src/dde_emu.c src/dde_emu_core.c src/dde_engine.c)
+     pico_generate_pio_header(pico_flexray ${CMAKE_CURRENT_LIST_DIR}/src/dde_emu_tx.pio)
+     target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_DDE_EMU=1
+         EMU_SYNC_BITS=${EMU_SYNC_BITS} EMU_DYN_5C=${EMU_DYN_5C} EMU_TSS_BITS=${EMU_TSS_BITS}
+diff --git a/src/dde_emu.c b/src/dde_emu.c
+index 42ec8d7..74f9b39 100644
+--- a/src/dde_emu.c
++++ b/src/dde_emu.c
+@@ -217,6 +217,24 @@ static bool nm_ok, nm_ceiling;               // 0x5C allowed in this cycle / sto
+ static volatile struct { uint8_t b3; uint32_t us; uint32_t seq; } f1mb;   // core0 -> core1 (0xF1)
+ static uint32_t f1_seq_seen;
+ static uint8_t f1_last_b3;
++// v1g fake engine (core 1 owns `eng`; core 0 talks to it through the mailboxes below)
++static eng_t eng;
++static uint8_t eng_e6_seen, eng_fb9_seen;    // last event counters acted on
++static bool eng_e6_event;                    // send 0xE6 in the next possible cycle (any cycle)
++static uint8_t eng_e8_alt;                   // 0xE8 L9 fast rate: alternate 8 / 16 cycles
++// ST_KL inputs: [0] = FlexRay 0x74 (even cycles), [1] = PT-CAN 0x12F. Written by core 0.
++static volatile struct { uint8_t stkl, brake; uint32_t us, seq; } stmb[2];
++static uint32_t stmb_seen[2];
++static uint8_t eng_stkl_src;
++static volatile struct { uint32_t us, seq; } brmb;                 // PT-CAN 0x173 brake pressed
++static uint32_t brmb_seen;
++static volatile struct { uint8_t mode, cmd; uint32_t us, seq; } hostmb;   // USB 0xa7
++static uint32_t hostmb_seen;
++// core 1 -> core 0: snapshot for the PT-CAN emulator + status (seqlock: odd = writing)
++static volatile uint32_t eng_pub_seq;
++static eng_out_t eng_pub;
++static dde_engine_status_t eng_pub_st;
++static volatile uint32_t eng_pub_us;
+ static struct {
+     int16_t isr_late_min, isr_late_max;      // dynamic fires: alarm ISR entry - alarm time (us)
+     int16_t r_entry_min, r_final_min;        // dynamic fires: fire delay at ISR entry / after the final check
+@@ -594,6 +612,12 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
+         bool keep = pdu_started[p] && (int32_t)(abs_cycle - pdu_due[p]) < (int32_t)(per / 2u);
+         pdu_due[p] = keep ? pdu_due[p] + per : abs_cycle + per;
+         pdu_started[p] = true;
++        if (p == DDE_PDU_E6) eng_e6_event = false;
++        // v1g: while the fake engine runs the DDE sends 0xE8 L9 ~15/s (Fred): every 8 / 16 cycles
++        if (p == DDE_PDU_E89 && eng.out.e8_fast) {
++            eng_e8_alt ^= 1u;
++            pdu_due[p] = abs_cycle + (eng_e8_alt ? 8u : 16u);
++        }
+     }
+     fire_rec_t *f = &fired[i];
+     f->pending = true;
+@@ -739,6 +763,64 @@ static void __time_critical_func(dyn_skip)(unsigned ds, unsigned reason)
+     sat16_inc(&dcnt.reason[reason]);
+ }
+ 
++// v1g: once per FlexRay cycle (core 1): take the core-0 inputs, step the engine story,
++// turn content changes into event sends and publish a snapshot for core 0 (PT-CAN).
++static void __time_critical_func(engine_cycle)(uint32_t now)
++{
++    uint32_t hs = hostmb.seq;
++    if (hs != hostmb_seen) {
++        __dmb();
++        uint8_t mode = hostmb.mode, cmd = hostmb.cmd;
++        uint32_t us = hostmb.us;
++        hostmb_seen = hs;
++        eng_set_mode(&eng, mode, us);
++        if (cmd) eng_command(&eng, cmd, us);
++    }
++    for (unsigned k = 0; k < 2; k++) {
++        uint32_t sq = stmb[k].seq;
++        if (sq == stmb_seen[k]) continue;
++        __dmb();
++        uint8_t v = stmb[k].stkl, b = stmb[k].brake;
++        uint32_t us = stmb[k].us;
++        stmb_seen[k] = sq;
++        eng_input_stkl(&eng, v, b != 0, us);
++        eng_stkl_src = (uint8_t)k;
++    }
++    uint32_t bs = brmb.seq;
++    if (bs != brmb_seen) { __dmb(); uint32_t us = brmb.us; brmb_seen = bs; eng_input_brake(&eng, true, us); }
++    eng_step(&eng, now);
++    if (eng.out.e6_ev != eng_e6_seen) { eng_e6_seen = eng.out.e6_ev; if (eng.out.active) eng_e6_event = true; }
++    if (eng.out.fb9_ev != eng_fb9_seen) {
++        eng_fb9_seen = eng.out.fb9_ev;
++        if (eng.out.active) pdu_due[DDE_PDU_FB9] = abs_cycle;   // next 0xFB L9 cycle (cycle % 8 == 3)
++    }
++    // E8 fast rate just started: do not wait for the 1 s grid
++    if (eng.out.e8_fast && (int32_t)(pdu_due[DDE_PDU_E89] - abs_cycle) > 16) pdu_due[DDE_PDU_E89] = abs_cycle;
++    eng_pub_seq = eng_pub_seq + 1u;   // odd: writing
++    __dmb();
++    eng_pub = eng.out;
++    dde_engine_status_t *st = &eng_pub_st;
++    st->version = 1;
++    st->mode = eng.mode;
++    st->phase = eng.phase;
++    st->stkl = eng.stkl_have ? eng.stkl : 0xFF;
++    st->stkl_src = eng_stkl_src;
++    st->brake = eng.brake_have && (now - eng.brake_us) <= 300000u;
++    st->last_reject = (uint8_t)eng.last_reject;
++    st->e6_b3 = eng.out.e6_b3;
++    st->rpm = (uint16_t)(eng.out.rpm4 / 4u);
++    st->torque_raw = eng.out.torque;
++    st->starts = eng.starts; st->stops = eng.stops; st->rejects = eng.rejects;
++    st->ms_since_start = eng.starts ? (now - eng.t0) / 1000u : 0xFFFFFFFFu;
++    st->ms_since_stkl = eng.stkl_have ? (now - eng.stkl_us) / 1000u : 0xFFFFFFFFu;
++    st->cnt_hi = eng.out.cnt_hi; st->fb9_b2 = eng.out.fb9_b2; st->e6_b4 = eng.out.e6_b4;
++    st->e6_ready = eng.out.e6_ready;
++    st->seq = eng.out.seq;
++    eng_pub_us = now;
++    __dmb();
++    eng_pub_seq = eng_pub_seq + 1u;   // even: consistent
++}
++
+ // New cycle (first reference of it): close the old cycle, pick what is due.
+ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t seq0)
+ {
+@@ -755,6 +837,8 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t
+         for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { pdu_due[p] = 0; pdu_ctr[p] = 1; pdu_started[p] = false; }
+         dde_kl15_reset(&kl15, now);
+         f1_seq_seen = f1mb.seq;   // an 0xF1 of the previous wake does not count
++        eng_reset(&eng);          // v1g: a new wake starts with the engine "never started"
++        eng_e6_seen = eng.out.e6_ev; eng_fb9_seen = eng.out.fb9_ev; eng_e6_event = false;
+     } else {
+         abs_cycle += (cycle - abs_last_cycle) & 63u;
+     }
+@@ -771,6 +855,7 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t
+     }
+     dde_kl15_eval(&kl15, now, abs_cycle, EMU_KL15_F1 != 0);
+     nm_ok = dde_nm_allowed(&kl15, abs_cycle, now, &nm_ceiling);
++    engine_cycle(now);
+     if (nm_ceiling && dde_core_dyn_cycle(cycle)) sat16_inc(&lat.nm_ceiling_stops);
+     dde_dyn_track_start(&trk, cycle, true, seq0);
+     if (!tx_allowed()) return;
+@@ -781,6 +866,7 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t
+         if (dde_emu_test_dyn_pick) p = dde_emu_test_dyn_pick(ds, cycle);
+         if (p == -1) continue;
+ #endif
++        if (p == -2 && ds == DDE_DSLOT_E6 && eng_e6_event) p = DDE_PDU_E6;   // v1g: state change, send now
+         if (p == -2) {
+             p = dde_core_dyn_pdu_for(ds, cycle);
+             if (p < 0) continue;
+@@ -957,6 +1043,8 @@ void dde_emu_init_core1(void)
+ {
+     dde_core_init();
+     dde_lock_reset(&lock);
++    eng_reset(&eng);
++    dde_core_eng = &eng.out;   // v1g overlay: does nothing until a start (mode is off by default)
+     for (unsigned i = 0; i < DDE_EMU_N_STATIC; i++) for (unsigned c = 0; c < 4; c++) counter[i][c] = 1;
+     for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { pdu_ctr[p] = 1; pdu_due[p] = 0; }
+     for (unsigned d = 0; d < DDE_DYN_N_SLOT; d++) dyn_due[d] = -1;
+@@ -1118,7 +1206,17 @@ void dde_emu_fill_stats(dde_emu_stats_t *st)
+ 
+ void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes)
+ {
+-    (void)cycle;
++    if (id == 0x74u) {
++        // v1g: 0x74 even cycles = same PDU as PT-CAN 0x12F (Fred): b3 low nibble ST_KL,
++        // b7 bits 0-1 = 3 brake pressed. Odd cycles carry another PDU: ignore them.
++        if ((cycle & 1u) || nbytes < 7u) return;
++        stmb[0].stkl = payload[2] & 0x0Fu;
++        stmb[0].brake = (payload[6] & 3u) == 3u;
++        stmb[0].us = time_us_32();
++        __dmb();
++        stmb[0].seq = stmb[0].seq + 1u;
++        return;
++    }
+     if (id != 0xF1u || nbytes < 3u) return;
+     f1mb.b3 = payload[2];
+     f1mb.us = time_us_32();
+@@ -1177,3 +1275,78 @@ void dde_emu_print_stats(void)
+            s.nm_ceiling_stops, s.ph142, s.isr_late_min_us, s.isr_late_max_us, s.r_entry_min, s.r_final_min,
+            s.topup_timeouts, s.hk_deferred, s.dyn_flags2);
+ }
++
++// ---------------------------------------------------------------- v1g engine, core0 side
++void dde_engine_on_can(uint16_t id, const uint8_t *d, uint8_t len)
++{
++    if (id == 0x12Fu && len >= 7u) {          // ST_KL d2 low nibble, brake d6 bits 0-1
++        stmb[1].stkl = d[2] & 0x0Fu;
++        stmb[1].brake = (d[6] & 3u) == 3u;
++        stmb[1].us = time_us_32();
++        __dmb();
++        stmb[1].seq = stmb[1].seq + 1u;
++    } else if (id == 0x173u && len >= 8u && (d[7] & 3u) == 3u) {   // brake pressed
++        brmb.us = time_us_32();
++        __dmb();
++        brmb.seq = brmb.seq + 1u;
++    }
++}
++
++void dde_engine_host_set(uint16_t wvalue)
++{
++    static uint8_t last_mode = 0xFF;
++    uint8_t mode = (uint8_t)(wvalue & 0xFFu), cmd = (uint8_t)(wvalue >> 8);
++    if (mode > ENG_MODE_FALLBACK) mode = ENG_MODE_OFF;
++    if (cmd > ENG_CMD_STOP) cmd = ENG_CMD_NONE;
++    hostmb.mode = mode;
++    hostmb.cmd = cmd;
++    hostmb.us = time_us_32();
++    __dmb();
++    hostmb.seq = hostmb.seq + 1u;
++    static const char *const mn[] = {"off", "cas", "fallback"};
++    if (mode != last_mode) printf("engine: fake start mode %s\n", mn[mode]);
++    if (cmd == ENG_CMD_START) printf("engine: start command\n");
++    if (cmd == ENG_CMD_STOP) printf("engine: stop command\n");
++    last_mode = mode;
++}
++
++static bool engine_read(eng_out_t *o, dde_engine_status_t *st, uint32_t *us)
++{
++    for (int tries = 0; tries < 8; tries++) {
++        uint32_t a = eng_pub_seq;
++        if (a & 1u) continue;
++        __dmb();
++        if (o) *o = eng_pub;
++        if (st) *st = eng_pub_st;
++        if (us) *us = eng_pub_us;
++        __dmb();
++        if (eng_pub_seq == a) return a != 0;
++    }
++    return false;
++}
++
++bool dde_engine_snapshot(eng_out_t *out)
++{
++    uint32_t us;
++    if (!engine_read(out, 0, &us)) return false;
++    // FlexRay not stepping (bus asleep / lock lost) for 500 ms: no PT-CAN overlay either
++    if (time_us_32() - us > 500000u) return false;
++    return out->active != 0;
++}
++
++void dde_engine_fill_status(dde_engine_status_t *st)
++{
++    if (!engine_read(0, st, 0)) { memset(st, 0, sizeof *st); st->version = 1; st->stkl = 0xFF; }
++}
++
++void dde_engine_print(void)
++{
++    dde_engine_status_t s;
++    dde_engine_fill_status(&s);
++    if (s.mode == 0 && s.starts == 0 && s.rejects == 0) return;
++    printf("engine: mode=%u phase=%s rpm=%u e6=%02X/%02X ready=%u stkl=%X(%s) brake=%u starts=%lu stops=%lu "
++           "rejects=%lu last_reject=%u\n",
++           s.mode, eng_phase_name(s.phase), s.rpm, s.e6_b3, s.e6_b4, s.e6_ready, s.stkl,
++           s.stkl_src ? "12F" : "74", s.brake, (unsigned long)s.starts, (unsigned long)s.stops,
++           (unsigned long)s.rejects, s.last_reject);
++}
+diff --git a/src/dde_emu.h b/src/dde_emu.h
+index a52348f..646334d 100644
+--- a/src/dde_emu.h
++++ b/src/dde_emu.h
+@@ -5,11 +5,20 @@
+ // See Software/FlexRay/dde-emulator/README.md.
+ #ifndef DDE_EMU_H
+ #define DDE_EMU_H
++#include <stdbool.h>
+ #include <stdint.h>
+ #include "dde_emu_core.h"
++#include "dde_engine.h"
+ 
+ #define PICOFLEX_SET_EMU   0xa3u   // vendor OUT, wValue 1 = enable/keepalive, 0 = disable + clear fault
+ #define PICOFLEX_GET_EMU   0xa4u   // vendor IN, up to 256 bytes: dde_emu_stats_t (first 64 = v1, 128 = v2, 192 = v3 layout)
++// v1g fake engine start (opt-in, OFF after every reset):
++//   SET_ENGINE (vendor OUT) wValue low byte = mode (0 off, 1 CAS start, 2 fallback start),
++//   high byte = command (0 none / keepalive, 1 start, 2 stop). Repeat at least every 3 s
++//   (the logger sends it every second) or the mode falls back to off (engine "stops").
++//   GET_ENGINE (vendor IN) = dde_engine_status_t.
++#define PICOFLEX_SET_ENGINE 0xa7u
++#define PICOFLEX_GET_ENGINE 0xa9u
+ 
+ // Pin used as the FR1 streamer's private frame-start mark (side-set) in the emu
+ // build: GP25 = Pico 2 on-board LED, not on any header pin.
+@@ -153,13 +162,39 @@ _Static_assert(__builtin_offsetof(dde_emu_stats_t, now_us) == 120, "v2 layout");
+ #define DDE_EMU_STATS_V3_SIZE 192u
+ 
+ void dde_emu_early_pins(void);   // core0 setup_pins: all TXD/TXEN of FR1/FR2 = SIO output high
++typedef struct __attribute__((packed)) {
++    uint8_t version;         // 1
++    uint8_t mode;            // ENG_MODE_*
++    uint8_t phase;           // ENG_* (0 off, 1 crank, 2 run, 3 stop, 4 stopped)
++    uint8_t stkl;            // last ST_KL nibble (0xFF = none yet)
++    uint8_t stkl_src;        // 0 = FlexRay 0x74, 1 = PT-CAN 0x12F
++    uint8_t brake;           // 1 = brake pressed in the last 300 ms
++    uint8_t last_reject;     // ENG_REJ_*
++    uint8_t e6_b3;           // 0xE6 state sent (0 = not overridden)
++    uint16_t rpm;            // engine speed sent (rpm)
++    uint16_t torque_raw;
++    uint32_t starts, stops, rejects;
++    uint32_t ms_since_start; // since the last start trigger (0xFFFFFFFF = none)
++    uint32_t ms_since_stkl;  // since the last ST_KL input
++    uint8_t cnt_hi, fb9_b2, e6_b4, e6_ready;
++    uint32_t seq;            // engine steps (one per FlexRay cycle)
++} dde_engine_status_t;
++_Static_assert(sizeof(dde_engine_status_t) == 40, "engine status size");
++
+ void dde_emu_init_core1(void);   // core1, after setup_stream(): PIO0 TX + fire SMs, alarm IRQ
+ // FR1/FR2 header ISR (core1), FR1 frames with a good header CRC.
+ void dde_emu_on_fr1_header(const uint8_t header[5], uint32_t start_pos, uint32_t ring_mask);
+ void dde_emu_host_set(uint16_t wvalue);         // USB 0xa3 (core0)
+ // core0, every valid FR1 frame (payload bytes): v1d uses 0xF1 byte 3 as the KL15 state
+ void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes);
+-void dde_emu_fill_stats(dde_emu_stats_t *st);   // USB 0xa4 / UART (core0)
++void dde_emu_fill_stats(dde_emu_stats_t *st);
++// v1g fake engine (see dde_engine.h). core0 calls.
++void dde_engine_host_set(uint16_t wvalue);                      // USB 0xa7
++void dde_engine_fill_status(dde_engine_status_t *st);           // USB 0xa9 / UART
++void dde_engine_on_can(uint16_t id, const uint8_t *d, uint8_t len);   // PT-CAN 0x12F / 0x173 RX
++// Latest engine overlay for the PT-CAN emulator (core0). false = none / stale.
++bool dde_engine_snapshot(eng_out_t *out);
++void dde_engine_print(void);   // USB 0xa4 / UART (core0)
+ void dde_emu_print_stats(void);                 // UART line (core0); "EMU FAULT ..." once per first fault
+ const char *dde_emu_fault_name(unsigned code);
+ #endif
+diff --git a/src/dde_emu_core.c b/src/dde_emu_core.c
+index 8ac0fe5..69ad751 100644
+--- a/src/dde_emu_core.c
++++ b/src/dde_emu_core.c
+@@ -1,6 +1,10 @@
+ #include "dde_emu_core.h"
+ #include <string.h>
+ #include "dde_emu_tables.h"
++#include "dde_engine.h"
++
++// v1g: fake-engine overlay (NULL = off). Set by dde_emu.c (core 1) / the host tests.
++const eng_out_t *volatile dde_core_eng;
+ 
+ // v1b: everything the header ISR / alarm ISR calls runs from RAM on the target
+ // (no XIP cache misses with interrupts disabled). Host builds: plain functions.
+@@ -130,6 +134,9 @@ unsigned DDE_RAM(dde_core_build_static_ph)(unsigned target, unsigned cycle, unsi
+         if (target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0x80;
+     }
+     if (phase == DDE_PH_OFF && (ind & 0x04u) && target == 2 && (cycle & 3u) == 3) out[5 + 7] = 0xC0;
++    // v1g: engine bytes go in before the alive counter + E2E CRC + frame CRC are computed
++    const eng_out_t *eo = dde_core_eng;
++    if (eo && (ind & 0x04u)) eng_patch_fr_static(eo, target, cycle, out + 5);
+     if (ind & 0x04u) dde_core_e2e_apply(out + 5, target, cycle, counter);
+     uint32_t c = dde_core_frame_crc(out, 5u + plen);
+     out[5 + plen] = (uint8_t)(c >> 16);
+@@ -360,10 +367,13 @@ unsigned DDE_RAM(dde_core_build_dyn_pdu_ph)(unsigned p, unsigned cycle, unsigned
+         pl[0] = (uint8_t)(counter % 255u);
+     } else if (d->kind == DDE_DYN_KIND_E2E) {
+         pl[1] = (uint8_t)(hi | (counter & 0x0Fu));
+-        pl[0] = (uint8_t)(dde_core_crc8(&pl[1], plen - 1u) ^ d->k);
+     } else if (d->kind == DDE_DYN_KIND_CTR) {
+         pl[0] = (uint8_t)(hi | (counter & 0x0Fu));
+     }
++    // v1g: engine bytes (may change the CounterHi nibble of 0xE6) before the E2E CRC
++    const eng_out_t *eo = dde_core_eng;
++    if (eo && !preign) eng_patch_fr_dyn(eo, p, pl);
++    if (d->kind == DDE_DYN_KIND_E2E) pl[0] = (uint8_t)(dde_core_crc8(&pl[1], plen - 1u) ^ d->k);
+     uint32_t c = dde_core_frame_crc(out, 5u + plen);
+     out[5 + plen] = (uint8_t)(c >> 16);
+     out[6 + plen] = (uint8_t)(c >> 8);
+diff --git a/src/dde_emu_core.h b/src/dde_emu_core.h
+index 6be054c..9f0cce4 100644
+--- a/src/dde_emu_core.h
++++ b/src/dde_emu_core.h
+@@ -238,4 +238,7 @@ void dde_dyn_track_header(dde_dyn_track_t *t, unsigned id, unsigned payload_byte
+ // Predict the minislot for our frame id X. Returns DDE_DYN_OK or a skip reason.
+ int dde_dyn_predict(const dde_dyn_track_t *t, unsigned id, unsigned *m_out);
+ 
++// v1g: fake-engine overlay used by the frame builders (NULL = off, the default).
++#include "dde_engine.h"
++extern const eng_out_t *volatile dde_core_eng;
+ #endif
+diff --git a/src/dde_engine.c b/src/dde_engine.c
+new file mode 100644
+index 0000000..f130a97
+--- /dev/null
++++ b/src/dde_engine.c
+@@ -0,0 +1,535 @@
++// v1g fake engine start. See dde_engine.h for the plain-English overview.
++// Every number below cites where it comes from:
++//   Ian  = flexray-re-notes/analysis/dde_start_sequence.md/.csv
++//   Fred = f11_fr_engine_running_diff.md/.csv
++//   3krev = egs-logs/F11_4log_3krev.csv (real DDE: D at 4.792 s, 82 at ~5.80 s, stop ~19.3 s)
++#include "dde_engine.h"
++#include <string.h>
++#include "dde_emu_core.h"   // DDE_PDU_* indices
++
++// Runs inside the FlexRay header ISR on core 1: code in RAM on the target (as dde_emu_core.c).
++#if defined(__arm__)
++#include "pico.h"
++#define ENG_RAM(f) __time_critical_func(f)
++#else
++#define ENG_RAM(f) f
++#endif
++
++static uint32_t ENG_RAM(since_ms)(uint32_t now, uint32_t t) { return (now - t) / 1000u; }
++
++const char *eng_phase_name(unsigned phase)
++{
++    static const char *const n[] = {"off", "crank", "run", "stop", "stopped"};
++    return phase < 5 ? n[phase] : "?";
++}
++
++void eng_reset(eng_t *e)
++{
++    uint8_t mode = e->mode; uint32_t mode_us = e->mode_us; bool mode_seen = e->mode_seen;
++    uint32_t starts = e->starts, stops = e->stops, rejects = e->rejects, lr = e->last_reject;
++    memset(e, 0, sizeof *e);
++    e->mode = mode; e->mode_us = mode_us; e->mode_seen = mode_seen;
++    e->starts = starts; e->stops = stops; e->rejects = rejects; e->last_reject = lr;
++    e->out.e6_ready = 0xFF;
++}
++
++void ENG_RAM(eng_set_mode)(eng_t *e, uint8_t mode, uint32_t now_us)
++{
++    if (mode > ENG_MODE_FALLBACK) mode = ENG_MODE_OFF;
++    e->mode = mode;
++    e->mode_us = now_us;
++    e->mode_seen = true;
++}
++
++void ENG_RAM(eng_command)(eng_t *e, uint8_t cmd, uint32_t now_us)
++{
++    e->cmd = cmd;
++    e->cmd_us = now_us;
++}
++
++void ENG_RAM(eng_input_stkl)(eng_t *e, uint8_t stkl, bool brake, uint32_t now_us)
++{
++    stkl &= 0x0F;
++    if (stkl >= 0xE) return;          // 0xE/0xF = invalid / not available: ignore
++    e->stkl = stkl;
++    e->stkl_us = now_us;
++    e->stkl_have = true;
++    if (brake) { e->brake_us = now_us; e->brake_have = true; }
++}
++
++void ENG_RAM(eng_input_brake)(eng_t *e, bool brake, uint32_t now_us)
++{
++    if (brake) { e->brake_us = now_us; e->brake_have = true; }
++}
++
++static bool ENG_RAM(brake_recent)(const eng_t *e, uint32_t now, uint32_t ms)
++{
++    return e->brake_have && since_ms(now, e->brake_us) <= ms;
++}
++
++// --- rpm shapes (rpm * 4) ----------------------------------------------------------
++// exp(-x/10) * 1000 for x = 0..50 (tenths of the time constant)
++static const uint16_t exp_tab[51] = {
++    1000, 905, 819, 741, 670, 607, 549, 497, 449, 407, 368, 333, 301, 273, 247, 223, 202, 183,
++    165, 150, 135, 122, 111, 100, 91, 82, 74, 67, 61, 55, 50, 45, 41, 37, 33, 30, 27, 25,
++    22, 20, 18, 17, 15, 14, 12, 11, 10, 9, 8, 7, 7};
++
++static uint32_t ENG_RAM(tri)(uint32_t t_ms, uint32_t period_ms, uint32_t amp)   // 0..amp..0
++{
++    uint32_t ph = t_ms % period_ms, half = period_ms / 2u;
++    return ph < half ? amp * ph / half : amp * (period_ms - ph) / half;
++}
++
++// Engine speed while starting / running, t = ms since the start trigger (T0).
++static uint32_t ENG_RAM(rpm4_start)(uint32_t t)
++{
++    if (t < ENG_T_RPM) return 0;
++    if (t < ENG_T_FIRE) {
++        // Cranking ~115..210 rpm with compression ripple (3krev A5: 114 -> 204 rpm)
++        uint32_t base = 115u + (t - ENG_T_RPM) * 60u / (ENG_T_FIRE - ENG_T_RPM);
++        return 4u * (base + tri(t, 140u, 35u));
++    }
++    if (t < ENG_T_FIRE + ENG_T_RUNUP) {
++        // First fire: run-up 200 -> 1000 rpm (3krev: 287 rpm at +0.74 s, 1005 rpm at +1.0 s)
++        return 4u * (200u + (t - ENG_T_FIRE) * 800u / ENG_T_RUNUP);
++    }
++    if (t < ENG_T_FLARE_END) return 4u * (1000u + tri(t, 300u, 60u));   // start flare 1000-1060
++    // Settle to idle: 780 + 260 * exp(-(t - 1.5 s) / 1 s), then 780 rpm (30 0C) with a
++    // +-1 rpm wobble so the value is alive like a real idle
++    uint32_t x = (t - ENG_T_FLARE_END) / (ENG_TAU_IDLE_MS / 10u);
++    uint32_t over = x > 50u ? 0u : 260u * exp_tab[x] / 1000u;
++    return 4u * (ENG_IDLE_RPM - 1u + over) + tri(t, 1200u, 8u);
++}
++
++// Stop: idle held 380 ms, then the run-down captured in 3krev (stop at 19.28 s), as a
++// fraction of the rpm at the stop request (per mille), t = ms since TS.
++static const struct { uint16_t ms, pm; } stop_tab[] = {
++    {0, 1000}, {380, 1000}, {402, 912}, {542, 651}, {661, 441}, {762, 359}, {882, 92}, {1180, 77}, {1200, 0}};
++#define ENG_T_STOP_ZERO 1200u
++
++static uint32_t ENG_RAM(rpm4_stop)(uint32_t rpm4_at_stop, uint32_t t)
++{
++    for (unsigned k = 1; k < sizeof stop_tab / sizeof stop_tab[0]; k++) {
++        if (t < stop_tab[k].ms) {
++            uint32_t a = stop_tab[k - 1].ms, b = stop_tab[k].ms;
++            uint32_t pa = stop_tab[k - 1].pm, pb = stop_tab[k].pm;
++            uint32_t pm = pa + (uint32_t)((int32_t)(pb - pa) * (int32_t)(t - a) / (int32_t)(b - a));
++            return rpm4_at_stop * pm / 1000u;
++        }
++    }
++    return 0;
++}
++
++// --- triggers ------------------------------------------------------------------------
++static void ENG_RAM(start_now)(eng_t *e, uint32_t now)
++{
++    e->phase = ENG_CRANK;
++    e->t0 = now;
++    e->cur_run = false;
++    e->t9_have = false;
++    e->b142_stop = false;
++    e->starts++;
++    e->cmd = ENG_CMD_NONE;
++    e->last_reject = ENG_REJ_NONE;
++}
++
++static void ENG_RAM(stop_now)(eng_t *e, uint32_t now)
++{
++    if (!e->cur_run && e->phase == ENG_CRANK) {
++        // aborted before the first rpm (first 95 ms): nothing was shown yet, just go back
++        // (to "off" in a new wake, to "stopped" after an earlier run)
++        e->phase = e->has_run ? ENG_STOPPED : ENG_OFF;
++        e->cmd = ENG_CMD_NONE;
++        return;
++    }
++    e->rpm_at_stop = e->out.rpm4;
++    e->ts = now;
++    e->phase = ENG_STOP;
++    e->stops++;
++    e->cmd = ENG_CMD_NONE;
++}
++
++static void ENG_RAM(reject)(eng_t *e, unsigned why)
++{
++    if (e->last_reject != why) e->rejects++;
++    e->last_reject = why;
++}
++
++static void ENG_RAM(check_start)(eng_t *e, uint32_t now)
++{
++    if (e->phase != ENG_OFF && e->phase != ENG_STOPPED) return;
++    bool stkl_fresh = e->stkl_have && since_ms(now, e->stkl_us) <= 300u;
++    if (e->mode == ENG_MODE_CAS) {
++        if (!stkl_fresh || e->stkl != 0xD) return;
++        if (!brake_recent(e, now, ENG_BRAKE_MS_CAS)) { reject(e, ENG_REJ_NO_BRAKE); return; }
++        start_now(e, now);
++    } else if (e->mode == ENG_MODE_FALLBACK) {
++        bool cmd = e->cmd == ENG_CMD_START && since_ms(now, e->cmd_us) <= ENG_CMD_MS;
++        if (!cmd) return;
++        // a refused command is used up: the driver has to type it again (no surprise start later)
++        if (!stkl_fresh || (e->stkl != 0xA && e->stkl != 0xD)) { reject(e, ENG_REJ_STKL); e->cmd = ENG_CMD_NONE; return; }
++        if (!brake_recent(e, now, ENG_BRAKE_MS_FB)) { reject(e, ENG_REJ_NO_BRAKE); e->cmd = ENG_CMD_NONE; return; }
++        start_now(e, now);
++    } else if (e->cmd == ENG_CMD_START) {
++        reject(e, ENG_REJ_MODE);
++        e->cmd = ENG_CMD_NONE;
++    }
++}
++
++static void ENG_RAM(check_stop)(eng_t *e, uint32_t now)
++{
++    if (e->phase != ENG_CRANK && e->phase != ENG_RUN) return;
++    if (e->cmd == ENG_CMD_STOP) { stop_now(e, now); return; }
++    if (e->mode == ENG_MODE_OFF) { stop_now(e, now); return; }          // PC switched it off / went away
++    if (!e->stkl_have || since_ms(now, e->stkl_us) > ENG_STKL_STALE_MS) { stop_now(e, now); return; }
++    uint8_t k = e->stkl;
++    if (k == 0xD || k >= 0xA) { e->t9_have = false; return; }   // A..D: keep going
++    if (k == 9) {
++        // Engine-off request (button with KL15 staying on): Ian: 0x142 b8 84 -> A4 at +50 ms,
++        // 92 only when ST_KL drops further (or after 1 s of 9).
++        if (!e->t9_have) { e->t9_have = true; e->t9 = now; }
++        if (since_ms(now, e->t9) >= ENG_STOP_9_MS) stop_now(e, now);
++        return;
++    }
++    stop_now(e, now);   // <= 8: ignition going off
++}
++
++// --- outputs -------------------------------------------------------------------------
++static void ENG_RAM(set_outputs)(eng_t *e, uint32_t now, uint32_t dt_ms)
++{
++    eng_out_t *o = &e->out;
++    eng_out_t prev = *o;
++    uint32_t seq = o->seq;
++    memset(o, 0, sizeof *o);
++    o->seq = seq + 1u;
++    o->mode = e->mode;
++    o->phase = e->phase;
++    o->e6_ready = 0xFF;
++    o->e6_ev = prev.e6_ev;
++    o->fb9_ev = prev.fb9_ev;
++    o->f3_val = prev.f3_val;
++    o->fuel = prev.fuel;
++    if (e->phase == ENG_OFF && !e->has_run) {
++        // Not started in this wake. A start that never reached first rpm (aborted in the
++        // first 95 ms) leaves no trace.
++        e->f3_q8 = 0;
++        return;
++    }
++    o->active = 1;
++    const uint32_t t = e->phase == ENG_CRANK || e->phase == ENG_RUN ? since_ms(now, e->t0) : 0;
++
++    switch (e->phase) {
++    case ENG_CRANK:
++    case ENG_RUN: {
++        o->rpm4 = (uint16_t)rpm4_start(t);
++        if (o->rpm4 && !e->cur_run) { e->cur_run = true; e->has_run = true; e->trpm = now; }
++        if (!e->cur_run && !e->has_run) { o->active = 0; }
++        // Crank marker: CounterHi 1 -> 3 on all DDE E2E groups (FR + PT-CAN D9/3F9), Ian +50..+155 ms
++        if (t >= ENG_T_BLIP_ON && t < ENG_T_BLIP_OFF) { o->cnt_hi = 3; o->active = 1; }
++        if (e->phase == ENG_CRANK && o->rpm4 >= 4u * ENG_RPM_82) { e->phase = ENG_RUN; e->t82 = now; o->phase = ENG_RUN; }
++        uint32_t tr = e->cur_run ? since_ms(now, e->trpm) : 0;     // ms since first rpm
++        if (e->phase == ENG_CRANK) {
++            // Ian: +100 ms state 0x81 (cranking), b4 0x65, start-ready 1 (b7 0x13)
++            if (t >= ENG_T_81 || e->cur_run) { o->e6_b3 = 0x81; o->e6_b4 = 0x65; o->e6_ready = 1; }
++            // torque: crank ~ +220 Nm (3krev A5 0x9B5), run-up falls to the idle level
++            if (t < ENG_T_FIRE) o->torque = 2560;   // Fred: crank raw 2540-2608
++            else o->torque = (uint16_t)(2560u - (t - ENG_T_FIRE) * 420u / ENG_T_RUNUP);
++            // supply dips while the starter turns: FB7 ~10.6 V (Fred), 0x281 0x2C1 (3krev)
++            o->fb7_mv = 10600; o->v281 = 0x2C1;
++        } else {
++            uint32_t t82 = since_ms(now, e->t82);
++            // Ian/Fred: 0xE6 = 0x82 "running"; b4 0x66 for 250 ms then 0x26; start-ready 0 20 ms later.
++            // Owner: CAS likely waits for 0x82 before releasing the starter (D -> C).
++            o->e6_b3 = 0x82;
++            o->e6_b4 = t82 < 250u ? 0x66 : 0x26;
++            o->e6_ready = t82 < 20u ? 1 : 0;
++            o->torque = t < ENG_T_FLARE_END ? (uint16_t)2140 : (uint16_t)2098;   // idle 25.5 Nm = 32 28 83
++            o->b142_b8 = 0x84;                       // Fred: 0x142 b8 A4 -> 84 while running
++            o->r381_run = 1;
++            o->fb7_mv = (uint16_t)(12400u + (t82 > 5000u ? 2300u : t82 * 2300u / 5000u));   // -> 14.70 V
++            o->v281 = (uint16_t)(t82 > 1000u ? 0x339 : 0x2C1 + (0x339 - 0x2C1) * t82 / 1000u);
++            // 0x397 (3krev): d0 c2, d1 e2 -> e1 (+60) -> dd (+120), d2 random 0x5f..0x79 / 60 ms
++            o->r397_set = 1;
++            o->r397_d0 = tr >= 2800u ? 0xD2 : 0xC2;
++            o->r397_d1 = t82 < 60u ? 0xE2 : (t82 < 120u ? 0xE1 : 0xDD);
++            uint32_t h = (now / 60000u) * 2654435761u;
++            o->r397_d2 = (uint8_t)(0x5F + (h >> 24) % 27u);
++            if (e->t9_have && since_ms(now, e->t9) >= 50u) o->b142_b8 = 0xA4;   // ST_KL 9: Ian +50 ms
++        }
++        if (e->cur_run) {
++            // Fred: 0x28 c3 b5b6 24 20 at first rpm, 20 20 0.1 s later; b3..4 3E 7D
++            o->c3_b56 = tr < 100u ? 1 : 2;
++            o->c3_b34 = 1;
++            // Fred/Ian: 0x29 b5 / PT-CAN 0x8F d4 0x7C -> 0x72 at first rpm (+7 ms)
++            if (tr >= 7u) o->r29_b5 = 0x72;
++            o->r29_b8 = 0x10;
++            if (tr >= 100u) o->f97c = 1;           // Ian +170 ms: sensor values valid (sticky)
++            if (tr >= 50u) o->b142_b23 = 0x24;     // Fred: 0x142 b23 20 -> 24 (sticky)
++            // FB9 (PT-CAN 0x3B3 mirror): b2 ramps 0x2D -> 0xC8 from +2.0 s (+4 per 100 ms),
++            // b3..4 04 00 -> 00 00 at +5.0 s (Fred; 3krev 0x3B3 +5.1 s)
++            o->fb9_set = 1;
++            o->fb9_b2 = 0;
++            if (tr >= 2000u) {
++                uint32_t v = 0x2Du + 4u * ((tr - 2000u) / 100u);
++                o->fb9_b2 = (uint8_t)(v > 0xC8u ? 0xC8u : v);
++            }
++            o->fb9_b3 = tr >= 5000u ? 0x00 : 0x04;
++            o->fb9_b4 = 0x00;
++            // E8 L9 running content from +2.8 s (Fred), b1 ramp 12 18 1E 25, fast rate
++            if (tr >= 2800u) {
++                uint32_t s = (tr - 2800u) / 100u;
++                o->e89 = 1;
++                o->e89_b1 = s == 0 ? 0x12 : (s == 1 ? 0x18 : (s == 2 ? 0x1E : 0x25));
++                o->e8_fast = 1;
++            }
++            o->turbine = (uint16_t)(2000u + (o->rpm4 / 4u > 56u ? o->rpm4 / 4u - 56u : 0u));
++        } else if (e->has_run) {
++            // restart after an earlier run, before this start's first rpm: the "after stop"
++            // values stay (they only change again at first rpm)
++            o->c3_b56 = 3; o->c3_b34 = 2;
++            o->r29_b5 = 0x7C; o->r29_b8 = 0xC0; o->f97c = 1;
++            o->b142_b8 = 0xA4; o->b142_b23 = 0x24;
++            o->fb9_set = 1; o->fb9_b2 = 0x00; o->fb9_b3 = 0xFF; o->fb9_b4 = 0x7F;
++            o->e89 = 2;
++            o->turbine = 2000;
++            if (!o->e6_b3) { o->e6_b3 = 0x80; o->e6_b4 = 0x64; o->e6_ready = 1; }
++            if (!o->torque) o->torque = 1978;
++        }
++        if (o->rpm4 || e->cur_run) o->r381_run = o->r381_run || o->rpm4;
++        break;
++    }
++    case ENG_STOP: {
++        uint32_t ts = since_ms(now, e->ts);
++        o->rpm4 = (uint16_t)rpm4_stop(e->rpm_at_stop, ts);
++        // Ian: +19 ms state 0x92 (stopping), b4 0x66, start-ready 0
++        o->e6_b3 = ts >= 19u ? 0x92 : 0x82;
++        o->e6_b4 = 0x66;
++        o->e6_ready = 0;
++        o->torque = ts < 400u ? 2098 : 1947;      // Ian: -50 Nm drag torque while running down
++        o->b142_b8 = 0xA4;
++        o->c3_b56 = ts >= 19u ? 3 : 2;            // Fred: E0 E0 with 92
++        o->c3_b34 = 1;
++        o->r29_b5 = ts >= 19u ? 0x7C : 0x72;      // Fred/Ian: back to 7C, b8 C0 (+35 ms)
++        o->r29_b8 = ts >= 35u ? 0xC0 : 0x10;
++        o->f97c = 1;
++        o->b142_b23 = 0x24;
++        o->fb9_set = 1;
++        o->fb9_b2 = prev.fb9_set ? prev.fb9_b2 : 0;
++        o->fb9_b3 = ts >= 240u ? 0xFF : prev.fb9_b3;   // 3krev 0x3B3: FF 7F at +0.24 s
++        o->fb9_b4 = ts >= 240u ? 0x7F : prev.fb9_b4;
++        o->e89 = prev.e89; o->e89_b1 = prev.e89_b1; o->e8_fast = prev.e8_fast;
++        o->fb7_mv = 14700;
++        o->v281 = 0x339;
++        o->r381_run = 1;
++        o->turbine = (uint16_t)(2000u + (o->rpm4 / 4u > 56u ? o->rpm4 / 4u - 56u : 0u));
++        // 0x397 (3krev): dd until 92 + 120 ms, then a2, 2e (+60), 24 (+120); d2 -> 00 at +440 ms
++        o->r397_set = 1;
++        o->r397_d0 = since_ms(now, e->trpm) >= 2800u ? 0xD2 : 0xC2;
++        o->r397_d1 = ts < 140u ? 0xDD : (ts < 200u ? 0xA2 : (ts < 260u ? 0x2E : 0x24));
++        o->r397_d2 = ts < 440u ? (uint8_t)(0x5F + (((now / 60000u) * 2654435761u) >> 24) % 27u) : 0x00;
++        if (o->rpm4 == 0 && ts >= ENG_T_STOP_ZERO) { e->phase = ENG_STOPPED; e->t80 = now; o->phase = ENG_STOPPED; }
++        else break;
++    }
++    /* fall through */
++    case ENG_STOPPED: {
++        uint32_t t80 = since_ms(now, e->t80);
++        o->rpm4 = 0;
++        // Ian: state 0x80, b4 0x64, start-ready 1 (b7 0x13) 20 ms later; T1 -34.5 Nm (raw 1978)
++        o->e6_b3 = 0x80; o->e6_b4 = 0x64; o->e6_ready = t80 >= 20u ? 1 : 0;
++        o->torque = 1978;
++        o->turbine = 2000;
++        o->b142_b8 = 0xA4; o->b142_b23 = 0x24;
++        o->c3_b56 = 3; o->c3_b34 = 2;             // Fred: b3..4 1C 7E after stop
++        o->r29_b5 = 0x7C; o->r29_b8 = 0xC0; o->f97c = 1;
++        o->fb9_set = 1; o->fb9_b2 = 0x00; o->fb9_b3 = 0xFF; o->fb9_b4 = 0x7F;
++        o->e89 = 2; o->e8_fast = t80 < 1500u;     // Fred: back to ~1/s 1.5 s after the stop
++        o->fb7_mv = (uint16_t)(t80 >= 5000u ? 0 : 14700u - (14700u - 12871u) * t80 / 5000u);
++        // 0x397: d0 d0, d1 24 held until +2.09 s, then 29 af df de dd df e2 (3krev)
++        o->r397_set = 1;
++        o->r397_d0 = 0xD0;
++        o->r397_d2 = 0x00;
++        static const struct { uint16_t ms; uint8_t v; } walk[] = {
++            {0, 0x24}, {2090, 0x29}, {2150, 0xAF}, {2210, 0xDF}, {2270, 0xDE}, {2370, 0xDD},
++            {2854, 0xDF}, {2913, 0xE2}};
++        uint8_t d1 = 0x24;
++        for (unsigned k = 0; k < sizeof walk / sizeof walk[0]; k++) if (t80 >= walk[k].ms) d1 = walk[k].v;
++        o->r397_d1 = d1;
++        o->abs_stop_walk = t80 >= 2913u;
++        o->r381_run = 0;
++        o->v281 = 0;
++        break;
++    }
++    default:
++        break;
++    }
++
++    // 0xF3: rpm/10 with ~0.2 s lag (3krev: 66 = 660 rpm when the A5 shows 1000)
++    {
++        uint32_t target = (uint32_t)o->rpm4 * 256u / 40u;     // (rpm/10) * 256
++        int32_t diff = (int32_t)target - (int32_t)e->f3_q8;
++        e->f3_q8 = (uint32_t)((int32_t)e->f3_q8 + diff * (int32_t)(dt_ms > 200u ? 200u : dt_ms) / 200);
++        if (o->rpm4 == 0 && e->f3_q8 < 256u) e->f3_q8 = 0;
++        o->f3_val = (uint16_t)(e->f3_q8 / 256u);
++    }
++    // 0x2C4 fuel counter (3krev: ~0x0E / 100 ms cranking, ~0x28 / 100 ms at idle)
++    if (o->rpm4) {
++        uint32_t rpm = o->rpm4 / 4u;
++        uint32_t per100 = (e->phase == ENG_CRANK && rpm < 400u) ? rpm / 10u : rpm / 20u;   // per 100 ms
++        e->fuel_q10 += per100 * dt_ms * 10u / 100u;   // 1/10 units
++        o->fuel = (uint16_t)(e->fuel_q10 / 10u);
++    }
++    // event flags
++    uint8_t e6[3] = {o->e6_b3, o->e6_b4, o->e6_ready};
++    if (memcmp(e6, e->last_e6, 3) != 0) { o->e6_ev++; memcpy(e->last_e6, e6, 3); }
++    uint8_t f9[3] = {o->fb9_b2, o->fb9_b3, o->fb9_b4};
++    if (o->fb9_set && memcmp(f9, e->last_fb9, 3) != 0) { o->fb9_ev++; memcpy(e->last_fb9, f9, 3); }
++}
++
++void ENG_RAM(eng_step)(eng_t *e, uint32_t now)
++{
++    uint32_t dt = e->last_have ? since_ms(now, e->last_us) : 5u;
++    if (dt > 1000u) dt = 1000u;
++    e->last_us = now; e->last_have = true;
++    if (e->mode != ENG_MODE_OFF && (!e->mode_seen || since_ms(now, e->mode_us) > ENG_MODE_KEEP_MS))
++        e->mode = ENG_MODE_OFF;                    // PC (logger) gone: no keepalive
++    if (e->cmd != ENG_CMD_NONE && since_ms(now, e->cmd_us) > ENG_CMD_MS) e->cmd = ENG_CMD_NONE;
++    check_stop(e, now);
++    check_start(e, now);
++    set_outputs(e, now, dt);
++}
++
++// --- byte patchers ---------------------------------------------------------------------
++static void ENG_RAM(hi3)(uint8_t *b, uint8_t hi) { *b = (uint8_t)((*b & 0x0Fu) | (uint8_t)(hi << 4)); }
++static void ENG_RAM(put_torque)(uint8_t *b, uint16_t t)   // b[0..2] = T1 (12 bit) + T2 (= T1), Ian
++{
++    b[0] = (uint8_t)t;
++    b[1] = (uint8_t)(((t >> 8) & 0x0Fu) | ((t & 0x0Fu) << 4));
++    b[2] = (uint8_t)(t >> 4);
++}
++
++void ENG_RAM(eng_patch_fr_static)(const eng_out_t *o, unsigned target, unsigned cycle, uint8_t *pl)
++{
++    if (!o || !o->active) return;
++    const unsigned c4 = cycle & 3u;
++    switch (target) {
++    case 0:   // 0x26 c1: b3..4 turbine speed (Fred: 2000 + rpm - 56 when running)
++        if (c4 == 1 && o->turbine) { pl[2] = (uint8_t)o->turbine; pl[3] = (uint8_t)(o->turbine >> 8); }
++        break;
++    case 1:   // 0x28
++        if (c4 == 1) {
++            if (o->torque) put_torque(&pl[2], o->torque);          // b3..5 T1/T2
++            pl[5] = (uint8_t)o->rpm4; pl[6] = (uint8_t)(o->rpm4 >> 8);   // b6..7 rpm*4 (= OBD 0x0C)
++            if (o->cnt_hi) hi3(&pl[9], o->cnt_hi);                 // group 2 CounterHi
++        } else if (c4 == 3) {
++            if (o->cnt_hi) { hi3(&pl[1], o->cnt_hi); hi3(&pl[9], o->cnt_hi); }
++            if (o->c3_b34 == 1) { pl[2] = 0x3E; pl[3] = 0x7D; }
++            else if (o->c3_b34 == 2) { pl[2] = 0x1C; pl[3] = 0x7E; }
++            if (o->c3_b56 == 1) { pl[4] = 0x24; pl[5] = 0x20; }
++            else if (o->c3_b56 == 2) { pl[4] = 0x20; pl[5] = 0x20; }
++            else if (o->c3_b56 == 3) { pl[4] = 0xE0; pl[5] = 0xE0; }
++        }
++        break;
++    case 2:   // 0x29 c3
++        if (c4 == 3) {
++            if (o->cnt_hi) { hi3(&pl[1], o->cnt_hi); hi3(&pl[9], o->cnt_hi); }
++            if (o->f97c) {
++                pl[2] = 0xF9; pl[3] = 0x7C;
++                pl[10] = 0xF9; pl[11] = 0x7C; pl[12] = 0xF9; pl[13] = 0x7C; pl[14] = 0xF9; pl[15] = 0x7C;
++            }
++            if (o->r29_b5) pl[4] = o->r29_b5;
++            if (o->r29_b8) pl[7] = o->r29_b8;
++        }
++        break;
++    case 3:   // 0x3D c3
++        if (c4 == 3) {
++            if (o->cnt_hi) { hi3(&pl[1], o->cnt_hi); hi3(&pl[9], o->cnt_hi); }
++            if (o->f97c) { pl[4] = 0xF9; pl[5] = 0x7C; pl[6] = 0xF9; pl[7] = 0x7C; }
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++void ENG_RAM(eng_patch_fr_dyn)(const eng_out_t *o, unsigned pdu, uint8_t *pl)
++{
++    if (!o || !o->active) return;
++    switch (pdu) {
++    case DDE_PDU_E6:   // b2 hi = CounterHi, b3 state, b4 phase, b7 hi = start-ready
++        if (o->cnt_hi) hi3(&pl[1], o->cnt_hi);
++        if (o->e6_b3) { pl[2] = o->e6_b3; pl[3] = o->e6_b4; }
++        if (o->e6_ready != 0xFF) hi3(&pl[6], o->e6_ready);
++        break;
++    case DDE_PDU_FB7:  // b3..4 supply voltage mV LE
++        if (o->fb7_mv) { pl[2] = (uint8_t)o->fb7_mv; pl[3] = (uint8_t)(o->fb7_mv >> 8); }
++        break;
++    case DDE_PDU_FB9:
++        if (o->fb9_set) { pl[1] = o->fb9_b2; pl[2] = o->fb9_b3; pl[3] = o->fb9_b4; }
++        break;
++    case DDE_PDU_E89: {
++        // Fred: running `25 14 00 AC 26 F3 58 F0` (b1 ramps up first); b1b2 back to 00 with E6=80
++        static const uint8_t run[8] = {0x25, 0x14, 0x00, 0xAC, 0x26, 0xF3, 0x58, 0xF0};
++        static const uint8_t aft[8] = {0x00, 0x00, 0x00, 0xAC, 0x26, 0xF3, 0x58, 0xF0};
++        if (o->e89 == 1) { memcpy(pl, run, 8); pl[0] = o->e89_b1; }
++        else if (o->e89 == 2) memcpy(pl, aft, 8);
++        break;
++    }
++    case DDE_PDU_142:
++        if (o->b142_b8) pl[7] = o->b142_b8;
++        if (o->b142_b23) pl[22] = o->b142_b23;
++        break;
++    default:
++        break;
++    }
++}
++
++bool ENG_RAM(eng_patch_can)(const eng_out_t *o, uint16_t id, uint8_t *d, uint8_t *ctr_hi)
++{
++    if (!o || !o->active) return false;
++    switch (id) {
++    case 0x0A5:        // torque d2..4 + rpm d5..6 (same encoding as FR 0x28 c1)
++        if (o->torque) put_torque(&d[2], o->torque);
++        d[5] = (uint8_t)o->rpm4; d[6] = (uint8_t)(o->rpm4 >> 8);
++        return true;
++    case 0x0D9:
++        if (o->cnt_hi) { *ctr_hi = o->cnt_hi; return true; }
++        return false;
++    case 0x3F9:        // PT-CAN copy of 0xE6: d2 state, d3 phase, d6 hi start-ready
++        if (o->cnt_hi) *ctr_hi = o->cnt_hi;
++        if (o->e6_b3) { d[2] = o->e6_b3; d[3] = o->e6_b4; }
++        if (o->e6_ready != 0xFF) hi3(&d[6], o->e6_ready);
++        return true;
++    case 0x08F:        // copy of FR 0x29: d2..3 F9 7C, d4 run nibble
++        if (o->f97c) { d[2] = 0xF9; d[3] = 0x7C; }
++        if (o->r29_b5) d[4] = o->r29_b5;
++        return true;
++    case 0x0F3:        // rpm/10 lagged: b1 hi nibble = low 4 bits, b2 = high 8 bits
++        *ctr_hi = (uint8_t)(o->f3_val & 0x0Fu);
++        d[2] = (uint8_t)(o->f3_val >> 4);
++        return true;
++    case 0x2C4:
++        d[0] = (uint8_t)o->fuel; d[1] = (uint8_t)(o->fuel >> 8);
++        return true;
++    case 0x281:
++        if (!o->v281) return false;
++        d[0] = (uint8_t)o->v281; d[1] = (uint8_t)(0xF0u | ((o->v281 >> 8) & 0x0Fu));
++        return true;
++    case 0x381:
++        if (!o->r381_run) return false;
++        d[0] = 0x79; d[1] = 0xF0;
++        return true;
++    case 0x3B3:        // mirror of FB L9 (`1f b2 b3 b4 00 03 f8`)
++        if (!o->fb9_set) return false;
++        d[1] = o->fb9_b2; d[2] = o->fb9_b3; d[3] = o->fb9_b4;
++        return true;
++    case 0x397:
++        if (!o->r397_set || o->abs_stop_walk) {
++            if (o->abs_stop_walk) d[0] = 0xD0;
++            return o->abs_stop_walk;
++        }
++        d[0] = o->r397_d0; d[1] = o->r397_d1; d[2] = o->r397_d2;
++        return true;
++    default:
++        return false;
++    }
++}
+diff --git a/src/dde_engine.h b/src/dde_engine.h
+new file mode 100644
+index 0000000..a4af060
+--- /dev/null
++++ b/src/dde_engine.h
+@@ -0,0 +1,135 @@
++// v1g: opt-in "fake engine start" for the DDE emulator (EV conversion, no engine).
++//
++// Plain English: the real DDE tells the car when the diesel cranks, fires,
++// idles and stops. With no engine the car never sees "engine running", so it
++// stays in a half-started state. This module plays a recorded start/run/stop
++// story (Ian's dde_start_sequence.md + Fred's f11_fr_engine_running_diff.md,
++// checked against the F11_4log_3krev capture) when the driver asks for a start:
++//
++//   OFF ---(start trigger)---> CRANK ---(rpm >= 950)---> RUN
++//    ^                          |                         |
++//    |                          +------(stop request)-----+--> STOP --(rpm 0)--> STOPPED
++//    +--------------------------- (new FlexRay wake) ------------------------------+
++//   STOPPED --(start trigger)--> CRANK (restart is allowed)
++//
++// Start triggers (both need the mode switched on from the PC, OFF by default).
++// Real start (F11_engstartthenstop): ST_KL A -> C -> D (starter) -> 0xE6 82 -> C (+8 ms) -> A.
++//   ENG_MODE_CAS:      the car's own start request, ST_KL = 0xD (CAS "starter
++//                      request") in FlexRay 0x74 or PT-CAN 0x12F, with the brake
++//                      pressed. This is the normal button start.
++//   ENG_MODE_FALLBACK: ST_KL = 0xA (ignition on; D also accepted), brake pressed in the last
++//                      300 ms, and a "start" command typed into the logger in
++//                      the last 2 s. Use it if the CAS never sends ST_KL = D
++//                      (for example because it waits for something we do not send).
++// Stop: ST_KL drops below 0xA (9 = engine-off request, <= 8 = ignition going
++// off), ST_KL not seen for 600 ms, a "stop" command, or the mode being switched off.
++//
++// This file is pure C (no SDK): the firmware runs eng_step() on core 1 once per
++// FlexRay cycle (5 ms) and the host tests run it with simulated time. It only
++// decides values; the frame builders call the eng_patch_*() helpers which
++// overwrite bytes BEFORE the counters and CRCs are computed, so every E2E CRC,
++// alive counter and FlexRay frame CRC stays valid. Nothing here ever creates
++// a new frame ID: only bytes of frames the emulator already sends change.
++#ifndef DDE_ENGINE_H
++#define DDE_ENGINE_H
++#include <stdbool.h>
++#include <stdint.h>
++
++enum { ENG_MODE_OFF = 0, ENG_MODE_CAS = 1, ENG_MODE_FALLBACK = 2 };
++enum { ENG_OFF = 0, ENG_CRANK = 1, ENG_RUN = 2, ENG_STOP = 3, ENG_STOPPED = 4 };
++enum { ENG_CMD_NONE = 0, ENG_CMD_START = 1, ENG_CMD_STOP = 2 };
++enum { ENG_SRC_FR74 = 0, ENG_SRC_CAN12F = 1 };
++
++// Timeline (ms). T0 = start trigger, TS = stop trigger. Sources in the comments.
++#define ENG_T_BLIP_ON      50u    // Ian: CounterHi 1 -> 3 at +50 ms (crank marker)
++#define ENG_T_BLIP_OFF    155u    //      back to 1 at +155 ms
++#define ENG_T_RPM          95u    // Ian/Fred: first rpm at +95 ms (~115 rpm)
++#define ENG_T_81          100u    // 0xE6 state 0x80 -> 0x81 (cranking) at +100 ms
++#define ENG_T_FIRE        700u    // first fire, run-up to 1000 rpm (3krev: 82 at +1.00 s)
++#define ENG_T_RUNUP       250u    // run-up duration 200 -> 1000 rpm
++#define ENG_T_FLARE_END  1500u    // start flare 1000-1060 rpm until +1.5 s
++#define ENG_IDLE_RPM      780u    // owner: idle ~780 rpm (OBD 0x0C 30 0C)
++#define ENG_TAU_IDLE_MS  1000u    // flare -> idle settle time constant
++#define ENG_RPM_82        950u    // 0xE6 = 0x82 (running) once rpm >= 950
++#define ENG_STKL_STALE_MS 600u    // no ST_KL for this long while cranking/running = stop
++#define ENG_BRAKE_MS_CAS 2000u    // CAS mode: brake pressed within this window of ST_KL = D
++#define ENG_BRAKE_MS_FB   300u    // fallback mode: brake pressed within 300 ms
++#define ENG_CMD_MS       2000u    // fallback start command valid for 2 s
++#define ENG_MODE_KEEP_MS 3000u    // mode must be refreshed by the PC (logger does it every 1 s)
++#define ENG_STOP_9_MS    1000u    // ST_KL 9 held this long = full stop even without <= 8
++
++// Everything the frame builders need, one consistent snapshot. 0 / false = no
++// override (use the emulator's normal content).
++typedef struct {
++    uint32_t seq;          // bumped by every eng_step (core 0 reads a snapshot)
++    uint8_t active;        // 1 = engine story in progress or happened in this wake
++    uint8_t phase;         // ENG_*
++    uint8_t mode;          // ENG_MODE_*
++    uint8_t cnt_hi;        // 0 = normal, 3 = crank CounterHi marker
++    uint16_t rpm4;         // engine speed * 4 (0x28 c1 b6..7, PT-CAN 0xA5 d5..6)
++    uint16_t torque;       // 12-bit raw (Nm*2 + 2047), 0 = no override
++    uint16_t turbine;      // 0x26 c1 b3..4 raw, 0 = no override
++    uint8_t e6_b3, e6_b4, e6_ready;   // 0xE6 / 0x3F9: state, phase byte, start-ready (b7 hi nibble); 0 = none (ready: 0xFF = none)
++    uint8_t c3_b56;        // 0x28 c3 b5/b6 code: 0 none, 1 = 24 20, 2 = 20 20, 3 = E0 E0
++    uint8_t c3_b34;        // 0x28 c3 b3..4: 0 none, 1 = 3E 7D (running), 2 = 1C 7E (after stop)
++    uint8_t r29_b5;        // 0x29 c3 b5 / PT-CAN 0x8F d4 (0 = none)
++    uint8_t r29_b8;        // 0x29 c3 b8 (0 = none)
++    uint8_t f97c;          // 1 = 0x29/0x3D/0x8F "F9 7C" (valid sensor values, sticky)
++    uint8_t b142_b8, b142_b23;   // 0x142 bytes (0 = none)
++    uint8_t fb9_set, fb9_b2, fb9_b3, fb9_b4;   // 0xFB L9 b2..b4 (+ PT-CAN 0x3B3 d1..d3)
++    uint16_t fb7_mv;       // 0xFB L7 b3..4 voltage in mV (0 = none)
++    uint8_t e89;           // 0xE8 L9: 0 template, 1 running content, 2 after-stop content
++    uint8_t e89_b1;        // running content b1 (ramp 0x12 -> 0x25)
++    uint8_t e8_fast;       // 1 = send 0xE8 L9 ~15/s instead of 1/s
++    uint16_t f3_val;       // PT-CAN 0xF3 rpm/10 (lagged)
++    uint16_t v281;         // PT-CAN 0x281 12-bit voltage (0 = none)
++    uint8_t r397_set, r397_d0, r397_d1, r397_d2;
++    uint8_t r381_run;      // PT-CAN 0x381 79 f0
++    uint16_t fuel;         // PT-CAN 0x2C4 b0..1 fuel counter
++    uint8_t e6_ev, fb9_ev; // bumped when 0xE6 / 0xFB L9 content changes (send as event)
++    uint8_t abs_stop_walk; // 1 = 0x397 stop walk finished (normal model again)
++} eng_out_t;
++
++typedef struct {
++    // inputs
++    uint8_t mode;
++    uint32_t mode_us; bool mode_seen;
++    uint8_t stkl; uint32_t stkl_us; bool stkl_have;
++    uint32_t brake_us; bool brake_have;
++    uint8_t cmd; uint32_t cmd_us;
++    // state
++    uint8_t phase;
++    bool has_run;              // reached first rpm in this wake
++    bool cur_run;              // reached first rpm in the current start attempt
++    uint32_t t0, trpm, t82, ts, t9, t80;
++    bool t9_have, b142_stop;
++    uint32_t rpm_at_stop;      // rpm*4 when the stop started
++    uint32_t last_us; bool last_have;
++    uint32_t f3_q8, fuel_q10;
++    uint8_t last_e6[3], last_fb9[3];
++    uint8_t mode_prev;
++    // stats
++    uint32_t starts, stops, rejects, last_reject;  // last_reject: ENG_REJ_*
++    eng_out_t out;
++} eng_t;
++
++enum { ENG_REJ_NONE = 0, ENG_REJ_NO_BRAKE, ENG_REJ_STKL, ENG_REJ_NO_CMD, ENG_REJ_BUSY, ENG_REJ_MODE };
++
++void eng_reset(eng_t *e);                 // power-up / new FlexRay wake: everything off, mode kept
++void eng_set_mode(eng_t *e, uint8_t mode, uint32_t now_us);   // PC keepalive (every <= 3 s)
++void eng_command(eng_t *e, uint8_t cmd, uint32_t now_us);     // ENG_CMD_START / STOP from the PC
++void eng_input_stkl(eng_t *e, uint8_t stkl, bool brake, uint32_t now_us);  // 0x74 / 0x12F
++void eng_input_brake(eng_t *e, bool brake, uint32_t now_us);               // 0x173
++void eng_step(eng_t *e, uint32_t now_us); // once per FlexRay cycle; updates e->out
++
++// Byte patchers. Called with the payload BEFORE counters/CRCs are written.
++// FlexRay static frame: target 0..3 = 0x26, 0x28, 0x29, 0x3D; pl = 16 payload bytes.
++void eng_patch_fr_static(const eng_out_t *o, unsigned target, unsigned cycle, uint8_t *pl);
++// FlexRay dynamic PDU (DDE_PDU_* index), pl = payload with counter byte already set
++// (the E2E CRC byte is computed afterwards).
++void eng_patch_fr_dyn(const eng_out_t *o, unsigned pdu, uint8_t *pl);
++// PT-CAN frame (d = 8 data bytes, before counter/CRC). *ctr_hi may be changed.
++// Returns true when it changed anything.
++bool eng_patch_can(const eng_out_t *o, uint16_t id, uint8_t *d, uint8_t *ctr_hi);
++const char *eng_phase_name(unsigned phase);
++#endif
+diff --git a/src/main.c b/src/main.c
+index 6e020e1..9bd0c5e 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -124,6 +124,7 @@ static void stats_print(const stream_stats_t *s, uint32_t prev_total, uint32_t p
+            (unsigned long)s->usb_fifo_dropped, (unsigned long)flexray_ts_fine_hz());
+ #if PICO_FLEXRAY_DDE_EMU
+     dde_emu_print_stats();
++    dde_engine_print();
+ #endif
+ }
+ 
+diff --git a/src/panda_usb.c b/src/panda_usb.c
+index e04f6f7..5b27118 100644
+--- a/src/panda_usb.c
++++ b/src/panda_usb.c
+@@ -287,6 +287,12 @@ static bool handle_control_read(uint8_t rhport, tusb_control_request_t const *re
+             dde_emu_fill_stats(&es);
+             return tud_control_xfer(rhport, request, &es, sizeof(es));
+         }
++    case PICOFLEX_GET_ENGINE:
++        {
++            static dde_engine_status_t eg;   // v1g fake engine status (static: read after return)
++            dde_engine_fill_status(&eg);
++            return tud_control_xfer(rhport, request, &eg, sizeof(eg));
++        }
+ #endif
+ #if PICO_FLEXRAY_BOARD_V2 && EMU_CAN_TX
+     case PICOFLEX_GET_CANTX:
+@@ -463,6 +469,13 @@ static bool handle_control_write(uint8_t rhport, tusb_control_request_t const *r
+         dde_emu_host_set(request->wValue);
+         handled = true;
+         break;
++    case PICOFLEX_SET_ENGINE:
++        // v1g fake engine start: wValue low byte = mode (0 off, 1 CAS, 2 fallback),
++        // high byte = command (0 keepalive, 1 start, 2 stop). Off after every reset.
++        if ((request->wValue & 0xFFu) > 2u || (request->wValue >> 8) > 2u) return false;
++        dde_engine_host_set(request->wValue);
++        handled = true;
++        break;
+ #endif
+ 
+ #if PICO_FLEXRAY_BOARD_V2 && EMU_CAN_TX
+diff --git a/src/ptcan_emu.c b/src/ptcan_emu.c
+index 2b56154..22b80ba 100644
+--- a/src/ptcan_emu.c
++++ b/src/ptcan_emu.c
+@@ -29,6 +29,7 @@
+ #include "hardware/sync.h"
+ #include "pico/time.h"
+ #include "ptcan_emu_core.h"
++#include "dde_emu.h"
+ #include "console.h"
+ #include "panda_usb.h"
+ #include "pico_can_record.h"
+@@ -109,7 +110,10 @@ void ptcan_emu_on_rx(const mcp_rx_frame_t *f, uint32_t t_us32)
+ {
+     // Extended / remote frames only count as bus traffic.
+     if (f->ide || f->rtr || f->fdf) pte_on_rx(&core, 0, NULL, 0, to64(t_us32));
+-    else pte_on_rx(&core, (uint16_t)f->id, f->data, f->len, to64(t_us32));
++    else {
++        pte_on_rx(&core, (uint16_t)f->id, f->data, f->len, to64(t_us32));
++        dde_engine_on_can((uint16_t)f->id, f->data, f->len);   // v1g: ST_KL / brake for the fake start
++    }
+ }
+ 
+ void ptcan_emu_host_set(uint32_t mask)
+@@ -205,6 +209,9 @@ bool ptcan_emu_poll(void)
+     last_pass_us = now;
+     if (!drain_tef()) return false;
+     int n = 0;
++    // v1g: fresh fake-engine snapshot from core 1 (NULL when off / FlexRay not stepping)
++    static eng_out_t eng_snap;
++    core.eng = dde_engine_snapshot(&eng_snap) ? &eng_snap : NULL;
+     for (; n < PTCAN_BURST; n++) {
+         pte_tx_t tx;
+         if (!pte_next(&core, now, &tx)) break;
+diff --git a/src/ptcan_emu_core.c b/src/ptcan_emu_core.c
+index 5151f3b..a432d61 100644
+--- a/src/ptcan_emu_core.c
++++ b/src/ptcan_emu_core.c
+@@ -436,7 +436,8 @@ static void build(const pte_t *p, int i, uint64_t now, uint8_t *d)
+         else if (tw < MS(601)) b = 0xe6;
+         else if (tw < MS(661)) b = 0xe4;
+         else if (blip397(tw)) b = 0xe3;
+-        if (!on && ever && toff < MS(4133)) {
++        // v1g: after a fake engine run the stop walk comes from the engine overlay instead
++        if (!on && ever && toff < MS(4133) && !(p->eng && p->eng->active)) {
+             static const struct { uint16_t ms; uint8_t v; } walk[] = {
+                 {93, 0xdf}, {153, 0xde}, {273, 0xdd}, {373, 0xde}, {434, 0xdd}, {513, 0xde},
+                 {634, 0xdd}, {713, 0xde}, {773, 0xdd}, {4073, 0xdf},
+@@ -502,6 +503,7 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+     uint64_t best_due = 0;
+     uint8_t best_d[8];
+     bool best_cyc = false;
++    uint8_t best_chi = 0;
+     for (int i = 0; i < PTE_N_FRAMES; i++) {
+         if (!(p->mask & (1u << i))) continue;
+         const pte_def_t *def = &pte_defs[i];
+@@ -511,7 +513,9 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+         uint64_t due;
+         bool cyc = true;
+         uint8_t d[8];
++        uint8_t chi = def->ctr_hi;
+         build(p, i, now, d);
++        if (p->eng) eng_patch_can(p->eng, def->id, d, &chi);   // v1g fake engine bytes
+         if (def->kind == PTE_K_NM512 && !p->kl15_ever) {
+             due = p->wake_us + MS(nm512_pre_ms[f->nm_pre_idx]);
+         } else if (def->kind == PTE_K_NM512 || def->kind == PTE_K_CC592) {
+@@ -531,6 +535,7 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+             best = i;
+             best_due = due;
+             best_cyc = cyc;
++            best_chi = chi;
+             memcpy(best_d, d, 8);
+         }
+     }
+@@ -545,7 +550,7 @@ bool pte_next(pte_t *p, uint64_t now, pte_tx_t *out)
+     if (def->data_id != NO_E2E) {
+         uint8_t c = p->f[best].ctr;
+         c = (c >= 14) ? 0 : (uint8_t)(c + 1);
+-        out->data[1] = (uint8_t)((def->ctr_hi << 4) | c);
++        out->data[1] = (uint8_t)(((best_chi & 0x0Fu) << 4) | c);
+         out->data[0] = pte_e2e_crc(def->data_id, out->data, def->dlc);
+     }
+     return true;
+diff --git a/src/ptcan_emu_core.h b/src/ptcan_emu_core.h
+index 4933ce3..bc019bc 100644
+--- a/src/ptcan_emu_core.h
++++ b/src/ptcan_emu_core.h
+@@ -11,6 +11,7 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include "dde_engine.h"
+ 
+ // ---- frame table (bit i of the host mask = table index i) ---------------------
+ enum {
+@@ -112,6 +113,9 @@ typedef struct {
+     uint32_t late_sends;   // cyclic sends more than PTE_LATE_US after their slot
+     uint32_t late_max_us;  // worst lateness of a cyclic send
+     uint32_t resyncs;      // grid restarts (frames skipped because too far behind)
++    // v1g: fake-engine overlay (NULL = none). The glue points it at a fresh snapshot
++    // before every pte_next(); eng_patch_can() changes bytes before the counter + CRC.
++    const eng_out_t *eng;
+ } pte_t;
+ 
+ typedef struct {
+diff --git a/tests/host/run.sh b/tests/host/run.sh
+index b682618..4eff935 100755
+--- a/tests/host/run.sh
++++ b/tests/host/run.sh
+@@ -16,7 +16,7 @@ gcc -std=c11 -Wall -Wextra -Werror -I../../src -o /tmp/pico_flexray_test_ts_reco
+ # v1c: dynamic 0xE6/0xE8/0xFB builder vs every real DDE frame of run 5 (dde_dyn_run5.txt),
+ # DTS/packing/tracker unit checks, and (capture present) the tracker vs the whole run 5 bus.
+ gcc -std=c11 -Wall -Wextra -Werror -I../../src -o /tmp/pico_flexray_test_dde_emu \
+-    test_dde_emu_core.c ../../src/dde_emu_core.c -lm
++    test_dde_emu_core.c ../../src/dde_emu_core.c ../../src/dde_engine.c -lm
+ RUN5_BIN="${DDE_RUN5_BIN:-/workspace/f11-ts-run5/f11_run5.csv.bin}"
+ RUN5_CSV="${DDE_RUN5_CSV:-/workspace/f11-ts-run5/f11_run5.csv}"
+ if [ -f "$RUN5_BIN" ]; then
+@@ -35,6 +35,14 @@ else
+     echo "(run 5 capture not found: full-run vector check skipped)"
+     /tmp/pico_flexray_test_dde_emu strict:dde_vectors_run5_2s.txt dyn:dde_dyn_run5.txt
+ fi
++# v1g fake engine start (src/dde_engine.c): off = identical bytes, CAS / fallback start,
++# run, stop timelines, every E2E/frame CRC, PT-CAN via pte_next. Timeline CSV kept in /tmp.
++gcc -std=c11 -Wall -Wextra -Werror -Istubs -I../../src -o /tmp/pico_flexray_test_engine \
++    test_engine.c ../../src/dde_engine.c ../../src/dde_emu_core.c ../../src/ptcan_emu_core.c -lm
++/tmp/pico_flexray_test_engine /tmp/pico_flexray_engine_timeline.csv > /tmp/pico_flexray_engine.txt ||
++    { cat /tmp/pico_flexray_engine.txt; exit 1; }
++tail -n 1 /tmp/pico_flexray_engine.txt
++
+ # DDE emulator firmware (src/dde_emu.c, the real file) replayed against car test 1's
+ # captured FR1 timing (emu_run1_fr1_1600ms.txt, from f11_emu1.csv) with a model of
+ # TIMER0, the PIO TX/fire SMs and the transceiver echo. See test_dde_emu_replay.c.
+@@ -42,10 +50,10 @@ fi
+ # 0xF1 on) and all dynamic frames off (= v1b behaviour + pre-ign statics) - the v1b
+ # scenarios must pass on both.
+ gcc -std=c11 -Wall -Wextra -Werror -Iemu_stubs -I../../src -o /tmp/pico_flexray_test_dde_emu_replay \
+-    test_dde_emu_replay.c ../../src/dde_emu.c ../../src/dde_emu_core.c -lm
++    test_dde_emu_replay.c ../../src/dde_emu.c ../../src/dde_emu_core.c ../../src/dde_engine.c -lm
+ gcc -std=c11 -Wall -Wextra -Werror -Iemu_stubs -I../../src -DEMU_DYN_E6=0 -DEMU_DYN_FB=0 -DEMU_DYN_E8=0 \
+     -DEMU_DYN_5C=0 -DEMU_142=0 -DEMU_10A=0 -DEMU_68=0 \
+-    -o /tmp/pico_flexray_test_dde_emu_replay_nodyn test_dde_emu_replay.c ../../src/dde_emu.c ../../src/dde_emu_core.c -lm
++    -o /tmp/pico_flexray_test_dde_emu_replay_nodyn test_dde_emu_replay.c ../../src/dde_emu.c ../../src/dde_emu_core.c ../../src/dde_engine.c -lm
+ for b in "" _nodyn; do
+ for sc in run1 run1-spike run1-bigspike lateecho foreign stuck noecho; do
+     /tmp/pico_flexray_test_dde_emu_replay$b emu_run1_fr1_1600ms.txt $sc > /tmp/pico_flexray_replay_$sc$b.txt ||
+@@ -102,7 +110,7 @@ if [ -f "$RUN1_CSV" ]; then
+ fi
+ if [ -f "$RUN2_CSV" ]; then
+     python3 ../../tools/dde_emu/extract_replay.py "$RUN2_CSV" /tmp/pico_flexray_emu_run2_full.txt
+-    for sc in dyn-run2 dyn-unsure; do
++    for sc in dyn-run2 dyn-unsure dyn-engine; do
+         /tmp/pico_flexray_test_dde_emu_replay /tmp/pico_flexray_emu_run2_full.txt $sc > /tmp/pico_flexray_replay_$sc.txt ||
+             { cat /tmp/pico_flexray_replay_$sc.txt; exit 1; }
+         tail -n 1 /tmp/pico_flexray_replay_$sc.txt
+@@ -158,7 +166,7 @@ PY
+ # replays against run 4 (DDE+EGS on the bus, and DDE unplugged) and run 5 (EGS fuse pulled,
+ # DDE off = the v1e target setup), ptcan_stats_t layout C vs frts.py, logger --can-tx flow.
+ gcc -std=c11 -Wall -Wextra -Werror -Istubs -I../../src -o /tmp/pico_flexray_test_pte \
+-    test_ptcan_emu.c ../../src/ptcan_emu_core.c
++    test_ptcan_emu.c ../../src/ptcan_emu_core.c ../../src/dde_engine.c
+ /tmp/pico_flexray_test_pte unit
+ /tmp/pico_flexray_test_pte e2e ptcan_e2e_vectors_run4.txt
+ RUN4_DDECAN="${PTE_RUN4_DDECAN:-/workspace/f11-emu-run4/replay/f11_emu4_ddecan.csv.can.csv}"
+@@ -213,4 +221,19 @@ fi
+ python3 test_cantx_logger.py /tmp/pico_flexray_pte_stats.bin > /tmp/pico_flexray_cantx_logger.txt 2>&1 ||
+     { cat /tmp/pico_flexray_cantx_logger.txt; exit 1; }
+ tail -n 1 /tmp/pico_flexray_cantx_logger.txt
++# v1g: check_emu_capture.py --engine on a real DDE start (SavvyCAN FR capture): the
++# per-start report, E2E CRC checks and "0x82 before CAS releases the starter" must pass
++ENGSTART=${ENGSTART_CSV:-/workspace/flexray-re-notes/captures/F11_engstartthenstop.csv}
++if [ -f "$ENGSTART" ]; then
++    python3 savvy_fr_to_frts.py "$ENGSTART" /tmp/pico_flexray_engstart.csv > /dev/null
++    python3 ../../tools/dde_emu/check_emu_capture.py /tmp/pico_flexray_engstart.csv --engine \
++        > /tmp/pico_flexray_engstart_check.txt || true
++    if grep -q "FAIL.*\(0x82\|E2E\|0xE6 b3\|ST_KL reached\)" /tmp/pico_flexray_engstart_check.txt ||
++       ! grep -q "PASS 0x82 sent before CAS released" /tmp/pico_flexray_engstart_check.txt; then
++        cat /tmp/pico_flexray_engstart_check.txt; exit 1
++    fi
++    echo "checker --engine on the real start capture: $(grep '^  start at' /tmp/pico_flexray_engstart_check.txt | head -n 1)"
++else
++    echo "(real engine start capture not found: checker --engine test skipped)"
++fi
+ echo "host tests: all OK"
+diff --git a/tests/host/savvy_fr_to_frts.py b/tests/host/savvy_fr_to_frts.py
+new file mode 100644
+index 0000000..d6fe48f
+--- /dev/null
++++ b/tests/host/savvy_fr_to_frts.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++"""v1g test helper: SavvyCAN FlexRay CSV (LEN 17 = cycle + 16 bytes) -> fr_ts_logger-style
++CSV with the columns check_emu_capture.py reads, for the slots given (hex), plus an empty
++<out>.can.csv. Used to run the --engine checks on a real DDE start capture."""
++import sys
++
++
++def main(src, dst, slots="74,26,28,29,3D,E6"):
++    keep = {int(x, 16) for x in slots.split(",")}
++    n = 0
++    with open(dst, "w") as out:
++        out.write("t_us,channel,slot_id,cycle,payload_len,header_flags,payload_hex\n")
++        for line in open(src):
++            f = line.rstrip().split(",")
++            if len(f) < 8 or f[0] == "Time Stamp" or "NULL" in line:
++                continue
++            sid = int(f[1], 16)
++            if sid not in keep:
++                continue
++            ln = int(f[5])
++            b = f[6:6 + ln]
++            if len(b) < ln or "" in b:
++                continue
++            out.write("%s,FR%d,%d,%d,%d,0x03,%s\n" % (f[0], int(f[4]) + 1, sid, int(b[0], 16), ln - 1, "".join(b[1:])))
++            n += 1
++    open(dst + ".can.csv", "w").write("t_us,can_id,ide,dir,data_hex\n1,0x100,0,Rx,00\n")
++    print("%d frames" % n)
++
++
++if __name__ == "__main__":
++    main(*sys.argv[1:])
+diff --git a/tests/host/test_cantx_logger.py b/tests/host/test_cantx_logger.py
+index 1a15df5..fbb6c94 100644
+--- a/tests/host/test_cantx_logger.py
++++ b/tests/host/test_cantx_logger.py
+@@ -32,10 +32,12 @@ sys.modules["usb"], sys.modules["usb.core"], sys.modules["usb.util"] = usb, usb.
+ 
+ 
+ class FakeDev:
+-    def __init__(self, cantx_ok=True, stats=None):
++    def __init__(self, cantx_ok=True, stats=None, engine_ok=True):
+         self.log = []
+         self.cantx_ok = cantx_ok
+         self.stats = stats
++        self.engine_ok = engine_ok
++        self.eng_phase = 0
+ 
+     def set_configuration(self):
+         pass
+@@ -48,6 +50,19 @@ class FakeDev:
+             return bytes(frts.TS_INFO_STRUCT.pack(*([1, 3, 0, 1, 100_000_000] + [0] * 13)))
+         if bm == 0xC0 and req == frts.REQ_GET_CANTX:
+             return self.stats
++        if req in (frts.REQ_SET_ENGINE, frts.REQ_GET_ENGINE) and not self.engine_ok:
++            raise USBError("Pipe error")
++        if req == frts.REQ_SET_ENGINE and value >> 8 == frts.ENGINE_CMD_START:
++            self.eng_phase = 2   # pretend the start went through
++        if req == frts.REQ_SET_ENGINE and value >> 8 == frts.ENGINE_CMD_STOP:
++            self.eng_phase = 4
++        if bm == 0xC0 and req == frts.REQ_GET_ENGINE:
++            run = self.eng_phase == 2
++            return frts.ENGINE_STATUS_STRUCT.pack(1, 2, self.eng_phase, 0xA, 0, 1, 0, 0x82 if run else 0x80,
++                                                  780 if run else 0, 2098, 1 if self.eng_phase else 0,
++                                                  1 if self.eng_phase == 4 else 0, 0, 100, 20, 1, 0xC8, 0x26, 0, 1234)
++        if bm == 0xC0 and req == frts.REQ_GET_EMU:
++            return bytes(frts.EMU_STATS_LEN)
+         return None
+ 
+     def read(self, ep, size, timeout=None):
+@@ -140,6 +155,46 @@ def main():
+     dev = FakeDev(cantx_ok=False)
+     rc = run(["-o", os.path.join(tmp, "t2.csv"), "--duration", "2", "--can-tx", "--no-console-log"], dev)
+     check(rc == 1, "firmware without 0xa5 -> error exit (%s)" % rc)
++
++    # v1g: --fake-start fallback: mode keepalive every 1 s, typed s / x, engine off on exit
++    check(frts.engine_wvalue("cas") == 1 and frts.engine_wvalue("fallback", 1) == 0x102
++          and frts.engine_wvalue(0, 2) == 0x200, "SET_ENGINE wValue = mode | cmd << 8")
++    d = frts.parse_engine_status(frts.ENGINE_STATUS_STRUCT.pack(1, 1, 2, 0xC, 0, 1, 0, 0x82, 779, 2098, 1, 0, 0,
++                                                                5000, 30, 1, 0xC8, 0x26, 0, 99))
++    check(d and d["rpm"] == 779 and "phase run rpm 779 E6 82/26" in frts.fmt_engine(d), frts.fmt_engine(d))
++
++    class SlowStdin:
++        def __iter__(self):
++            import time
++            time.sleep(1.2)
++            yield "s\n"
++            time.sleep(1.5)
++            yield "?\n"
++            yield "x\n"
++    old_stdin = sys.stdin
++    sys.stdin = SlowStdin()
++    dev = FakeDev()
++    rc = run(["-o", os.path.join(tmp, "t3.csv"), "--duration", "4.5", "--status-interval", "1", "--emulate",
++              "--fake-start", "fallback", "--no-console-log"], dev)
++    sys.stdin = old_stdin
++    eng = [v for bm, r, v, i in dev.log if r == frts.REQ_SET_ENGINE]
++    check(rc == 0, "fake-start run rc=0 (%s)" % rc)
++    check(eng[0] == 2 and eng.count(2) >= 3, "fallback mode keepalive every second (%s)" % eng)
++    check(0x102 in eng and 0x202 in eng and eng.index(0x102) < eng.index(0x202), "typed s -> start, x -> stop")
++    check(eng[-1] == 0x200, "engine off (mode 0 + stop) on exit")
++    emu = [v for bm, r, v, i in dev.log if r == frts.REQ_SET_EMU]
++    last_eng = max(k for k, e in enumerate(dev.log) if e[1] == frts.REQ_SET_ENGINE)
++    last_emu = max(k for k, e in enumerate(dev.log) if e[1] == frts.REQ_SET_EMU)
++    check(emu[-1] == 0 and last_eng < last_emu, "fake engine off before emulator TX off")
++    rc = run(["-o", os.path.join(tmp, "t4.csv"), "--duration", "1", "--fake-start", "cas", "--no-console-log"], FakeDev())
++    check(rc == 2, "--fake-start without --emulate refused (%s)" % rc)
++    sys.stdin = iter(())
++    dev = FakeDev(engine_ok=False)
++    rc = run(["-o", os.path.join(tmp, "t5.csv"), "--duration", "2", "--emulate", "--fake-start", "cas",
++              "--no-console-log"], dev)
++    sys.stdin = old_stdin
++    check(rc == 1 and [v for bm, r, v, i in dev.log if r == frts.REQ_SET_EMU][-1] == 0,
++          "firmware without 0xa7 -> error exit, emulator TX off (%s)" % rc)
+     print("cantx logger: " + ("ok" if not fails else "%d FAILED" % fails))
+     return 1 if fails else 0
+ 
+diff --git a/tests/host/test_dde_emu_replay.c b/tests/host/test_dde_emu_replay.c
+index 53c95c5..1ccd7fe 100644
+--- a/tests/host/test_dde_emu_replay.c
++++ b/tests/host/test_dde_emu_replay.c
+@@ -35,6 +35,10 @@
+ //                              Car frames with a higher ID move back by our frame's minislots.
+ //              dyn-run5 DDE    run 5 (FR1 + the real DDE's other FR2 frames), each PDU sent in
+ //                              the cycles the real DDE sent it: our placement vs the real DDE's
++//              dyn-engine      v1g: dyn-run2 with the fake engine (CAS mode): ST_KL/brake in
++//                              injected 0x74 frames (A, D at 8 s, C, 9 + 8 at 22 s, D again at
++//                              26 s, 8 at KL15 off). Placement/order/counters as dyn-run2; E6
++//                              state changes sent as events, E2E CRCs valid, E8/FB9 rates.
+ //              dyn-unsure      dyn-run2 plus: an unexplained frame start just before 0xE6
+ //                              (no header), an unknown-length frame before it, and headers
+ //                              without their mark: 0xE6 must be skipped (counted), not sent
+@@ -50,6 +54,13 @@
+ // v1d: core 0 hands decoded frames (0xF1 KL15) to the emulator. Weak so that older
+ // sources without it (the v1 before-the-fix build) still link; then never called.
+ extern void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes) __attribute__((weak));
++// v1g fake engine (weak: older sources do not have it)
++#ifdef PICOFLEX_GET_ENGINE
++#define HAVE_ENGINE 1
++extern void dde_engine_host_set(uint16_t wvalue) __attribute__((weak));
++extern void dde_engine_fill_status(dde_engine_status_t *st) __attribute__((weak));
++#endif
++static bool engine_sc __attribute__((unused));   // scenario dyn-engine
+ 
+ #define K_TRUE 34       // ticks: fire-delay counter read -> TXEN mark (car test 1: K=34)
+ #define LOOP_TRUE 34    // ticks: TXEN mark -> FR1 RX echo mark (car test 1: loop=338 ns)
+@@ -64,7 +75,7 @@ static uint64_t T;   // 10 ns ticks
+ uint32_t time_us_32(void) { return (uint32_t)(T / 100u) + US_OFF; }
+ static uint64_t us_to_tick(uint32_t us) { return (uint64_t)(uint32_t)(us - US_OFF) * 100u; }
+ 
+-enum { EV_CAR, EV_HDR, EV_ALARM_MATCH, EV_ALARM_FORCE, EV_TXEN, EV_ECHO, EV_TXEND, EV_HOST, EV_CORE0 };
++enum { EV_CAR, EV_HDR, EV_ALARM_MATCH, EV_ALARM_FORCE, EV_TXEN, EV_ECHO, EV_TXEND, EV_HOST, EV_CORE0, EV_ENG74 };
+ typedef struct { uint64_t t; uint32_t seq; int type; uint32_t gen; uint32_t pos; uint8_t h[5]; uint8_t ours; uint8_t flags; uint32_t mpos; uint16_t b3p1; } ev_t;   // b3p1: 0xF1 payload[2] + 1 (0 = none)
+ #define EVF_NOMARK 1u     // header whose mark is not the latest one (capture row without a hw timestamp)
+ #define EVF_MARKONLY 2u   // frame start without a decoded header
+@@ -369,7 +380,21 @@ static void handle(ev_t e)
+             dde_emu_on_frame(0xF1, e.h[4] & 63u, pl, 4);
+         }
+         break;
++    case EV_ENG74: {   // v1g: vehicle 0x74 (even cycle): b3 low nibble ST_KL, b7 & 3 = 3 brake
++        static const struct { uint32_t ms; uint8_t k; } plan[] = {
++            {0, 0xA}, {8000, 0xD}, {10000, 0xC}, {22000, 0x9}, {22500, 0x8}, {25000, 0xA}, {26000, 0xD},
++            {28000, 0xC}, {34700, 0x8}};
++        uint32_t ms = (uint32_t)(e.t / 100000u);
++        uint8_t k = 0xA;
++        for (unsigned i = 0; i < sizeof plan / sizeof plan[0]; i++) if (ms >= plan[i].ms) k = plan[i].k;
++        uint8_t pl[8] = {0x00, 0x00, (uint8_t)(0xF0u | k), 0x00, 0x00, 0x85, 0x03, 0x00};
++        if (dde_emu_on_frame) dde_emu_on_frame(0x74, 0, pl, 8);
++        { ev_t n = e; n.t = e.t + 10000000ull; push(n); }   // every 100 ms
++        break; }
+     case EV_HOST:
++#ifdef HAVE_ENGINE
++        if (engine_sc && dde_engine_host_set) dde_engine_host_set(ENG_MODE_CAS);   // logger keepalive
++#endif
+         dde_emu_host_set(1);
+         { ev_t n = e; n.t = e.t + 100000000ull; push(n); }   // keepalive 1 s
+         break;
+@@ -726,9 +751,11 @@ static dynchk_t check_dyn(bool picked)
+             dde_core_build_dyn_pdu((unsigned)p, cyc, ctr >= 0 ? (unsigned)ctr : 0, pre != 0, fr);
+             okc = memcmp(fr + 5, txl[k].pl, plen) == 0;
+         }
++        if (engine_sc && (p == 0 || p == 2 || p == 3 || p == 4 || p == DDE_DYN_N_PDU - 2 || p == DDE_PDU_FB9 || p == DDE_PDU_E89 || p == DDE_PDU_142))
++            okc = true;   // v1g: engine bytes are checked in check_engine()
+         if (!okc) { if (d.bytes_bad + d.preign_bad < 5) printf("    0x%02X L%u cycle %u: bytes differ (ign +%.0f ms)\n", X, plen + 1, cyc, since / 1e5); if (pre_must || post_must) d.preign_bad++; else d.bytes_bad++; }
+         // the spec's ign-on 0xE6 bytes, independent of the builder
+-        if (p == 0 && post_must) {
++        if (p == 0 && post_must && !engine_sc) {
+             static const uint8_t e6[6] = {0x80, 0x64, 0x45, 0x44, 0x23, 0x47};
+             if ((txl[k].pl[1] & 0xF0) != 0x10 || memcmp(txl[k].pl + 2, e6, 6) != 0 ||
+                 txl[k].pl[0] != (dde_core_crc8(txl[k].pl + 1, 7) ^ 0x04)) d.spec_bad++;
+@@ -743,7 +770,7 @@ static dynchk_t check_dyn(bool picked)
+                 d.e85_early++;
+             }
+         }
+-        if (!picked) {
++        if (!picked && !(engine_sc && (p == 0 || p == 3 || p == 4))) {
+             if (pd->every4 ? (cyc & 3u) != (pd->cyc_mod8 & 3u) : (cyc & 7u) != pd->cyc_mod8) d.cyc_bad++;
+             // period grid: a send that was late (retry after a skip / no lock) is followed by
+             // one that is early by the same amount (the grid is kept)
+@@ -1056,6 +1083,73 @@ static void check_unsure(void)
+ static void shift_after_ours(uint64_t txen, unsigned id, unsigned cyc, unsigned plen) { (void)txen; (void)id; (void)cyc; (void)plen; }
+ #endif
+ 
++#ifdef HAVE_ENGINE
++// v1g dyn-engine: what the fake engine put on the bus
++static void __attribute__((unused)) check_engine(void)
++{
++    unsigned n_e6 = 0, e6_crc_bad = 0, e6_offgrid = 0, e2e_bad = 0, nstat = 0, n_fb9 = 0, n_e89 = 0;
++    unsigned seen81 = 0, seen82 = 0, seen92 = 0, seen80 = 0, rpm_max = 0, hi3 = 0;
++    uint64_t t_rpm950 = 0, t_e6_82 = 0, t_fast0 = 0, t_fast1 = 0; unsigned n_fast = 0;
++    for (unsigned k = 0; k < ntx; k++) {
++        const uint8_t *pl = txl[k].pl;
++        unsigned id = txl[k].id, cyc = txl[k].cycle;
++        int tg = dde_core_target_index(id);
++        if (tg >= 0) {
++            for (unsigned g = 0; g < DDE_EMU_N_E2E; g++) {
++                const uint8_t *e = dde_emu_e2e[g];
++                if (e[0] != (unsigned)tg || e[1] != (cyc & 3u)) continue;
++                nstat++;
++                if (pl[e[2]] != (uint8_t)(dde_core_crc8(&pl[e[2] + 1], e[3] - e[2]) ^ e[4])) e2e_bad++;
++                if ((pl[e[2] + 1] >> 4) == 3) hi3++;
++            }
++            if (id == 0x28 && (cyc & 3u) == 1) {
++                unsigned r = (unsigned)(pl[5] | pl[6] << 8) / 4u;
++                if (r > rpm_max) rpm_max = r;
++                if (!t_rpm950 && r >= 950) t_rpm950 = txl[k].txen;
++            }
++        }
++        if (id == 0xE6) {
++            n_e6++;
++            if (pl[0] != (uint8_t)(dde_core_crc8(pl + 1, 7) ^ 0x04)) e6_crc_bad++;
++            if ((cyc & 7u) != 2u) e6_offgrid++;
++            seen81 += pl[2] == 0x81; seen92 += pl[2] == 0x92; seen80 += pl[2] == 0x80 && seen92;
++            if (pl[2] == 0x82) { seen82++; if (!t_e6_82) t_e6_82 = txl[k].txen; }
++        }
++        if (id == 0xFB && txl[k].plen == 8) {
++            n_fb9++;
++            if (getenv("FB9_TRACE")) printf("    FB9 %.3f s cycle %u: %02X %02X %02X %02X\n", txl[k].txen / 1e8, cyc, pl[0], pl[1], pl[2], pl[3]);
++        }
++        if (id == 0xE8 && txl[k].plen == 8) {
++            n_e89++;
++            if (pl[0] == 0x25 && pl[1] == 0x14) {   // mean gap between running-content frames of one run
++                if (t_fast1 && txl[k].txen - t_fast1 < 20000000ull) { t_fast0 += txl[k].txen - t_fast1; n_fast++; }
++                t_fast1 = txl[k].txen;
++            }
++        }
++    }
++    double e8_iv = n_fast ? (double)t_fast0 / 1e5 / n_fast : 0;
++    printf("  engine: rpm max %u, 0x28 c1 >= 950 rpm at %.3f s, E6 82 on the bus at %.3f s (+%.1f ms); E6 frames %u "
++           "(%u outside cycle%%8==2 = events), 81/82/92/80 seen %u/%u/%u/%u, E6 CRC bad %u; static E2E groups %u, bad %u, "
++           "CounterHi=3 %u; FB L9 %u, E8 L9 %u (running content %u, mean interval %.1f ms)\n",
++           rpm_max, t_rpm950 / 1e8, t_e6_82 / 1e8, ((double)t_e6_82 - (double)t_rpm950) / 1e5, n_e6, e6_offgrid,
++           seen81, seen82, seen92, seen80, e6_crc_bad, nstat, e2e_bad, hi3, n_fb9, n_e89, n_fast, e8_iv);
++    CHECK(rpm_max >= 1000 && rpm_max < 1100, "rpm max %u", rpm_max);
++    CHECK(t_e6_82 && t_e6_82 >= t_rpm950 && (double)(t_e6_82 - t_rpm950) / 1e5 <= 15.0, "E6 82 sent within 15 ms of rpm 950");
++    CHECK(seen81 && seen82 && seen92 && seen80, "E6 state sequence");
++    CHECK(e6_offgrid >= 4, "E6 state changes sent as events (%u)", e6_offgrid);
++    CHECK(e6_crc_bad == 0 && e2e_bad == 0, "E2E CRCs");
++    CHECK(hi3 >= 8, "CounterHi=3 crank marker on the bus (%u)", hi3);
++    CHECK(n_fast > 50 && e8_iv > 50 && e8_iv < 70, "E8 L9 ~15/s while running (%u, %.1f ms)", n_fast, e8_iv);
++    CHECK(n_fb9 >= 60, "FB L9 sent on change while ramping (%u)", n_fb9);
++    dde_engine_status_t es; dde_engine_fill_status(&es);
++    printf("  engine status: mode %u phase %u starts %u stops %u rejects %u stkl %X\n", es.mode, es.phase,
++           (unsigned)es.starts, (unsigned)es.stops, (unsigned)es.rejects, es.stkl);
++    CHECK(es.starts == 2 && es.stops == 2 && es.rejects == 0, "two starts, two stops");
++}
++#else
++static void __attribute__((unused)) check_engine(void) { CHECK(0, "no engine in this build"); }
++#endif
++
+ int main(int argc, char **argv)
+ {
+     if (argc < 2) { fprintf(stderr, "usage: %s VECTORS [run1|run1-v1|foreign|stuck|noecho|lateecho]\n", argv[0]); return 2; }
+@@ -1094,6 +1188,8 @@ int main(int argc, char **argv)
+             dde_emu_test_dyn_pick = pick_real;
+         } else if (argc >= 4) load_dde(argv[3]);   // dyn-mitm: the real DDE's frames, for the 0x5C comparison only
+         if (unsure) setup_unsure();
++        engine_sc = strcmp(sc, "dyn-engine") == 0;
++        if (engine_sc) { ev_t e = {0}; e.t = 20; e.type = EV_ENG74; push(e); }
+         run_until(tend);
+         print_stats("end");
+         dde_emu_stats_t s = st();
+@@ -1125,7 +1221,7 @@ int main(int argc, char **argv)
+         for (unsigned k = 0; k < ntx; k++) nfb7 += (txl[k].plen & 3u) == 2u;
+         CHECK((unsigned)s.dyn_parks + 1u >= nfb7 && (unsigned)s.dyn_parks <= nfb7, "parks %u vs %u 14-byte frames", (unsigned)s.dyn_parks, nfb7);
+         if (!r5) {
+-            CHECK(check_preign_static() == 0, "static pre-ign content");
++            if (!engine_sc) CHECK(check_preign_static() == 0, "static pre-ign content");   // v1g: engine bytes in check_engine()
+             // every PDU sent about as often as its period allows (bus time after the first lock)
+             double cyc = (double)(t_capture_end - car[0].t) / CYC_T;
+             for (int p = 0; p < DDE_DYN_N_PDU; p++) {
+@@ -1143,12 +1239,14 @@ int main(int argc, char **argv)
+                 unsigned got = d.per_pdu[p];
+                 printf("  %s: sent %u, period allows %.1f\n", dde_dyn_pdu[p].name, got, want);
+                 if (!unsure && want >= 3) CHECK(got + 2 >= (unsigned)(want * 0.9), "%s sent %u of ~%.0f", dde_dyn_pdu[p].name, got, want);
+-                CHECK(got <= (unsigned)want + 2, "%s sent too often", dde_dyn_pdu[p].name);
++                if (!(engine_sc && (p == 3 || p == 4)))   // v1g: FB9 on change, E8 L9 15/s while running
++                    CHECK(got <= (unsigned)want + 2, "%s sent too often", dde_dyn_pdu[p].name);
+             }
+         } else {
+             compare_real();
+         }
+         if (unsure) check_unsure();
++        if (engine_sc) check_engine();
+         printf("%s: %s\n", sc, fails ? "FAILED" : "ok");
+         return fails ? 1 : 0;
+     }
+diff --git a/tests/host/test_engine.c b/tests/host/test_engine.c
+new file mode 100644
+index 0000000..92e745b
+--- /dev/null
++++ b/tests/host/test_engine.c
+@@ -0,0 +1,407 @@
++// v1g fake engine start (src/dde_engine.c) host checks:
++//  - off by default: every FlexRay / PT-CAN frame is bit-identical to v1f;
++//  - CAS start (ST_KL D + brake): the start / run / stop timeline of Ian's and Fred's
++//    specs (times checked with tolerances), idle 780 rpm = 30 0C;
++//  - every E2E CRC, alive counter and frame CRC of every frame built during the run is
++//    valid (FlexRay static + dynamic, PT-CAN via the real pte_next path);
++//  - fallback trigger (ST_KL A + brake + command), rejects, stop paths (ST_KL 9 / 8,
++//    stale ST_KL, PC gone, stop command), restart, new-wake reset;
++//  - writes the timeline to argv[1] (CSV) when given.
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "dde_emu_core.h"
++#include "dde_emu_tables.h"
++#include "dde_engine.h"
++#include "ptcan_emu_core.h"
++
++static int fails;
++#define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++static FILE *csv;
++static uint32_t T;               // simulated time (us)
++static eng_t E;
++
++// One FlexRay cycle: inputs every 100 ms (0x12F / 0x74 alternate is not needed: same path)
++static uint8_t in_stkl = 0xA; static bool in_brake = false; static bool in_feed = true;
++static void cycle5(void)
++{
++    T += 5000u;
++    if (in_feed && T % 100000u == 0) eng_input_stkl(&E, in_stkl, in_brake, T);
++    if (T % 1000000u == 0) eng_set_mode(&E, E.mode, T);   // logger keepalive (if mode != off)
++    eng_step(&E, T);
++    if (csv) {
++        const eng_out_t *o = &E.out;
++        fprintf(csv, "%.3f,%u,%s,%u,%u,%02X,%02X,%u,%u,%u,%02X,%02X,%u,%u,%u,%u\n", T / 1e6, in_stkl,
++                eng_phase_name(o->phase), o->rpm4 / 4u, o->torque, o->e6_b3, o->e6_b4,
++                o->e6_ready == 0xFF ? 9u : o->e6_ready, o->cnt_hi, o->fb9_b2, o->b142_b8, o->b142_b23,
++                o->fb7_mv, o->f3_val, o->fuel, o->e8_fast);
++    }
++}
++static void run_ms(uint32_t ms) { for (uint32_t k = 0; k < ms / 5u; k++) cycle5(); }
++static uint32_t ms_since(uint32_t t) { return (T - t) / 1000u; }
++
++// Validity of every frame built with the current overlay.
++static unsigned e2e_checked;
++static void check_frames(const char *what)
++{
++    uint8_t f[DDE_MAX_FRAME_BYTES];
++    for (unsigned tg = 0; tg < 4; tg++) {
++        for (unsigned c = 0; c < 64; c++) {
++            unsigned n = dde_core_build_static_ph(tg, c, c % 15u, false, DDE_PH_ON, f);
++            uint32_t crc = dde_core_frame_crc(f, n - 3u);
++            CHECK(f[n - 3] == (uint8_t)(crc >> 16) && f[n - 2] == (uint8_t)(crc >> 8) && f[n - 1] == (uint8_t)crc,
++                  "%s: frame CRC target %u cycle %u", what, tg, c);
++            if (!(dde_core_emu_indicators(tg, c, false) & 0x04u)) continue;
++            const uint8_t *pl = f + 5;
++            for (unsigned g = 0; g < DDE_EMU_N_E2E; g++) {
++                const uint8_t *e = dde_emu_e2e[g];
++                if (e[0] != tg || e[1] != (c & 3u)) continue;
++                CHECK(pl[e[2]] == (uint8_t)(dde_core_crc8(&pl[e[2] + 1], e[3] - e[2]) ^ e[4]),
++                      "%s: E2E CRC target %u cycle %u group %u", what, tg, c, g);
++                CHECK((pl[e[2] + 1] & 0x0F) == c % 15u, "%s: alive counter target %u cycle %u", what, tg, c);
++                uint8_t hi = pl[e[2] + 1] >> 4;
++                CHECK(hi == 1 || hi == 3 || hi == 0xF, "%s: CounterHi %X target %u cycle %u", what, hi, tg, c);
++                e2e_checked++;
++            }
++        }
++    }
++    for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) {
++        unsigned n = dde_core_build_dyn_pdu_ph(p, dde_dyn_pdu[p].cyc_mod8, 5, p == DDE_PDU_142 ? DDE_142_P2 : 1u, f);
++        uint32_t crc = dde_core_frame_crc(f, n - 3u);
++        CHECK(f[n - 1] == (uint8_t)crc && f[n - 2] == (uint8_t)(crc >> 8), "%s: dyn frame CRC pdu %u", what, p);
++        if (dde_dyn_pdu[p].kind == DDE_DYN_KIND_E2E) {
++            const uint8_t *pl = f + 5;
++            CHECK(pl[0] == (uint8_t)(dde_core_crc8(&pl[1], dde_dyn_pdu[p].plen - 1u) ^ dde_dyn_pdu[p].k),
++                  "%s: E6 E2E CRC", what);
++            CHECK((pl[1] & 0x0F) == 5, "%s: E6 alive counter", what);
++            e2e_checked++;
++        }
++    }
++}
++
++static void fr_payload(unsigned tg, unsigned c, uint8_t *pl)
++{
++    uint8_t f[DDE_MAX_FRAME_BYTES];
++    dde_core_build_static_ph(tg, c, 1, false, DDE_PH_ON, f);
++    memcpy(pl, f + 5, 16);
++}
++static void dyn_payload(unsigned p, uint8_t *pl)
++{
++    uint8_t f[DDE_MAX_FRAME_BYTES];
++    dde_core_build_dyn_pdu_ph(p, dde_dyn_pdu[p].cyc_mod8, 1, p == DDE_PDU_142 ? DDE_142_P2 : 1u, f);
++    memcpy(pl, f + 5, dde_dyn_pdu[p].plen);
++}
++
++// Off by default: identical bytes with and without the overlay pointer.
++static void test_off_identical(void)
++{
++    eng_reset(&E);
++    E.mode = ENG_MODE_OFF;
++    in_stkl = 0xD; in_brake = true;
++    run_ms(2000);                                   // a D without the mode: nothing
++    CHECK(E.phase == ENG_OFF && !E.out.active, "mode off: D must not start");
++    uint8_t a[DDE_MAX_FRAME_BYTES], b[DDE_MAX_FRAME_BYTES];
++    for (unsigned tg = 0; tg < 4; tg++) for (unsigned c = 0; c < 64; c++) {
++        dde_core_eng = NULL; unsigned n1 = dde_core_build_static_ph(tg, c, 3, false, DDE_PH_ON, a);
++        dde_core_eng = &E.out; unsigned n2 = dde_core_build_static_ph(tg, c, 3, false, DDE_PH_ON, b);
++        CHECK(n1 == n2 && !memcmp(a, b, n1), "off: static %u/%u differs", tg, c);
++    }
++    for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) for (unsigned ph = 0; ph < 3; ph++) {
++        dde_core_eng = NULL; unsigned n1 = dde_core_build_dyn_pdu_ph(p, 2, 3, ph, a);
++        dde_core_eng = &E.out; unsigned n2 = dde_core_build_dyn_pdu_ph(p, 2, 3, ph, b);
++        CHECK(n1 == n2 && !memcmp(a, b, n1), "off: dyn %u differs", p);
++    }
++    uint8_t d[8] = {1, 2, 3, 4, 5, 6, 7, 8}, d2[8]; uint8_t chi = 1;
++    memcpy(d2, d, 8);
++    for (unsigned id = 0; id < 0x800; id++) CHECK(!eng_patch_can(&E.out, (uint16_t)id, d2, &chi) && !memcmp(d, d2, 8) && chi == 1, "off: CAN %X", id);
++    printf("off by default: FlexRay static/dynamic and PT-CAN bytes identical to v1f\n");
++}
++
++static void test_cas_start_stop(void)
++{
++    eng_reset(&E);
++    T += 1000000u;
++    eng_set_mode(&E, ENG_MODE_CAS, T);
++    in_stkl = 0xA; in_brake = false;
++    run_ms(1000);
++    CHECK(E.phase == ENG_OFF, "KL15 only: no start");
++    in_brake = true;
++    run_ms(300);
++    in_stkl = 0xD;                                  // CAS starter request
++    uint32_t t_d = 0, t_blip = 0, t_blip_end = 0, t_rpm = 0, t_81 = 0, t_82 = 0, t_b4_26 = 0, t_ready0 = 0,
++             t_f97c = 0, t_b23 = 0, t_fb9 = 0, t_fb9_00 = 0, t_e8 = 0, t_c8 = 0;
++    for (int k = 0; k < 2400; k++) {               // 12 s
++        if (E.out.e6_b3 == 0x82 && t_82 && ms_since(t_82) > 300 && in_stkl == 0xD) in_stkl = 0xC;   // CAS: D -> C after 82
++        cycle5();
++        const eng_out_t *o = &E.out;
++        if (!t_d && E.phase == ENG_CRANK) t_d = T - 5000u;   // trigger in the previous step's input
++        if (!t_blip && o->cnt_hi == 3) t_blip = T;
++        if (t_blip && !t_blip_end && o->cnt_hi != 3) t_blip_end = T;
++        if (!t_rpm && o->rpm4) t_rpm = T;
++        if (!t_81 && o->e6_b3 == 0x81) t_81 = T;
++        if (!t_82 && o->e6_b3 == 0x82) t_82 = T;
++        if (!t_b4_26 && o->e6_b4 == 0x26) t_b4_26 = T;
++        if (t_82 && !t_ready0 && o->e6_ready == 0) t_ready0 = T;
++        if (!t_f97c && o->f97c) t_f97c = T;
++        if (!t_b23 && o->b142_b23 == 0x24) t_b23 = T;
++        if (!t_fb9 && o->fb9_b2) t_fb9 = T;
++        if (!t_c8 && o->fb9_b2 == 0xC8) t_c8 = T;
++        if (!t_fb9_00 && o->fb9_set && o->fb9_b3 == 0) t_fb9_00 = T;
++        if (!t_e8 && o->e8_fast) t_e8 = T;
++        if (k % 40 == 0) check_frames("running");
++        // safety: the overlay never claims a CounterHi other than 1/3 and 0x592 is never touched
++        uint8_t d[8] = {0x40, 0x22, 0x00, 0x14, 0xff, 0xff, 0xff, 0xff}; uint8_t chi = 0;
++        CHECK(!eng_patch_can(o, 0x592, d, &chi), "0x592 must stay the MIL-off frame");
++    }
++    CHECK(t_d && t_blip && t_rpm && t_81 && t_82, "start milestones missing");
++    int32_t rel = 0;
++#define RELV(t) ((int32_t)((t) - t_d) / 1000)
++#define REL(t) (rel = RELV(t))
++    printf("CAS start (ms after ST_KL D): CounterHi=3 %d..%d, first rpm %d, E6 81 %d, E6 82 %d, b4 26 %d, ready 0 %d,"
++           " F9 7C %d, 0x142 b23 24 %d, FB9 ramp %d (C8 %d), FB9 b3 00 %d, E8 fast %d\n",
++           RELV(t_blip), RELV(t_blip_end), RELV(t_rpm), RELV(t_81), RELV(t_82), RELV(t_b4_26), RELV(t_ready0), RELV(t_f97c),
++           RELV(t_b23), RELV(t_fb9), RELV(t_c8), RELV(t_fb9_00), RELV(t_e8));
++    CHECK(REL(t_blip) >= 45 && REL(t_blip) <= 60, "CounterHi=3 at +50 ms (Ian), got %d", rel);
++    CHECK(REL(t_blip_end) >= 145 && REL(t_blip_end) <= 165, "CounterHi back to 1 at +155 ms, got %d", rel);
++    CHECK(REL(t_rpm) >= 90 && REL(t_rpm) <= 105, "first rpm at +95 ms, got %d", rel);
++    CHECK(REL(t_81) >= 90 && REL(t_81) <= 110, "E6 81 at ~+100 ms, got %d", rel);
++    CHECK(REL(t_82) >= 850 && REL(t_82) <= 1200, "E6 82 at ~+1.0 s (3krev 1.0 s), got %d", rel);
++    CHECK((int32_t)(t_b4_26 - t_82) / 1000 >= 245 && (int32_t)(t_b4_26 - t_82) / 1000 <= 260, "b4 26 250 ms after 82");
++    CHECK((int32_t)(t_ready0 - t_82) / 1000 >= 15 && (int32_t)(t_ready0 - t_82) / 1000 <= 30, "ready 0 20 ms after 82");
++    CHECK((int32_t)(t_f97c - t_rpm) / 1000 >= 60 && (int32_t)(t_f97c - t_rpm) / 1000 <= 140, "F9 7C +0.07..0.13 s (Fred)");
++    CHECK((int32_t)(t_fb9 - t_rpm) / 1000 >= 1990 && (int32_t)(t_fb9 - t_rpm) / 1000 <= 2010, "FB9 ramp +2.0 s");
++    CHECK((int32_t)(t_c8 - t_fb9) / 1000 >= 3500 && (int32_t)(t_c8 - t_fb9) / 1000 <= 4300, "FB9 C8 in ~4 s");
++    CHECK((int32_t)(t_fb9_00 - t_rpm) / 1000 >= 4995 && (int32_t)(t_fb9_00 - t_rpm) / 1000 <= 5100, "FB9 00 00 at +5.0 s");
++    CHECK((int32_t)(t_e8 - t_rpm) / 1000 >= 2600 && (int32_t)(t_e8 - t_rpm) / 1000 <= 3100, "E8 fast +2.6..3.1 s");
++    // idle 780 rpm (owner: 30 0C), rpm field bytes
++    uint8_t pl[16];
++    dde_core_eng = &E.out;
++    fr_payload(1, 1, pl);
++    unsigned rpm = (unsigned)(pl[5] | pl[6] << 8) / 4u;
++    printf("idle after 12 s: 0x28 c1 b6..7 = %02X %02X (%u rpm), torque %02X %02X %02X, E6 %02X %02X ready %u\n",
++           pl[5], pl[6], rpm, pl[2], pl[3], pl[4], E.out.e6_b3, E.out.e6_b4, E.out.e6_ready);
++    CHECK(rpm >= 776 && rpm <= 790, "idle ~780 rpm, got %u", rpm);
++    CHECK(pl[2] == 0x32 && pl[3] == 0x28 && pl[4] == 0x83, "idle torque 32 28 83");
++    CHECK(E.out.e6_b3 == 0x82 && E.out.e6_b4 == 0x26 && E.out.e6_ready == 0, "running E6 82/26/0x");
++    fr_payload(1, 3, pl);
++    CHECK(pl[4] == 0x20 && pl[5] == 0x20 && pl[2] == 0x3E && pl[3] == 0x7D, "0x28 c3 running bytes");
++    fr_payload(2, 3, pl);
++    CHECK(pl[4] == 0x72 && pl[2] == 0xF9 && pl[3] == 0x7C && pl[10] == 0xF9 && pl[15] == 0x7C, "0x29 c3 running bytes");
++    fr_payload(3, 3, pl);
++    CHECK(pl[4] == 0xF9 && pl[5] == 0x7C && pl[6] == 0xF9 && pl[7] == 0x7C, "0x3D c3 running bytes");
++    fr_payload(0, 1, pl);
++    unsigned tu = pl[2] | pl[3] << 8;
++    CHECK(tu >= 2000 + 776 - 56 && tu <= 2000 + 790 - 56, "turbine 2000 + rpm - 56, got %u", tu);
++    uint8_t dp[32];
++    dyn_payload(DDE_PDU_E6, dp);
++    CHECK(dp[2] == 0x82 && dp[3] == 0x26 && (dp[6] >> 4) == 0 && (dp[1] >> 4) == 1, "0xE6 running bytes");
++    dyn_payload(DDE_PDU_142, dp);
++    CHECK(dp[7] == 0x84 && dp[22] == 0x24, "0x142 b8 84 / b23 24");
++    dyn_payload(DDE_PDU_FB9, dp);
++    CHECK(dp[1] == 0xC8 && dp[2] == 0 && dp[3] == 0, "FB L9 1F C8 00 00");
++    dyn_payload(DDE_PDU_FB7, dp);
++    CHECK(dp[2] == 0x6C && dp[3] == 0x39, "FB L7 14.70 V = 6C 39");
++    dyn_payload(DDE_PDU_E89, dp);
++    CHECK(dp[0] == 0x25 && dp[1] == 0x14 && dp[3] == 0xAC, "E8 L9 25 14 00 AC");
++
++    // engine-off request with KL15 on: ST_KL 9 -> 0x142 b8 A4 at +50 ms, then 8 -> stop
++    in_stkl = 0x9;
++    uint32_t t9 = T + 100000u - (T % 100000u);    // next input instant
++    uint32_t t_a4 = 0;
++    for (int k = 0; k < 60; k++) { cycle5(); if (!t_a4 && E.out.b142_b8 == 0xA4) t_a4 = T; }
++    CHECK(t_a4 && (int32_t)(t_a4 - t9) / 1000 >= 45 && (int32_t)(t_a4 - t9) / 1000 <= 60, "ST_KL 9: 0x142 A4 +50 ms (%d)",
++          (int32_t)(t_a4 - t9) / 1000);
++    CHECK(E.phase == ENG_RUN && E.out.e6_b3 == 0x82, "ST_KL 9 alone keeps running for up to 1 s");
++    in_stkl = 0x8;
++    uint32_t t_92 = 0, t_c0 = 0, t_ff7f = 0, t_80 = 0, t_ready1 = 0, t_e0 = 0, t_rpm0 = 0;
++    uint32_t ts = 0;
++    for (int k = 0; k < 1200; k++) {
++        cycle5();
++        const eng_out_t *o = &E.out;
++        if (!ts && E.phase == ENG_STOP) ts = E.ts;
++        if (!t_92 && o->e6_b3 == 0x92) t_92 = T;
++        if (!t_c0 && o->r29_b8 == 0xC0) t_c0 = T;
++        if (!t_e0 && o->c3_b56 == 3) t_e0 = T;
++        if (!t_ff7f && o->fb9_b3 == 0xFF) t_ff7f = T;
++        if (!t_rpm0 && ts && o->rpm4 == 0) t_rpm0 = T;
++        if (!t_80 && t_92 && o->e6_b3 == 0x80) t_80 = T;
++        if (t_80 && !t_ready1 && o->e6_ready == 1) t_ready1 = T;
++        if (k % 40 == 0) check_frames("stopping");
++    }
++    printf("stop (ms after ST_KL 8): E6 92 %d, 0x29 b8 C0 %d, 0x28 c3 E0 E0 %d, FB9 FF 7F %d, rpm 0 %d, E6 80 %d, ready 1 %d\n",
++           (int)(t_92 - ts) / 1000, (int)(t_c0 - ts) / 1000, (int)(t_e0 - ts) / 1000, (int)(t_ff7f - ts) / 1000,
++           (int)(t_rpm0 - ts) / 1000, (int)(t_80 - ts) / 1000, (int)(t_ready1 - ts) / 1000);
++    CHECK(ts && (t_92 - ts) / 1000 >= 15 && (t_92 - ts) / 1000 <= 25, "92 at +19 ms");
++    CHECK(t_e0 == t_92, "0x28 c3 E0 E0 together with 92 (Fred)");
++    CHECK((t_c0 - ts) / 1000 >= 30 && (t_c0 - ts) / 1000 <= 40, "0x29 b8 C0 +35 ms");
++    CHECK((t_ff7f - ts) / 1000 >= 235 && (t_ff7f - ts) / 1000 <= 250, "FB9 FF 7F +0.24 s");
++    CHECK((t_rpm0 - ts) / 1000 >= 1150 && (t_rpm0 - ts) / 1000 <= 1250, "rpm 0 at ~+1.2 s");
++    CHECK(t_80 && (t_ready1 - t_80) / 1000 >= 15 && (t_ready1 - t_80) / 1000 <= 30, "ready 1 20 ms after 80");
++    CHECK(E.phase == ENG_STOPPED && E.out.e6_b3 == 0x80 && E.out.e6_b4 == 0x64 && E.out.torque == 1978, "stopped state");
++    fr_payload(2, 3, pl);
++    CHECK(pl[2] == 0xF9 && pl[3] == 0x7C && pl[4] == 0x7C && pl[7] == 0xC0, "0x29 after stop: F9 7C sticky, b5 7C, b8 C0");
++    fr_payload(1, 3, pl);
++    CHECK(pl[2] == 0x1C && pl[3] == 0x7E && pl[4] == 0xE0, "0x28 c3 after stop 1C 7E E0 E0");
++    // restart from STOPPED
++    in_stkl = 0xA; run_ms(500);
++    in_stkl = 0xD;
++    uint32_t t_r = 0, t_r81 = 0, t_rfb9 = 0, t_re8 = 0; bool r_early = false;
++    for (int k = 0; k < 1400; k++) {
++        cycle5();
++        if (!t_r && E.phase == ENG_CRANK) t_r = T;
++        if (t_r && !E.cur_run && (E.out.fb9_b2 || E.out.e8_fast || E.out.e6_b3 == 0x82)) r_early = true;
++        if (t_r && !t_r81 && E.out.e6_b3 == 0x81) t_r81 = T;
++        if (t_r && !t_rfb9 && E.out.fb9_b2 == 0x2D) t_rfb9 = T;
++        if (t_r && !t_re8 && E.out.e8_fast && E.out.e89 == 1) t_re8 = T;
++    }
++    printf("restart: E6 81 +%d ms, FB9 ramp +%d ms, E8 running +%d ms\n", (int)(t_r81 - t_r) / 1000,
++           (int)(t_rfb9 - t_r) / 1000, (int)(t_re8 - t_r) / 1000);
++    CHECK(E.phase == ENG_RUN && E.starts == 2, "restart from stopped");
++    CHECK(!r_early && t_r81 && (t_r81 - t_r) / 1000 <= 110 && (t_rfb9 - t_r) / 1000 >= 2000 && (t_re8 - t_r) / 1000 >= 2600,
++          "restart replays the whole start timeline");
++    // new FlexRay wake: everything off again, mode kept
++    eng_reset(&E);
++    eng_step(&E, T);
++    CHECK(!E.out.active && E.mode == ENG_MODE_CAS, "new wake: overlay off, mode kept");
++}
++
++static void test_fallback_and_guards(void)
++{
++    eng_reset(&E);
++    T += 1000000u;
++    eng_set_mode(&E, ENG_MODE_FALLBACK, T);
++    in_stkl = 0xA; in_brake = false;
++    run_ms(500);
++    eng_command(&E, ENG_CMD_START, T);
++    run_ms(500);
++    CHECK(E.phase == ENG_OFF && E.last_reject == ENG_REJ_NO_BRAKE, "fallback: no brake -> rejected");
++    in_stkl = 0xD;     // fallback also ignores a plain D (no command)
++    in_brake = true;
++    run_ms(500);
++    CHECK(E.phase == ENG_OFF, "fallback mode: D alone does not start");
++    in_stkl = 0xA;
++    run_ms(200);
++    eng_command(&E, ENG_CMD_START, T);
++    run_ms(1500);
++    CHECK(E.phase == ENG_RUN, "fallback: A + brake + command -> running (phase %u)", E.phase);
++    eng_command(&E, ENG_CMD_STOP, T);
++    run_ms(2000);
++    CHECK(E.phase == ENG_STOPPED, "stop command -> stopped");
++    // PC goes away while running: mode lapses after 3 s -> stop
++    eng_command(&E, ENG_CMD_START, T);
++    run_ms(1500);
++    CHECK(E.phase == ENG_RUN, "fallback restart");
++    uint8_t mode = E.mode;
++    E.mode_us = T - 2000000u;   // last keepalive 2 s ago, stop sending keepalives:
++    for (int k = 0; k < 400 && E.phase == ENG_RUN; k++) { T += 5000u; if (T % 100000u == 0) eng_input_stkl(&E, 0xA, true, T); eng_step(&E, T); }
++    CHECK(E.phase == ENG_STOP && E.mode == ENG_MODE_OFF, "keepalive lost -> stop (mode was %u)", mode);
++    run_ms(2000);
++    // stale ST_KL while running -> stop
++    eng_set_mode(&E, ENG_MODE_CAS, T);
++    in_stkl = 0xD; run_ms(1500);
++    CHECK(E.phase == ENG_RUN, "CAS restart");
++    in_feed = false;
++    run_ms(700);
++    CHECK(E.phase == ENG_STOP || E.phase == ENG_STOPPED, "ST_KL lost 600 ms -> stop");
++    in_feed = true;
++    // start aborted in the first 95 ms: no trace
++    eng_reset(&E); in_stkl = 0xA; run_ms(300);
++    in_stkl = 0xD; run_ms(100);
++    CHECK(E.phase == ENG_CRANK, "crank");
++    in_stkl = 0x8; run_ms(300);
++    CHECK(E.phase == ENG_STOP || E.phase == ENG_STOPPED || E.phase == ENG_OFF, "ST_KL 8 while cranking stops");
++    printf("fallback trigger, rejects, stop command, PC lost, ST_KL lost, crank abort: checked\n");
++}
++
++// PT-CAN through the real pte_next() path: CRCs/counters valid, bytes as specified.
++static void test_ptcan(void)
++{
++    pte_t p;
++    pte_init(&p);
++    pte_set_mask(&p, PTE_MASK_ALL);
++    eng_reset(&E);
++    E.mode = ENG_MODE_CAS; E.mode_us = T;
++    uint64_t t0 = 10000000ull, t = t0;
++    uint32_t sent = 0, crc_ok = 0, a5_rpm_max = 0, f3_max = 0, d9_hi3 = 0, f9_hi3 = 0, f3_bad = 0;
++    uint8_t last397 = 0, a5_last[8] = {0}, f3_last[8] = {0};
++    unsigned n397 = 0; bool saw_3b3_c8 = false, saw_381_79 = false, saw_8f_72 = false;
++    uint8_t stkl = 0xA;
++    for (; t < t0 + 14000000ull; t += 1000) {
++        uint64_t rel = t - t0;
++        if (rel % 10000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x1A1, d, 8, t); }
++        if (rel == 3000000) stkl = 0xD;
++        if (rel == 5000000) stkl = 0xC;
++        if (rel == 10000000) stkl = 0x8;
++        if (rel % 100000 == 0) {
++            uint8_t d[8] = {0, 0, stkl, 0, 0, 0, 3, 0};
++            pte_on_rx(&p, 0x12F, d, 8, t);
++            eng_input_stkl(&E, stkl, true, (uint32_t)t);
++        }
++        if (rel % 640000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x510, d, 8, t); }
++        if (rel % 5000 == 0) { if (rel % 1000000 == 0) eng_set_mode(&E, ENG_MODE_CAS, (uint32_t)t); eng_step(&E, (uint32_t)t); }
++        p.eng = E.out.active ? &E.out : NULL;
++        pte_tx_t tx;
++        while (pte_next(&p, t, &tx)) {
++            CHECK(!pte_id_forbidden(tx.id), "forbidden id %X", tx.id);
++            const pte_def_t *def = &pte_defs[tx.idx];
++            if (def->data_id != 0xFFFF) {
++                CHECK(tx.data[0] == pte_e2e_crc(def->data_id, tx.data, tx.dlc), "PT-CAN CRC %X", tx.id);
++                crc_ok++;
++            }
++            if (tx.id == 0x0A5) {
++                uint32_t r = (uint32_t)(tx.data[5] | tx.data[6] << 8) / 4u;
++                if (r > a5_rpm_max) a5_rpm_max = r;
++                memcpy(a5_last, tx.data, 8);
++            }
++            if (tx.id == 0x0F3) {
++                uint32_t v = (uint32_t)(tx.data[1] >> 4) | (uint32_t)tx.data[2] << 4;
++                if (v > f3_max) f3_max = v;
++                if (v > 120) f3_bad++;
++                memcpy(f3_last, tx.data, 8);
++            }
++            if (tx.id == 0x0D9 && (tx.data[1] >> 4) == 3) d9_hi3++;
++            if (tx.id == 0x3F9 && (tx.data[1] >> 4) == 3) f9_hi3++;
++            if (tx.id == 0x3B3 && tx.data[1] == 0xC8) saw_3b3_c8 = true;
++            if (tx.id == 0x381 && tx.data[0] == 0x79) saw_381_79 = true;
++            if (tx.id == 0x08F && tx.data[4] == 0x72 && tx.data[2] == 0xF9) saw_8f_72 = true;
++            if (tx.id == 0x397 && tx.data[1] != last397) { n397++; last397 = tx.data[1]; }
++            if (tx.id == 0x592) CHECK(tx.data[0] == 0x40 && tx.data[1] == 0x22, "0x592 MIL off");
++            pte_commit(&p, &tx, t);
++            sent++;
++        }
++        if (rel == 9000000) {
++            uint32_t r = (uint32_t)(a5_last[5] | a5_last[6] << 8) / 4u;
++            CHECK(r >= 776 && r <= 800, "PT-CAN 0xA5 idle rpm %u", r);
++            CHECK(a5_last[2] == 0x32 && a5_last[3] == 0x28 && a5_last[4] == 0x83, "0xA5 idle torque 32 28 83");
++            uint32_t v = (uint32_t)(f3_last[1] >> 4) | (uint32_t)f3_last[2] << 4;
++            CHECK(v >= 76 && v <= 80, "0xF3 = rpm/10 at idle (%u)", v);
++        }
++    }
++    CHECK(a5_rpm_max >= 1000 && a5_rpm_max <= 1070, "0xA5 flare peak %u", a5_rpm_max);
++    CHECK(d9_hi3 >= 3 && d9_hi3 <= 8, "0xD9 CounterHi 3 for ~105 ms (%u frames)", d9_hi3);
++    CHECK(f9_hi3 >= 1, "0x3F9 81 event with CounterHi 3");
++    CHECK(saw_3b3_c8 && saw_381_79 && saw_8f_72, "0x3B3 C8 / 0x381 79 / 0x8F 72 F9 7C");
++    CHECK(E.phase == ENG_STOPPED, "PT-CAN run ends stopped");
++    printf("PT-CAN via pte_next: %u frames, %u E2E CRCs valid, 0xA5 peak %u rpm, 0xF3 max %u, D9 CounterHi=3 x%u, "
++           "0x397 d1 changes %u, 0x592 MIL off only\n", sent, crc_ok, a5_rpm_max, f3_max, d9_hi3, n397);
++}
++
++int main(int argc, char **argv)
++{
++    dde_core_init();
++    if (argc > 1) {
++        csv = fopen(argv[1], "w");
++        if (csv) fprintf(csv, "t_s,stkl,phase,rpm,torque_raw,e6_b3,e6_b4,ready,cnt_hi,fb9_b2,b142_b8,b142_b23,fb7_mv,f3,fuel,e8_fast\n");
++    }
++    test_off_identical();
++    dde_core_eng = &E.out;
++    test_cas_start_stop();
++    if (csv) { fclose(csv); csv = NULL; }
++    test_fallback_and_guards();
++    test_ptcan();
++    dde_core_eng = NULL;
++    printf("frames checked: %u E2E groups valid\n", e2e_checked);
++    printf("engine tests: %s\n", fails ? "FAILED" : "ok");
++    return fails ? 1 : 0;
++}
+diff --git a/tools/dde_emu/check_emu_capture.py b/tools/dde_emu/check_emu_capture.py
+index 7283ce1..c1ead06 100644
+--- a/tools/dde_emu/check_emu_capture.py
++++ b/tools/dde_emu/check_emu_capture.py
+@@ -12,13 +12,21 @@ What it reports (and the pass criteria printed in the README):
+   3. KL15 (0x12F ST_KL) and the brake signals: PT-CAN 0x173 d7 bits 0-1 and 0x12F d6
+      bits 0-1, FlexRay 0x74 b7 bits 0-1 on even cycles (bN = 1-based byte).
+   4. --engine: the v1g start/stop as sent (0x0A5 rpm, 0x0D9 crank nibble) and as seen on
+-     FlexRay (0x28 rpm, 0xE6 b3 state, ST_KL C/D).
++     FlexRay (0x28 rpm, 0xE6 b3 state, ST_KL C/D). Per start: ST_KL D -> first rpm ->
++     0xE6 81 -> 82 -> CAS releases the starter (D -> C), idle rpm, every E2E CRC of our
++     0x26/0x28/0x29/0x3D/0xE6 frames, 0x592 (MIL) never changed.
+ Exit code 0 = all PASS lines passed (missing data is reported, not failed).
+ """
+ import csv
+ import os
+ import sys
+ 
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++try:
++    import dde_emu_model as model   # E2E CRC tables (optional)
++except Exception:   # pragma: no cover
++    model = None
++
+ EMU_IDS = [0x3F9, 0x3FD, 0x39A, 0x396, 0x518, 0x0A5, 0x0D9, 0x0DC, 0x0F3, 0x08F,
+            0x2C4, 0x281, 0x1B9, 0x381, 0x3B3, 0x397, 0x3FB, 0x512, 0x592]
+ PERIOD_MS = {0x0A5: 20, 0x0D9: 20, 0x0DC: 20, 0x0F3: 20, 0x08F: 30, 0x3FD: 100, 0x2C4: 100, 0x281: 100}
+@@ -156,6 +164,8 @@ def main(argv):
+     # 4. engine (v1g)
+     if engine:
+         print("\n4. fake engine start/stop (v1g)")
++        if fr:   # reload with every frame the engine changes
++            fr = load_fr(cap, {0x74, 0x26, 0x28, 0x29, 0x3D, 0xE6})
+         rpm = [(t, (p[5] | p[6] << 8) / 4.0) for t, p in by.get(0x0A5, []) if len(p) > 6]
+         if rpm:
+             runs_ = [r for r in runs_of([t for t, v in rpm if v > 0], 0.3e6)]
+@@ -163,11 +173,44 @@ def main(argv):
+                 vals = [v for t, v in rpm if r[0] <= t <= r[-1]]
+                 print("  PT-CAN 0x0A5 rpm > 0 from %.2f to %.2f s, max %.0f, last %.0f" % (T(r[0]), T(r[-1]), max(vals), vals[-1]))
+             res(bool(runs_), "rpm sent on PT-CAN")
++            d9 = edges([(t, p[1] >> 4) for t, p in by.get(0x0D9, []) if len(p) > 1])
++            print("  PT-CAN 0x0D9 CounterHi: " + " ".join("%X@%.2f" % (v, T(t)) for t, v in d9[:20]))
++        m592 = {bytes(p[2:]) for t, p in by.get(0x592, [])}
++        if m592:
++            res(len(m592) == 1, "0x592 (MIL / check-control) content never changed (%d variants)" % len(m592))
+         if fr:
++            st74 = edges([(t, p[2] & 15) for t, s, c, p in fr if s == 0x74 and len(p) > 6 and c % 2 == 0])
++            print("  FlexRay 0x74 ST_KL: " + " ".join("%X@%.2f" % (v, T(t)) for t, v in st74[:30]))
+             e6 = edges([(t, p[2]) for t, s, c, p in fr if s == 0xE6 and len(p) > 2])
+             print("  FlexRay 0xE6 b3: " + " ".join("%02X@%.2f" % (v, T(t)) for t, v in e6[:30]))
++            r28 = [(t, (p[5] | p[6] << 8) / 4.0) for t, s, c, p in fr if s == 0x28 and c % 4 == 1 and len(p) > 6]
+             res(any(v == 0x82 for _, v in e6), "0xE6 b3 reached 82 (running)")
+-        res(any(v in (0xC, 0xD) for _, v in stkl), "ST_KL reached C/D (CAS start request)")
++            # per start: ST_KL D edge -> first rpm -> 81 -> 82 -> D released
++            for td, _ in [(t, v) for t, v in st74 if v == 0xD]:
++                f_rpm = next((t for t, v in r28 if t >= td and v > 0), None)
++                t81 = next((t for t, v in e6 if t >= td and v == 0x81), None)
++                t82 = next((t for t, v in e6 if t >= td and v == 0x82), None)
++                trel = next((t for t, v in st74 if t > td and v != 0xD), None)
++                ms = lambda x: "%+.0f ms" % ((x - td) / 1e3) if x else "never"  # noqa: E731
++                print("  start at %.2f s (ST_KL D): first rpm %s, E6 81 %s, E6 82 %s, D released %s"
++                      % (T(td), ms(f_rpm), ms(t81), ms(t82), ms(trel)))
++                res(t82 is not None and (trel is None or trel >= t82),
++                    "0x82 sent before CAS released the starter (D -> %s)"
++                    % ("%X" % next(v for t, v in st74 if t == trel) if trel else "-"))
++            for r in runs_of([t for t, v in r28 if v > 0], 0.3e6):
++                idle = [v for t, v in r28 if r[-1] - 2e6 <= t <= r[-1] - 1.3e6]
++                if r[-1] - r[0] > 8e6 and idle:
++                    med = sorted(idle)[len(idle) // 2]
++                    res(760 <= med <= 820, "0x28 rpm %.2f..%.2f s: idle %.0f rpm (780 = 30 0C)" % (T(r[0]), T(r[-1]), med))
++            if model:
++                ours = [(t, s, c, p) for t, s, c, p in fr if s in (0x26, 0x28, 0x29, 0x3D)]
++                bad = sum(1 for t, s, c, p in ours if not model.e2e_check(p, s, c)[0])
++                e6bad = sum(1 for t, s, c, p in fr if s == 0xE6 and len(p) >= 8
++                            and model.crc8_e2e(p[1:8]) ^ 0x04 != p[0])
++                res(bad == 0 and e6bad == 0, "E2E CRCs: %d static frames, %d bad; 0xE6 %d bad" % (len(ours), bad, e6bad))
++        st_fr = [v for _, v in st74] if fr else []
++        res(any(v in (0xC, 0xD) for _, v in stkl) or any(v in (0xC, 0xD) for v in st_fr),
++            "ST_KL reached C/D (CAS start request; PT-CAN 0x12F or FlexRay 0x74)")
+     print("\n%s" % ("ALL PASS" if not fails else "%d FAIL(s)" % len(fails)))
+     return 1 if fails else 0
+ 
+diff --git a/tools/ts_capture/fr_ts_logger.py b/tools/ts_capture/fr_ts_logger.py
+index 73d2bb1..c4503cc 100644
+--- a/tools/ts_capture/fr_ts_logger.py
++++ b/tools/ts_capture/fr_ts_logger.py
+@@ -43,6 +43,18 @@ comma separated: step1 (3F9), step2 (+3FD), step3 (+39A), step4 (+396,518), step
+ dde, egs. The firmware only transmits while PT-CAN traffic is present (silence >200 ms
+ stops it). The counters (vendor request 0xa6) are printed with every status line as
+ "cantx: ...". TX is disabled on exit, Ctrl-C or any error. Default: no CAN TX at all.
++
++--fake-start cas|fallback (v1g DDE emulator firmware, with --emulate): the emulator
++also shows a running engine when you start the car (vendor request 0xa7, repeated
++every second; the firmware turns it off by itself 3 s after the last one, which
++"stops" the engine). Off by default.
++  cas:      the car's own start: ignition on, foot on the brake, press START. The
++            emulator answers CAS's starter request (ST_KL = D) with crank -> run -> idle.
++  fallback: CAS does not ask: ignition on (ST_KL = A), hold the brake, then type
++            "s" + Enter in this window (the brake must be pressed when it arrives).
++            "x" + Enter stops the fake engine in both modes, "?" prints the
++            engine status. Every engine phase change is printed as "ENGINE: ...".
++Ctrl-C (or the end of --duration) turns the fake engine off before TX is disabled.
+ """
+ import argparse
+ import csv
+@@ -340,6 +352,38 @@ def live(args):
+             cantx["prev"] = d["tx"]
+         return line
+ 
++    # v1g fake engine start
++    eng = {"on": False, "mode": frts.ENGINE_MODES.get(args.fake_start or "off", 0), "last": None, "next": 0.0,
++           "poll": 0.0}
++    cmdq = queue.Queue()
++
++    def eng_set(cmd=frts.ENGINE_CMD_NONE, mode=None):
++        ctrl_out(frts.REQ_SET_ENGINE, frts.engine_wvalue(eng["mode"] if mode is None else mode, cmd))
++
++    def eng_status():
++        try:
++            return frts.parse_engine_status(dev.ctrl_transfer(0xC0, frts.REQ_GET_ENGINE, 0, 0,
++                                                              frts.ENGINE_STATUS_LEN, timeout=1000))
++        except usb.core.USBError:
++            return None
++
++    def eng_poll(force=False):
++        d = eng_status()
++        if not d:
++            return
++        key = (d["phase"], d["rejects"], d["e6_b3"])
++        if force or key != eng["last"]:
++            if eng["last"] is not None and d["rejects"] != eng["last"][1]:
++                print("ENGINE: start refused - %s (logger t=%.1fs)"
++                      % (frts.ENGINE_REJECTS[d["last_reject"]] if d["last_reject"] < len(frts.ENGINE_REJECTS)
++                         else d["last_reject"], time.time() - t_start))
++            print("ENGINE: %s (logger t=%.1fs)" % (frts.fmt_engine(d), time.time() - t_start))
++            eng["last"] = key
++
++    def stdin_reader():
++        for line in sys.stdin:
++            cmdq.put(line.strip().lower())
++
+     emu_on = False
+     next_keepalive = 0.0
+     try:
+@@ -374,6 +418,25 @@ def live(args):
+             next_keepalive = time.time() + 2.0
+             print("EMULATOR TX ENABLED (it starts sending after 8 clean bus cycles). Ctrl-C disables it.")
+             print("emu: " + emu_line())
++        if args.fake_start:
++            try:
++                eng_set()
++            except usb.core.USBError as e:
++                print("ERROR: the device refused the fake engine start (%s).\n"
++                      "It is not running the v1g (or later) DDE emulator firmware "
++                      "(pico_flexray_dde_emu_v1g_ignon*.uf2)." % e, file=sys.stderr)
++                stop["flag"] = True
++                raise SystemExit(1)
++            eng["on"] = True
++            eng["next"] = time.time() + 1.0
++            if args.fake_start == "cas":
++                print("FAKE ENGINE START ARMED (cas): ignition on, foot on the brake, press START. "
++                      "Type x + Enter to stop the engine, ? + Enter for status.")
++            else:
++                print("FAKE ENGINE START ARMED (fallback): ignition on (not START), foot on the brake, "
++                      "then type s + Enter. x + Enter stops, ? + Enter for status.")
++            threading.Thread(target=stdin_reader, name="stdin", daemon=True).start()
++            eng_poll(True)
+         while True:
+             now = time.time()
+             if args.duration and now - t_start >= args.duration:
+@@ -405,6 +468,32 @@ def live(args):
+                     except usb.core.USBError:
+                         print("cantx: keepalive failed (USB)", file=sys.stderr)
+                     cantx_line()   # prints "CANTX FAULT ..." as soon as a fault appears
++            if eng["on"]:
++                while not cmdq.empty():
++                    c = cmdq.get()
++                    try:
++                        if c in ("s", "start"):
++                            eng_set(frts.ENGINE_CMD_START)
++                            print("ENGINE: start command sent (logger t=%.1fs)%s" % (now - t_start,
++                                  "" if eng["mode"] == 2 else " - cas mode ignores it, press START in the car"))
++                        elif c in ("x", "stop"):
++                            eng_set(frts.ENGINE_CMD_STOP)
++                            print("ENGINE: stop command sent (logger t=%.1fs)" % (now - t_start))
++                        elif c in ("?", "status", ""):
++                            eng_poll(True)
++                        else:
++                            print("ENGINE: commands: s = start (fallback), x = stop, ? = status")
++                    except usb.core.USBError:
++                        print("ENGINE: command failed (USB)", file=sys.stderr)
++                if now >= eng["next"]:
++                    eng["next"] = now + 1.0
++                    try:
++                        eng_set()
++                    except usb.core.USBError:
++                        print("engine: keepalive failed (USB)", file=sys.stderr)
++                if now >= eng["poll"]:
++                    eng["poll"] = now + 0.2
++                    eng_poll()
+             if now >= next_status:
+                 rate = (lg.n_fr - last_n) / max(1e-6, now - last_t)
+                 last_n, last_t = lg.n_fr, now
+@@ -420,12 +509,25 @@ def live(args):
+                     print("         emu: " + emu_line())
+                 if cantx["on"]:
+                     print("         cantx: " + cantx_line(True))
++                if eng["on"]:
++                    print("         engine: " + frts.fmt_engine(eng_status()))
+                 if raw:
+                     raw.flush()
+                 lg.f.flush()
+         if rd["fatal"]:
+             print(rd["fatal"], file=sys.stderr)
+     finally:
++        if eng["on"]:
++            # fake engine off first (the firmware would also drop it 3 s after the last keepalive)
++            for _ in range(3):
++                try:
++                    eng_set(frts.ENGINE_CMD_STOP, mode=0)
++                    print("FAKE ENGINE OFF")
++                    break
++                except Exception:
++                    time.sleep(0.1)
++            d = eng_status()
++            print("engine at stop: " + frts.fmt_engine(d))
+         if args.can_tx_mask and not cantx["on"]:
+             try:
+                 cantx_set(0)   # enable was refused or never sent: best effort, no warning
+@@ -492,6 +594,9 @@ def main(argv=None):
+     ap.add_argument("--can-tx-ids", default=None, metavar="LIST",
+                     help="like --can-tx but only these: hex IDs and/or sets, comma separated "
+                          "(step1=3F9, step2=+3FD, step3=+39A, step4=+396,518, step5/all, dde, egs), e.g. 3F9 or 3F9,3FD,39A")
++    ap.add_argument("--fake-start", choices=("cas", "fallback"), default=None,
++                    help="v1g: show a running engine on start (needs --emulate): cas = car's START button "
++                         "(ST_KL D), fallback = ignition on + brake + typed 's'")
+     ap.add_argument("--can-csv", default=None, help="CAN CSV output (default <output>.can.csv with --can)")
+     ap.add_argument("--savvy-csv", default=None,
+                     help="combined SavvyCAN CSV: FR1 = bus 0, FR2 = bus 1, PT-CAN = bus 2 "
+@@ -515,6 +620,8 @@ def main(argv=None):
+         except ValueError as e:
+             ap.error(str(e))
+         args.can = True
++    if args.fake_start and (args.replay or not args.emulate):
++        ap.error("--fake-start needs --emulate (live capture with the DDE emulator firmware)")
+     if args.read_size % 64:
+         ap.error("--read-size must be a multiple of 64")
+     if args.raw is None and not args.no_raw and not args.replay:
+diff --git a/tools/ts_capture/frts.py b/tools/ts_capture/frts.py
+index 9cc57c7..c2fccc2 100644
+--- a/tools/ts_capture/frts.py
++++ b/tools/ts_capture/frts.py
+@@ -19,6 +19,8 @@ REQ_SET_EMU = 0xA3        # DDE emulator build: wValue 1 = enable TX / keepalive
+ REQ_GET_EMU = 0xA4        # DDE emulator build: stats, 64/128/192/256 bytes by version (src/dde_emu.h dde_emu_stats_t)
+ REQ_SET_CANTX = 0xA5      # v1e V2 DDE emulator: PT-CAN TX ID mask, wValue = bits 0..15, wIndex = bits 16..31, 0 = off
+ REQ_GET_CANTX = 0xA6      # v1e: PT-CAN TX stats (src/ptcan_emu.h ptcan_stats_t, 178 bytes; v1f: 214)
++REQ_SET_ENGINE = 0xA7     # v1g: fake engine start, wValue = mode | cmd << 8 (repeat <= 3 s)
++REQ_GET_ENGINE = 0xA9     # v1g: engine status (src/dde_emu.h dde_engine_status_t, 40 bytes)
+ REQ_RESET_COMMS = 0xC0
+ 
+ FLAG_FRAME_CRC_OK = 0x01
+@@ -532,3 +534,50 @@ def savvy_can_row(rec, t_us):
+     return "%d,%08X,%s,%s,%d,%d%s" % (int(t_us), rec["can_id"], "true" if f & 1 else "false",
+                                       "Tx" if f & CAN_FLAG_TX else "Rx", rec["bus"],
+                                       len(rec["data"]), "".join(",%02X" % x for x in rec["data"]))
++
++
++# --- v1g fake engine start ---------------------------------------------------------
++ENGINE_MODES = {"off": 0, "cas": 1, "fallback": 2}
++ENGINE_CMD_NONE, ENGINE_CMD_START, ENGINE_CMD_STOP = 0, 1, 2
++ENGINE_PHASES = ("off", "crank", "run", "stop", "stopped")
++ENGINE_REJECTS = ("-", "no brake", "ST_KL not A/D (ignition off?)", "no start command", "busy", "mode off")
++ENGINE_STATUS_FIELDS = (
++    "version", "mode", "phase", "stkl", "stkl_src", "brake", "last_reject", "e6_b3", "rpm", "torque_raw",
++    "starts", "stops", "rejects", "ms_since_start", "ms_since_stkl", "cnt_hi", "fb9_b2", "e6_b4", "e6_ready", "seq",
++)
++ENGINE_STATUS_STRUCT = struct.Struct("<8B2H5I4BI")
++ENGINE_STATUS_LEN = ENGINE_STATUS_STRUCT.size
++assert ENGINE_STATUS_LEN == 40
++
++
++def engine_wvalue(mode, cmd=ENGINE_CMD_NONE):
++    """SET_ENGINE wValue: low byte mode (0 off, 1 cas, 2 fallback), high byte command."""
++    if isinstance(mode, str):
++        mode = ENGINE_MODES[mode]
++    if mode not in (0, 1, 2) or cmd not in (0, 1, 2):
++        raise ValueError("bad engine mode/command")
++    return mode | cmd << 8
++
++
++def parse_engine_status(raw):
++    raw = bytes(raw)
++    if len(raw) < ENGINE_STATUS_LEN:
++        return None
++    return dict(zip(ENGINE_STATUS_FIELDS, ENGINE_STATUS_STRUCT.unpack_from(raw)))
++
++
++def fmt_engine(d):
++    if not d:
++        return "(no engine status)"
++    mode = {v: k for k, v in ENGINE_MODES.items()}.get(d["mode"], str(d["mode"]))
++    phase = ENGINE_PHASES[d["phase"]] if d["phase"] < len(ENGINE_PHASES) else str(d["phase"])
++    rej = ENGINE_REJECTS[d["last_reject"]] if d["last_reject"] < len(ENGINE_REJECTS) else str(d["last_reject"])
++    stkl = "-" if d["stkl"] == 0xFF else "%X" % d["stkl"]
++    e6 = "%02X/%02X" % (d["e6_b3"], d["e6_b4"]) if d["e6_b3"] else "stock"
++    ready = "-" if d["e6_ready"] == 0xFF else str(d["e6_ready"])
++    return ("mode %s phase %s rpm %d E6 %s ready %s CounterHi %d FB9 %02X | ST_KL %s (%s, %s) brake %d | "
++            "starts %d stops %d rejects %d (last: %s)"
++            % (mode, phase, d["rpm"], e6, ready, d["cnt_hi"], d["fb9_b2"], stkl,
++               "PT-CAN 0x12F" if d["stkl_src"] else "FR 0x74",
++               "%d ms ago" % d["ms_since_stkl"] if d["ms_since_stkl"] != 0xFFFFFFFF else "never",
++               d["brake"], d["starts"], d["stops"], d["rejects"], rej))
+-- 
+2.47.3
+

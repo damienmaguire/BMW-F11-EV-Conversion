@@ -12,6 +12,9 @@
 #include "panda_usb.h"
 #include "pico_can_record.h"
 #include "v2_cantest.h"
+#if PICO_FLEXRAY_DDE_EMU
+#include "dde_standalone.h"
+#endif
 #if EMU_CAN_TX
 #include "ptcan_emu.h"
 #endif
@@ -30,6 +33,7 @@ static const mcp251863_cfg_t can_cfg = {
     .data_bitrate = V2_CAN_FD_DATA_BITRATE,
     .listen_only = (V2_CAN_MODE == V2_CAN_MODE_LISTEN_ONLY),
     .tx_fifo_depth = V2_CAN_TX_FIFO_DEPTH,
+    .tef_depth = EMU_CAN_TX ? 16 : 0, // v1f: our own TX frames, time stamped, for the logger
 };
 
 #define FD_ENABLED (V2_CAN_FD_DATA_BITRATE != 0)
@@ -152,7 +156,14 @@ static bool tick_cb(repeating_timer_t *t)
     (void)t;
     uint32_t n = ++tick_count;
     const uint32_t half_s = 500 / V2_CAN_TICK_MS;
+#if PICO_FLEXRAY_DDE_EMU && EMU_STANDALONE
+    // v1h.1 standalone: LED1 says the emulator state (flash every 2 s = waiting for the
+    // car, slow blink = emulating, fast blink = fault); see dde_standalone.h
+    (void)half_s;
+    led1(dde_standalone_led(dde_standalone_led_state(), n * V2_CAN_TICK_MS));
+#else
     if ((n % half_s) == 0) led1(((n / half_s) & 1) != 0); // 1 Hz heartbeat
+#endif
     tick_due = true;
     __sev();
     return true;

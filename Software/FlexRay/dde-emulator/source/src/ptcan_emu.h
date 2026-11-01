@@ -9,12 +9,14 @@
 #include "mcp251863.h"
 
 #define PICOFLEX_SET_CANTX 0xa5u  // vendor OUT: wValue = ID mask bits 0..15, wIndex = bits 16..31; 0 = off + clear fault
-#define PICOFLEX_GET_CANTX 0xa6u  // vendor IN: ptcan_stats_t (178 bytes)
+#define PICOFLEX_GET_CANTX 0xa6u  // vendor IN: ptcan_stats_t (v1: 178 bytes, v2 (v1f): 214 bytes;
+                                  // the firmware returns min(sizeof, wLength), so an old host
+                                  // asking for 178 bytes still gets the v1 layout)
 #define PTCAN_EMU_KEEPALIVE_MS 20000u  // host must repeat SET_CANTX within this, else TX off
 
 // Stats for vendor request 0xa6 (GET_CANTX), little endian, packed. Python:
-// struct '<BBBBIHBBBBBBIIIiiiiiIIII19H19I'
-#define PTCAN_STATS_VERSION 1
+// struct '<BBBBIHBBBBBBIIIiiiiiIIII19H19I' + v2 tail '<IIIIIIIIHH'
+#define PTCAN_STATS_VERSION 2
 typedef struct __attribute__((packed)) {
     uint8_t version;        // PTCAN_STATS_VERSION
     uint8_t state;          // pte_state_t
@@ -31,6 +33,17 @@ typedef struct __attribute__((packed)) {
     uint32_t tx_total, tx_fifo_full, tx_fail, mode_switches;
     uint16_t id[19];
     uint32_t tx[19];
+    // ---- v2 (v1f) ----
+    uint32_t loop_gap_max_us;   // longest gap between two CAN TX passes of the main loop
+    uint32_t loop_gaps_20ms;    // passes that came > 20 ms after the previous one
+    uint32_t late_max_us;       // latest a cyclic frame went out after its slot
+    uint32_t late_sends;        // cyclic frames sent > 5 ms after their slot
+    uint32_t resyncs;           // frames whose schedule restarted (> 250 ms behind)
+    uint32_t tx_logged;         // own TX frames (TEF) pushed to the host as TX records
+    uint32_t tx_log_lost;       // TEF overflow / unknown sequence / record queue full
+    uint32_t console_dropped;   // UART console bytes dropped (ring full; never blocks)
+    uint16_t burst_max;         // most frames queued in one pass
+    uint16_t reserved2;
 } ptcan_stats_t;
 
 void ptcan_emu_on_can_init(bool ok);
@@ -42,6 +55,7 @@ void ptcan_emu_fill_health_tx(uint32_t *tx_cnt, uint32_t *err_cnt);
 
 // Host interface (USB control requests, core 0). mask 0 = TX off + clear latched fault.
 void ptcan_emu_host_set(uint32_t mask);
+uint8_t ptcan_emu_fault(void);   // v1h.1 standalone LED: 0 = no PT-CAN TX fault
 uint16_t ptcan_emu_get_stats(uint8_t *buf, uint16_t max);
 
 #endif

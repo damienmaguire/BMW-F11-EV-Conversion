@@ -49,6 +49,7 @@ add_executable(pico_flexray
      src/flexray_injector.c
      src/flexray_fifo.c
      src/flexray_ts.c
+     src/console.c
      )
 
 # TS-CAPTURE (FIXED): hardware frame-start timestamps on the stock pass-through repeater.
@@ -72,6 +73,11 @@ if (PICO_FLEXRAY_BOARD_V2)
         )
     target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_BOARD_V2=1
         V2_CAN_MODE=0 V2_CAN_TEST_TX=0 V2_CAN_FD_DATA_BITRATE=0u)
+    # SPI clock to the CAN chip, default 4 MHz (board_pico_flexray_v2.h explains the
+    # 6.8 MHz limit). Bench tests only: -DV2_CAN_SPI_HZ=6250000
+    if (DEFINED V2_CAN_SPI_HZ)
+        target_compile_definitions(pico_flexray PRIVATE V2_CAN_SPI_HZ=${V2_CAN_SPI_HZ}u)
+    endif()
     # PT-CAN DDE/EGS emulation TX (v1e): DDE emulator builds only, opt-in at runtime
     # from the host (--can-tx). Boots Listen Only; see board_pico_flexray_v2.h.
     option(EMU_CAN_TX "DDE emulator V2 build: PT-CAN DDE/EGS frame TX, enabled at runtime by the host" ON)
@@ -84,8 +90,18 @@ if (PICO_FLEXRAY_BOARD_V2)
 else()
     target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_BOARD_V2=0)
 endif()
-# Bigger USB vendor transfers + tud_task during notify bursts (run 4 USB loss fix, untested on HW)
-option(PICO_FR_USB_FAST "1 KB vendor IN transfers, 16 KB TX buffer" OFF)
+# Bigger USB vendor transfers + tud_task during notify bursts (run 4 USB loss fix).
+# v1h: ON by default for the DDE emulator build (run 8 lost 11% of records in the device
+# FIFO with 64-byte transfers; see tests/host/usb_fast_model.py). Bench-test it before
+# relying on it in the car: it has not run on hardware yet. Capture-only builds keep OFF
+# unless asked (-DPICO_FR_USB_FAST=ON). An explicit -DPICO_FR_USB_FAST=OFF still wins.
+if (PICO_FLEXRAY_DDE_EMU)
+    set(PICO_FR_USB_FAST_DEFAULT ON)
+else()
+    set(PICO_FR_USB_FAST_DEFAULT OFF)
+endif()
+option(PICO_FR_USB_FAST "1 KB vendor IN transfers, 16 KB TX buffer" ${PICO_FR_USB_FAST_DEFAULT})
+message(STATUS "pico_flexray: PICO_FR_USB_FAST=${PICO_FR_USB_FAST}")
 if (PICO_FR_USB_FAST)
     target_compile_definitions(pico_flexray PRIVATE PICO_FR_USB_FAST=1)
 endif()
@@ -103,8 +119,21 @@ set(EMU_142 1 CACHE STRING "1 = send dynamic 0x142 L31 (every 4 cycles, cycle%4=
 set(EMU_10A 1 CACHE STRING "1 = send dynamic 0x10A L5 (cycle%8==2, every 200 cycles, KL15 on only)")
 set(EMU_68 1 CACHE STRING "1 = send dynamic 0x68 L3 (cycle%8==5, every 1000 cycles, from wake)")
 set(EMU_KL15_F1 1 CACHE STRING "1 = KL15 from 0xF1 byte 3 (0x20 on / 0xE0 off), 0x103 fallback; 0 = 0x103 only")
+# v1h.1 gear shifting: 1 = read the brake (0x173) and the lever (0x197, PT-CAN, V2 only)
+# and report P/R/N/D like the gearbox; 0 = fixed P as in v1h. Can also be switched off at
+# runtime by the logger (--no-gear).
+set(EMU_GEAR 1 CACHE STRING "1 = gear shifting P/R/N/D from lever 0x197 + brake 0x173 (v1h.1); 0 = fixed P (v1h)")
+# v1h.1 standalone: 1 = start emulating at power-up without a laptop, with the settings of
+# "fr_ts_logger.py --emulate --can-tx --fake-start cas --start-profile short" (see
+# src/dde_standalone.c). 0 = the normal build: nothing is sent until the logger says so.
+set(EMU_STANDALONE 0 CACHE STRING "1 = start emulating at power-up with no USB host (v1h.1 standalone build)")
 if (PICO_FLEXRAY_DDE_EMU)
-    target_sources(pico_flexray PRIVATE src/dde_emu.c src/dde_emu_core.c)
+    target_sources(pico_flexray PRIVATE src/dde_emu.c src/dde_emu_core.c src/dde_engine.c src/dde_gear.c
+        src/dde_standalone.c)
+    target_compile_definitions(pico_flexray PRIVATE EMU_GEAR=${EMU_GEAR} EMU_STANDALONE=${EMU_STANDALONE})
+    if (EMU_STANDALONE)
+        message(STATUS "EMU_STANDALONE=1: this image starts emulating (and PT-CAN TX on V2) at power-up, no host needed")
+    endif()
     pico_generate_pio_header(pico_flexray ${CMAKE_CURRENT_LIST_DIR}/src/dde_emu_tx.pio)
     target_compile_definitions(pico_flexray PRIVATE PICO_FLEXRAY_DDE_EMU=1
         EMU_SYNC_BITS=${EMU_SYNC_BITS} EMU_DYN_5C=${EMU_DYN_5C} EMU_TSS_BITS=${EMU_TSS_BITS}

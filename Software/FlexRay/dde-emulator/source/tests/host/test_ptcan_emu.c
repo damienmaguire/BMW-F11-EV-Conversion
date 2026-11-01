@@ -91,6 +91,12 @@ typedef struct {
     uint32_t tx, tx_while_silent, tx_bad_id;
 } sim_t;
 
+// Firmware loop model for the replay (v1f): at most g_burst frames per poll (v1e: 4,
+// v1f: 16 = the TX FIFO depth), and optionally a main-loop stall of g_stall_us every
+// g_stall_every_us (v1e: the blocking 5 s UART status print, ~120-160 ms).
+static int g_burst = 32;
+static uint64_t g_stall_every_us, g_stall_us;
+
 static void step(pte_t *p, sim_t *s, uint64_t now)
 {
     pte_state_t st = pte_state(p, now);
@@ -100,7 +106,7 @@ static void step(pte_t *p, sim_t *s, uint64_t now)
     }
     pte_tx_t tx;
     int guard = 0;
-    while (pte_next(p, now, &tx) && guard++ < 32) {
+    while (guard++ < g_burst && pte_next(p, now, &tx)) {
         if (pte_id_forbidden(tx.id)) s->tx_bad_id++;
         if (!p->have_rx || now - p->last_rx_us > PTE_SILENCE_US) s->tx_while_silent++;
         pte_commit(p, &tx, now);
@@ -124,7 +130,8 @@ static void simulate(pte_t *p, sim_t *s, const rx_t *v, size_t n, uint64_t t_fro
             pte_on_rx(p, v[k].id, v[k].d, v[k].len, v[k].t);
             k++;
         }
-        step(p, s, now);
+        bool stalled = g_stall_every_us && ((now - t_from) % g_stall_every_us) < g_stall_us;
+        if (!stalled) step(p, s, now);
         now += 1000;
     }
 }
@@ -141,8 +148,15 @@ static int run_replay(const char *path, uint32_t mask, const char *outp, double 
     sim_t s = {.out = out, .last_state = (pte_state_t)-1};
     uint64_t t0 = v[0].t > 2000000 ? v[0].t - 2000000 : 0;   // 2 s of sleeping bus first
     simulate(&p, &s, v, n, t0, v[n - 1].t + (uint64_t)(extra_s * 1e6));
+#ifndef PTE_V1E_COMPARE
+    fprintf(out, "E fault=%d fault_id=%03x wakes=%u kl15_on=%u kl15_off=%u tx=%u silent_tx=%u bad_id=%u "
+            "late=%u late_max_us=%u resyncs=%u\n",
+            p.fault, p.fault_id, p.wakes, p.kl15_on_edges, p.kl15_off_edges, s.tx, s.tx_while_silent, s.tx_bad_id,
+            p.late_sends, p.late_max_us, p.resyncs);
+#else   // replay only, built against the v1e core (git) to reproduce the run 6 loss
     fprintf(out, "E fault=%d fault_id=%03x wakes=%u kl15_on=%u kl15_off=%u tx=%u silent_tx=%u bad_id=%u\n",
             p.fault, p.fault_id, p.wakes, p.kl15_on_edges, p.kl15_off_edges, s.tx, s.tx_while_silent, s.tx_bad_id);
+#endif
     fclose(out);
     free(v);
     CHECK(s.tx_while_silent == 0, "TX while PT-CAN silent: %u", s.tx_while_silent);
@@ -271,8 +285,8 @@ static void unit(void)
     uint64_t OFF = W + 10000000;
     feed_bus(&p, &s, OFF, OFF + 50000000, 0x6, 0x510);    // others keep NM for 50 s
     uint64_t l512 = p.f[PTE_F_512].last_tx_us, l518 = p.f[PTE_F_518].last_tx_us;
-    CHECK(l518 >= OFF + 29000000 && l518 <= OFF + 29910000, "0x518 last OFF+%.2f", (double)(l518 - OFF) / 1e6);
-    CHECK(l512 >= OFF + 45200000 && l512 <= OFF + 45930000, "0x512 last OFF+%.2f", (double)(l512 - OFF) / 1e6);
+    CHECK(l518 >= OFF + 29300000 && l518 < OFF + PTE_518_RELEASE_US, "0x518 last OFF+%.2f", (double)(l518 - OFF) / 1e6);
+    CHECK(l512 >= OFF + 45300000 && l512 < OFF + PTE_512_RELEASE_US, "0x512 last OFF+%.2f", (double)(l512 - OFF) / 1e6);
     CHECK(pte_state(&p, OFF + 50000000) == PTE_ST_RUN, "still RUN while others hold NM");
     feed_bus(&p, &s, OFF + 50000000, OFF + 53000000, 0x6, 0);
     CHECK(pte_state(&p, OFF + 53000000 - 1000) == PTE_ST_PREP_SLEEP, "PREP_SLEEP 2 s after the last foreign NM");
@@ -304,6 +318,70 @@ static void unit(void)
 
     // 0x592: only ever 40 22 00 14
     CHECK(p.f[PTE_F_592].tx > 0 && memcmp(p.f[PTE_F_592].last, "\x40\x22\x00\x14\xff\xff\xff\xff", 8) == 0, "0x592 content");
+
+#ifndef PTE_V1E_COMPARE
+    // v1f: a 150 ms main-loop stall must not cost frames: the late 0x0A5 slots are all
+    // sent (late, back to back) once the loop runs again, the counter stays continuous,
+    // and the grid is kept (next slots on time again).
+    {
+        pte_init(&p);
+        pte_set_mask(&p, 1u << PTE_F_0A5);
+        uint32_t n0 = 0, n_stall = 0;
+        uint8_t prev = 0;
+        bool cont = true;
+        for (uint64_t t = W; t < W + 3000000; t += 1000) {
+            if (t % 10000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x1A1, d, 8, t); }
+            if (t % 100000 == 0) { uint8_t d[8] = {0, 0, 0xA, 0, 0, 0, 0, 0}; pte_on_rx(&p, 0x12F, d, 8, t); }
+            if (t % 640000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x510, d, 8, t); }
+            if (t >= W + 1500000 && t < W + 1650000) continue;   // loop stalled 150 ms
+            while (pte_next(&p, t, &tx)) {
+                uint8_t c = tx.data[1] & 0xF;
+                if (n0 && c != (prev >= 14 ? 0 : prev + 1)) cont = false;
+                prev = c;
+                if (t == W + 1650000) n_stall++;
+                pte_commit(&p, &tx, t);
+                n0++;
+            }
+        }
+        // first slot W+0.459, period 20 ms: slots up to W+2.999
+        uint32_t want = (uint32_t)((3000000 - 459000 - 1) / 20000 + 1);
+        CHECK(n0 == want, "0x0A5 with a 150 ms stall: %u sent, %u slots", n0, want);
+        CHECK(n_stall >= 7 && cont, "catch-up burst %u frames, counter continuous %d", n_stall, cont);
+        CHECK(p.resyncs == 0 && p.late_sends >= 7 && p.late_max_us >= 120000, "late %u max %u resyncs %u",
+              p.late_sends, p.late_max_us, p.resyncs);
+        // a 400 ms stall (> PTE_CATCHUP_MAX_US) is hopeless: one late frame, then the grid
+        // restarts from now (no 20-frame burst)
+        pte_init(&p);
+        pte_set_mask(&p, 1u << PTE_F_0A5);
+        uint32_t burst = 0;
+        for (uint64_t t = W; t < W + 3000000; t += 1000) {
+            if (t % 10000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x1A1, d, 8, t); }
+            if (t % 100000 == 0) { uint8_t d[8] = {0, 0, 0xA, 0, 0, 0, 0, 0}; pte_on_rx(&p, 0x12F, d, 8, t); }
+            if (t % 640000 == 0) { uint8_t d[8] = {0}; pte_on_rx(&p, 0x510, d, 8, t); }
+            if (t >= W + 1500000 && t < W + 1900000) continue;
+            uint32_t k = 0;
+            while (pte_next(&p, t, &tx)) { pte_commit(&p, &tx, t); k++; }
+            if (k > burst) burst = k;
+        }
+        CHECK(burst == 1 && p.resyncs == 1, "burst after a 400 ms stall %u, resyncs %u", burst, p.resyncs);
+    }
+
+    // 0x397: e3 blips and the post-OFF walk
+    {
+        pte_init(&p);
+        pte_set_mask(&p, 1u << PTE_F_397);
+        memset(&s, 0, sizeof s);
+        feed_bus(&p, &s, W, W + 10000000, 0xA, 0x510);
+        uint32_t n_on = p.f[PTE_F_397].tx;
+        CHECK(n_on >= 18 && n_on <= 30, "0x397 frames in 10 s: %u (real ~26)", n_on);
+        uint64_t OFF2 = W + 10000000;
+        feed_bus(&p, &s, OFF2, OFF2 + 300000, 0x6, 0x510);
+        CHECK(p.f[PTE_F_397].last[1] == 0xdd, "0x397 OFF+0.3 s: %02x", p.f[PTE_F_397].last[1]);
+        feed_bus(&p, &s, OFF2 + 300000, OFF2 + 4200000, 0x6, 0x510);
+        CHECK(p.f[PTE_F_397].last[1] == 0xe2, "0x397 OFF+4.2 s: %02x", p.f[PTE_F_397].last[1]);
+    }
+#endif
+
     printf("unit tests: %s\n", fails ? "FAILED" : "ok");
 }
 
@@ -318,6 +396,8 @@ static int write_stats(const char *path)
     st.ms_since_wake = 1000; st.ms_since_rx = 2; st.ms_since_on = -1; st.ms_since_off = 45930; st.ms_since_foreign_nm = 1950;
     st.tx_total = 99999; st.tx_fifo_full = 11; st.tx_fail = 12; st.mode_switches = 13;
     for (int i = 0; i < PTE_N_FRAMES; i++) { st.id[i] = pte_defs[i].id; st.tx[i] = 1000u + (uint32_t)i; }
+    st.loop_gap_max_us = 4321; st.loop_gaps_20ms = 5; st.late_max_us = 131000; st.late_sends = 77; st.resyncs = 1;
+    st.tx_logged = 36000; st.tx_log_lost = 2; st.console_dropped = 9; st.burst_max = 8;
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return 2; }
     fwrite(&st, sizeof st, 1, f);
@@ -331,8 +411,12 @@ int main(int argc, char **argv)
     if (argc >= 3 && !strcmp(argv[1], "stats")) return write_stats(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "unit")) { unit(); return fails ? 1 : 0; }
     if (argc >= 3 && !strcmp(argv[1], "e2e")) return run_e2e(argv[2]);
-    if (argc >= 5 && !strcmp(argv[1], "replay"))
+    if (argc >= 5 && !strcmp(argv[1], "replay")) {
+        // optional: burst per poll, stall every ms, stall length ms (firmware loop model)
+        if (argc >= 7) g_burst = atoi(argv[6]);
+        if (argc >= 9) { g_stall_every_us = 1000ull * strtoull(argv[7], NULL, 10); g_stall_us = 1000ull * strtoull(argv[8], NULL, 10); }
         return run_replay(argv[2], (uint32_t)strtoul(argv[3], NULL, 16), argv[4], argc >= 6 ? atof(argv[5]) : 5.0);
-    printf("usage: %s unit | e2e FILE | replay CANFILE MASK OUT [extra_s]\n", argv[0]);
+    }
+    printf("usage: %s unit | e2e FILE | replay CANFILE MASK OUT [extra_s [burst [stall_every_ms stall_ms]]]\n", argv[0]);
     return 2;
 }

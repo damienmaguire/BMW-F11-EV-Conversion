@@ -36,6 +36,7 @@
 #include "flexray_pins.h"
 #include "flexray_ts.h"
 #include "dde_emu_tables.h"
+#include "dde_gear.h"
 #include "dde_emu_tx.pio.h"
 
 #ifndef EMU_DYN_5C
@@ -107,6 +108,20 @@ static inline bool dyn_enabled(unsigned ds)
 #define DDE_EMU_WD_MARGIN_US 20u        // TX SM may be busy this long past a frame's computed end
 #define DDE_EMU_WD_UNEXPECTED_US 200u   // TX SM busy with no committed frame: fault after this
 #define DDE_EMU_ECHO_WINDOW_US 1000u    // echo header must arrive within this after our fire
+// v1h: do not move an already armed static slot when the new reference is less than this
+// many us before the slot (e.g. 0x27 -> 0x28 = 33 us, 0x3C -> 0x3D = 33 us); keep the
+// schedule made from the earlier reference instead.
+// v1h.2: ON by default with 70 us. Run 9: every echo miss was on a slot re-armed by the
+// reference right before it (0x28 by 0x27, 0x3D by 0x3C: alarm 14-15 us after the re-arm;
+// 0x29 by 0x27: 47 us), 0x26 (scheduled from 0x21, ~165 us before) had 0 misses in 54 k
+// frames. 70 us also keeps 0x27 off 0x29 (66 us). The earlier references are 66..240 us
+// before the slot: the timing error from that is a few ns (clock rate +-100 ppm).
+// -DDDE_EMU_RESCHED_MIN_US=0 = v1h.1 behaviour.
+#ifndef DDE_EMU_RESCHED_MIN_US
+#define DDE_EMU_RESCHED_MIN_US 70u
+#endif
+#define DDE_EMU_DIAG_CLOSE_US 40        // v1h diag: "re-armed shortly before the alarm"
+#define DDE_EMU_E8_CRANK_CYCLES 35u     // v1h: 0xE8 L9 every 35 cycles (~5.7/s) while cranking (real 4-7/s)
 
 enum { SL_IDLE = 0, SL_ARMED = 1, SL_DONE = 2, SL_WAIT = 3 };   // WAIT: dynamic, due, no certain minislot yet
 
@@ -217,12 +232,76 @@ static bool nm_ok, nm_ceiling;               // 0x5C allowed in this cycle / sto
 static volatile struct { uint8_t b3; uint32_t us; uint32_t seq; } f1mb;   // core0 -> core1 (0xF1)
 static uint32_t f1_seq_seen;
 static uint8_t f1_last_b3;
+// v1g fake engine (core 1 owns `eng`; core 0 talks to it through the mailboxes below)
+static eng_t eng;
+static uint8_t eng_e6_seen, eng_fb9_seen;    // last event counters acted on
+static bool eng_e6_event;                    // send 0xE6 in the next possible cycle (any cycle)
+static uint8_t eng_e8_alt;                   // 0xE8 L9 fast rate: alternate 8 / 16 cycles
+// ST_KL inputs: [0] = FlexRay 0x74 (even cycles), [1] = PT-CAN 0x12F. Written by core 0.
+static volatile struct { uint8_t stkl, brake; uint32_t us, seq; } stmb[2];
+static uint32_t stmb_seen[2];
+static uint8_t eng_stkl_src;
+static volatile struct { uint32_t us, seq; } brmb;                 // PT-CAN 0x173 brake pressed
+static uint32_t brmb_seen;
+static volatile struct { uint8_t mode, cmd, prof, gear_off; uint32_t us, seq; } hostmb;   // USB 0xa7
+// v1h.1 gear: core 1 owns `gear`; the lever 0x197 comes from core 0 (PT-CAN RX) through lvmb
+static gear_t gear;
+static volatile struct { uint8_t d[4]; uint8_t len; uint32_t us, seq; } lvmb;
+static uint32_t lvmb_seen;
+static uint8_t gear_e6_last[2];              // 0xE6 gear bits last sent (event on change)
+static dde_gear_status_t eng_pub_gear;
+static uint32_t hostmb_seen;
+// core 1 -> core 0: snapshot for the PT-CAN emulator (seqlock: odd = writing).
+// v1h.2: the write window holds only eng_pub + its time (a ~64-byte copy with interrupts
+// off on core 1, < 1 us); everything is computed before the window opens. The status
+// structs (USB/console only) have their own seqlock, so a PT-CAN read never waits on them.
+static volatile uint32_t eng_pub_seq;
+static eng_out_t eng_pub;
+static volatile uint32_t eng_pub_us;
+static volatile uint32_t eng_st_seq;          // seqlock 2: eng_pub_st + eng_pub_gear
+static dde_engine_status_t eng_pub_st;
+// v1h.2: the engine story and the gear run in core 1's background loop (dde_emu_core1_poll),
+// with interrupts on, not in the FlexRay header ISR. The header ISR only asks for one
+// step per FlexRay cycle; the ISR-side frame builders read eng_isr (copied with interrupts
+// off, so a frame never mixes two states).
+static eng_out_t eng_isr;
+static volatile uint32_t bg_req_seq;          // header ISR: +1 per new FlexRay cycle
+static volatile bool bg_new_wake;             // header ISR: a new wake (engine + gear reset)
+static uint32_t bg_seen_seq;
+static uint32_t bg_cyc_us;                    // last engine step (core 1 background)
+static uint32_t bg_gear_us;                   // last gear-only step (1 ms between cycles)
+static volatile uint16_t bg_max_us;           // longest background step (diag)
+static volatile uint16_t snap_fail;           // core 0: snapshot reads that failed (last good one reused)
 static struct {
     int16_t isr_late_min, isr_late_max;      // dynamic fires: alarm ISR entry - alarm time (us)
     int16_t r_entry_min, r_final_min;        // dynamic fires: fire delay at ISR entry / after the final check
     uint16_t topup_timeouts, hk_deferred, nm_ceiling_stops;
     bool any;
 } lat;
+// v1h echo-miss diagnostics (core 1 writes, core 0 copies; small tearing is acceptable)
+static struct {
+    uint16_t miss[DDE_EMU_N_STATIC], late[DDE_EMU_N_STATIC];
+    // per static slot: the last (re)schedule and the last fire
+    uint16_t sched_ref[DDE_EMU_N_STATIC];
+    uint32_t sched_us[DDE_EMU_N_STATIC];
+    int16_t f_r0[DDE_EMU_N_STATIC], f_r[DDE_EMU_N_STATIC], f_il[DDE_EMU_N_STATIC], f_lead[DDE_EMU_N_STATIC];
+    uint16_t f_ref[DDE_EMU_N_STATIC], f_hdr_us[DDE_EMU_N_STATIC];
+    uint8_t f_flags[DDE_EMU_N_STATIC];
+    uint32_t f_crc[DDE_EMU_N_STATIC], f_nc[DDE_EMU_N_STATIC];
+    // last miss
+    uint8_t lm_slot, lm_cycle, lm_flags;
+    int16_t lm_r0, lm_r, lm_il, lm_lead;
+    uint16_t lm_ref, lm_hdr_us;
+    uint16_t hdr_max, alarm_max, hdr_over10, miss_close, miss_crc, miss_preempt, guard_skips;
+    uint32_t static_fired;
+    uint16_t last_hdr_us;
+} dg;
+static volatile bool in_hdr_isr;     // core 1: the FR1 header hook is running
+// Streamer header counters (flexray_bss_streamer.c has the real ones; host tests: 0)
+__attribute__((weak)) void dde_emu_stream_counts(uint32_t *crc_fail, uint32_t *no_cand)
+{
+    *crc_fail = 0; *no_cand = 0;
+}
 static volatile struct {
     uint32_t sent[DDE_DYN_N_PDU];
     uint16_t skip[DDE_DYN_N_PDU];
@@ -290,6 +369,7 @@ static void __time_critical_func(count_late)(unsigned i, uint8_t reason, int32_t
 {
     cnt.late++;
     if (late_reason[reason] != 0xFFFFu) late_reason[reason]++;
+    if (i < DDE_EMU_N_STATIC) sat16_inc(&dg.late[i]);
     last_late_slot = (uint8_t)slot_id(i);
     last_late_reason = reason;
     last_late_r = (int16_t)clamp32(r, -32768, 32767);
@@ -508,6 +588,16 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
         if (!lat.any) lat.r_final_min = 32767;
         lat.any = true;
     }
+    if (i < DDE_EMU_N_STATIC) {
+        dg.f_r0[i] = (int16_t)clamp32(r0, -32768, 32767);
+        dg.f_il[i] = (int16_t)clamp32((int32_t)(now - s->alarm_us), -32768, 32767);
+        dg.f_lead[i] = (int16_t)clamp32((int32_t)(s->alarm_us - dg.sched_us[i]), -32768, 32767);
+        dg.f_ref[i] = dg.sched_ref[i];
+        dg.f_hdr_us[i] = dg.last_hdr_us;
+        dg.f_flags[i] = (uint8_t)((in_hdr_isr ? 1u : 0u) | (dg.f_lead[i] < DDE_EMU_DIAG_CLOSE_US ? 2u : 0u) |
+                                  (tx_expect ? 16u : 0u));
+        dde_emu_stream_counts(&dg.f_crc[i], &dg.f_nc[i]);
+    }
     if (r0 < DDE_EMU_R_PRECHECK) { count_late(i, DDE_EMU_LATE_SHORT, r0); return; }
     uint32_t seq1 = 0;
     flexray_ts_t t1;
@@ -551,6 +641,7 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
     }
     pio_sm_put(DDE_EMU_PIO, sm_fire, (uint32_t)r);
     if (i >= DDE_EMU_N_SLOTS && r < lat.r_final_min) lat.r_final_min = (int16_t)r;
+    if (i < DDE_EMU_N_STATIC) { dg.f_r[i] = (int16_t)r; dg.static_fired++; }
     if (s->nwords > npre) {
         // top-up: the SM drains a word per 3.2 us once the frame runs; the FIFO always has
         // >= 6 words queued here, so this never underruns unless the core stalls > 20 us.
@@ -592,8 +683,21 @@ static void __time_critical_func(fire_slot)(unsigned i, uint32_t now)
         // grid, anything later than half a period restarts it from now
         uint32_t per = dde_dyn_pdu[p].period;
         bool keep = pdu_started[p] && (int32_t)(abs_cycle - pdu_due[p]) < (int32_t)(per / 2u);
-        pdu_due[p] = keep ? pdu_due[p] + per : abs_cycle + per;
+        // v1h.2: an 0xE6 event copy sent BEFORE its periodic slot does not move the 1 s grid.
+        // v1h.1 pushed the grid a whole period on (event just after a periodic one = next
+        // periodic ~2 s later; run 9: 1.9-2.6 s gaps, EPS D51744 "DT_PT_2" x3, real max ~2.0 s).
+        bool ev_early = p == DDE_PDU_E6 && pdu_started[p] && (int32_t)(abs_cycle - pdu_due[p]) < 0;
+        if (!ev_early) pdu_due[p] = keep ? pdu_due[p] + per : abs_cycle + per;
         pdu_started[p] = true;
+        if (p == DDE_PDU_E6) eng_e6_event = false;
+        // v1g: while the fake engine runs the DDE sends 0xE8 L9 ~15/s (Fred): every 8 / 16 cycles
+        if (p == DDE_PDU_E89 && eng_isr.e8_fast) {
+            eng_e8_alt ^= 1u;
+            pdu_due[p] = abs_cycle + (eng_e8_alt ? 8u : 16u);
+        } else if (p == DDE_PDU_E89 && eng_isr.e8_crank) {
+            // v1h: while cranking the real DDE sends 0xE8 L9 4-7 times a second (Fred)
+            pdu_due[p] = abs_cycle + DDE_EMU_E8_CRANK_CYCLES;
+        }
     }
     fire_rec_t *f = &fired[i];
     f->pending = true;
@@ -619,7 +723,9 @@ static void __time_critical_func(alarm_isr)(void)
         }
     }
     housekeeping(now);
-    alarm_rearm_next(time_us_32());
+    uint32_t end = time_us_32();
+    alarm_rearm_next(end);
+    if (end - now > dg.alarm_max) dg.alarm_max = (uint16_t)(end - now > 0xFFFFu ? 0xFFFFu : end - now);
 }
 
 // ---------------------------------------------------------------- header hook
@@ -681,6 +787,21 @@ static void __time_critical_func(echo_missed)(unsigned i)
 {
     fired[i].pending = false;
     cnt.echo_miss++;
+    if (i < DDE_EMU_N_STATIC) {   // v1h: what was special about this fire?
+        uint32_t crc, nc;
+        dde_emu_stream_counts(&crc, &nc);
+        uint8_t fl = dg.f_flags[i];
+        if (crc != dg.f_crc[i]) { fl |= 4u; sat16_inc(&dg.miss_crc); }
+        if (nc != dg.f_nc[i]) fl |= 8u;
+        if (fl & 2u) sat16_inc(&dg.miss_close);
+        if (fl & 1u) sat16_inc(&dg.miss_preempt);
+        sat16_inc(&dg.miss[i]);
+        dg.lm_slot = (uint8_t)slot_id(i);
+        dg.lm_cycle = fired[i].cycle;
+        dg.lm_flags = fl;
+        dg.lm_r0 = dg.f_r0[i]; dg.lm_r = dg.f_r[i]; dg.lm_il = dg.f_il[i]; dg.lm_lead = dg.f_lead[i];
+        dg.lm_ref = dg.f_ref[i]; dg.lm_hdr_us = dg.f_hdr_us[i];
+    }
     if (echo_miss_run == 0 || fired[i].cycle != echo_miss_last_cycle) echo_miss_run_cycles++;
     echo_miss_last_cycle = fired[i].cycle;
     echo_miss_run++;
@@ -739,6 +860,173 @@ static void __time_critical_func(dyn_skip)(unsigned ds, unsigned reason)
     sat16_inc(&dcnt.reason[reason]);
 }
 
+// v1h.2: lever + brake inputs from core 0, gear step, gear bytes into eng.out. Core 1
+// background (dde_emu_core1_poll), every FlexRay cycle and every 1 ms in between.
+static void __time_critical_func(gear_tick)(uint32_t now)
+{
+    uint32_t bs = brmb.seq;
+    if (bs != brmb_seen) {
+        __dmb(); uint32_t us = brmb.us; brmb_seen = bs;
+        eng_input_brake(&eng, true, us);
+        gear_input_brake(&gear, us);
+    }
+    uint32_t ls = lvmb.seq;
+    if (ls != lvmb_seen && !(ls & 1u)) {
+        __dmb();
+        uint8_t d[4] = {lvmb.d[0], lvmb.d[1], lvmb.d[2], lvmb.d[3]}, len = lvmb.len;
+        uint32_t us = lvmb.us;
+        __dmb();
+        lvmb_seen = ls;
+        if (lvmb.seq == ls) gear_input_lever(&gear, d, len, us);   // torn read: skip, next one in 22-38 ms
+    }
+    gear_step(&gear, now, eng.phase == ENG_RUN);
+    gear_fill_out(&gear, &eng.out);
+}
+
+// v1h.2: hand the new state to the ISR side (frame builders, event sends) and to core 0.
+// Everything is computed BEFORE the shared windows open; each window is a plain copy.
+static void __time_critical_func(engine_publish)(uint32_t now, bool full)
+{
+    // 1) ISR side (core 1): eng_isr + the event decisions that touch the ISR's PDU plan
+    uint8_t ge[2] = {eng.out.g_set ? eng.out.g_fr_park : 2u, eng.out.g_set ? eng.out.g_nib : 3u};   // = what 0xE6 carries
+    bool e6 = false, fb9 = false;
+    if (memcmp(ge, gear_e6_last, 2) != 0) {   // 0xE6 carries the gear: send it as an event
+        memcpy(gear_e6_last, ge, 2);
+        if (eng.out.active) e6 = true;
+    }
+    if (eng.out.e6_ev != eng_e6_seen) { eng_e6_seen = eng.out.e6_ev; if (eng.out.active) e6 = true; }
+    if (eng.out.fb9_ev != eng_fb9_seen) { eng_fb9_seen = eng.out.fb9_ev; if (eng.out.active) fb9 = true; }
+    uint32_t irq = save_and_disable_interrupts();
+    if (bg_new_wake) {   // a new wake came in while we computed: drop this result, reset first
+        restore_interrupts(irq);
+        return;
+    }
+    eng_isr = eng.out;
+    if (e6) eng_e6_event = true;
+    if (fb9) pdu_due[DDE_PDU_FB9] = abs_cycle;   // next 0xFB L9 cycle (cycle % 8 == 3)
+    // E8 fast rate just started: do not wait for the 1 s grid
+    if (eng.out.e8_fast && (int32_t)(pdu_due[DDE_PDU_E89] - abs_cycle) > 16) pdu_due[DDE_PDU_E89] = abs_cycle;
+    // v1h: crank rate just started: first one now, not at the end of the 1 s period
+    if (eng.out.e8_crank && (int32_t)(pdu_due[DDE_PDU_E89] - abs_cycle) > (int32_t)DDE_EMU_E8_CRANK_CYCLES)
+        pdu_due[DDE_PDU_E89] = abs_cycle;
+    // 2) core 0 snapshot (PT-CAN): seqlock window = one struct copy, interrupts still off
+    eng_pub_seq = eng_pub_seq + 1u;   // odd: writing
+    __dmb();
+    eng_pub = eng.out;
+    eng_pub_us = bg_cyc_us;           // time of the last FlexRay-cycle step (500 ms bus-asleep rule)
+    __dmb();
+    eng_pub_seq = eng_pub_seq + 1u;   // even: consistent
+    restore_interrupts(irq);
+    if (!full) return;
+    // 3) status for USB / console (own seqlock, filled into locals first)
+    dde_engine_status_t st;
+    memset(&st, 0, sizeof st);
+    st.version = 2;
+    st.mode = eng.mode;
+    st.phase = eng.phase;
+    st.stkl = eng.stkl_have ? eng.stkl : 0xFF;
+    st.stkl_src = eng_stkl_src;
+    st.brake = eng.brake_have && (now - eng.brake_us) <= 300000u;
+    st.last_reject = (uint8_t)eng.last_reject;
+    st.e6_b3 = eng.out.e6_b3;
+    st.rpm = (uint16_t)(eng.out.rpm4 / 4u);
+    st.torque_raw = eng.out.torque;
+    st.starts = eng.starts; st.stops = eng.stops; st.rejects = eng.rejects;
+    st.ms_since_start = eng.starts ? (now - eng.t0) / 1000u : 0xFFFFFFFFu;
+    st.ms_since_stkl = eng.stkl_have ? (now - eng.stkl_us) / 1000u : 0xFFFFFFFFu;
+    st.cnt_hi = eng.out.cnt_hi; st.fb9_b2 = eng.out.fb9_b2; st.e6_b4 = eng.out.e6_b4;
+    st.e6_ready = eng.out.e6_ready;
+    st.seq = eng.out.seq;
+    // v1h: start profile and what the CAS did with our start
+    st.profile = eng.starts ? eng.prof : 0;
+    st.profile_req = eng.prof_req;
+    st.cas_flags = eng.cas_flags;
+    st.out_flags = (uint8_t)((eng.out.inj ? 1u : 0u) | (eng.out.e8_crank ? 2u : 0u) | (eng.out.e8_fast ? 4u : 0u));
+    st.d_to_82_ms = (eng.starts && eng.t82_have) ? (uint16_t)clamp32((int32_t)((eng.t82 - eng.t0) / 1000u), 0, 0xFFFE) : 0xFFFFu;
+    st.d_len_ms = (eng.starts && eng.start_d && eng.d_end_have)
+                      ? (uint16_t)clamp32((int32_t)((eng.d_end_us - eng.t0) / 1000u), 0, 0xFFFE) : 0xFFFFu;
+    st.d_end_after_82_ms = (eng.starts && eng.start_d && eng.d_end_have && eng.t82_have)
+                               ? (int16_t)clamp32((int32_t)(eng.d_end_us - eng.t82) / 1000, -32767, 32766)
+                               : (eng.starts && eng.start_d && eng.d_end_have) ? (int16_t)-32768 : (int16_t)0x7FFF;
+    st.t_rpm_ms = (eng.starts && eng.cur_run) ? (uint16_t)clamp32((int32_t)((eng.trpm - eng.t0) / 1000u), 0, 0xFFFE) : 0xFFFFu;
+    st.aborts = eng.aborts;
+    dde_gear_status_t gs;
+    gear_fill_status(&gear, &gs);
+    irq = save_and_disable_interrupts();
+    eng_st_seq = eng_st_seq + 1u;
+    __dmb();
+    eng_pub_st = st;
+    eng_pub_gear = gs;
+    __dmb();
+    eng_st_seq = eng_st_seq + 1u;
+    restore_interrupts(irq);
+}
+
+// v1g: once per FlexRay cycle: take the core-0 inputs, step the engine story, turn content
+// changes into event sends and publish a snapshot for core 0 (PT-CAN).
+// v1h.2: core 1 background loop (was: inside the FR1 header ISR, up to 189 us in run 9).
+static void __time_critical_func(engine_cycle)(uint32_t now)
+{
+    uint32_t hs = hostmb.seq;
+    if (hs != hostmb_seen) {
+        __dmb();
+        uint8_t mode = hostmb.mode, cmd = hostmb.cmd, prof = hostmb.prof, goff = hostmb.gear_off;
+        uint32_t us = hostmb.us;
+        hostmb_seen = hs;
+        gear_set_enabled(&gear, !goff, us);   // v1h.1: logger --no-gear = fixed P
+        eng_set_profile(&eng, prof);   // v1h: takes effect at the next start
+        eng_set_mode(&eng, mode, us);
+        if (cmd) eng_command(&eng, cmd, us);
+    }
+    for (unsigned k = 0; k < 2; k++) {
+        uint32_t sq = stmb[k].seq;
+        if (sq == stmb_seen[k]) continue;
+        __dmb();
+        uint8_t v = stmb[k].stkl, b = stmb[k].brake;
+        uint32_t us = stmb[k].us;
+        stmb_seen[k] = sq;
+        eng_input_stkl(&eng, v, b != 0, us);
+        eng_stkl_src = (uint8_t)k;
+    }
+    eng_step(&eng, now);
+    // v1h.1: gear after the engine (it needs "running"), bytes into the same snapshot
+    gear_tick(now);
+    bg_cyc_us = now;
+    bg_gear_us = now;
+    engine_publish(now, true);
+}
+
+// v1h.2: core 1 background (main.c core1_entry loop, after every interrupt; the 1 ms
+// housekeeping alarm guarantees >= 1 kHz). Never called from an ISR.
+void __time_critical_func(dde_emu_core1_poll)(void)
+{
+    uint32_t t0 = time_us_32();
+    uint32_t irq = save_and_disable_interrupts();
+    bool wake = bg_new_wake;
+    bg_new_wake = false;
+    uint32_t rq = bg_req_seq;
+    restore_interrupts(irq);
+    if (wake) {   // new wake: the engine starts "never started", the gear in P
+        eng_reset(&eng);
+        gear_reset(&gear, gear.enabled);
+        gear_e6_last[0] = 2; gear_e6_last[1] = 3;
+        eng_e6_seen = eng.out.e6_ev; eng_fb9_seen = eng.out.fb9_ev;
+    }
+    if (rq != bg_seen_seq) {
+        bg_seen_seq = rq;
+        engine_cycle(t0);
+    } else if ((uint32_t)(t0 - bg_cyc_us) < 20000u && (uint32_t)(t0 - bg_gear_us) >= 1000u) {
+        // between FlexRay cycles: the gear every 1 ms (lever timing), the engine stays per cycle
+        bg_gear_us = t0;
+        gear_tick(t0);
+        engine_publish(t0, false);
+    } else {
+        return;
+    }
+    uint32_t d = time_us_32() - t0;
+    if (d > bg_max_us) bg_max_us = (uint16_t)(d > 0xFFFFu ? 0xFFFFu : d);
+}
+
 // New cycle (first reference of it): close the old cycle, pick what is due.
 static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t seq0)
 {
@@ -755,6 +1043,11 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t 
         for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { pdu_due[p] = 0; pdu_ctr[p] = 1; pdu_started[p] = false; }
         dde_kl15_reset(&kl15, now);
         f1_seq_seen = f1mb.seq;   // an 0xF1 of the previous wake does not count
+        // v1g: a new wake starts with the engine "never started", v1h.1: and in P.
+        // v1h.2: the reset itself runs in the core 1 background; until then nothing is patched.
+        bg_new_wake = true;
+        eng_isr.active = 0; eng_isr.g_set = 0;
+        eng_e6_event = false;
     } else {
         abs_cycle += (cycle - abs_last_cycle) & 63u;
     }
@@ -771,6 +1064,9 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t 
     }
     dde_kl15_eval(&kl15, now, abs_cycle, EMU_KL15_F1 != 0);
     nm_ok = dde_nm_allowed(&kl15, abs_cycle, now, &nm_ceiling);
+    // v1h.2: the engine/gear step runs in the core 1 background (dde_emu_core1_poll), not here
+    bg_req_seq = bg_req_seq + 1u;
+    __sev();
     if (nm_ceiling && dde_core_dyn_cycle(cycle)) sat16_inc(&lat.nm_ceiling_stops);
     dde_dyn_track_start(&trk, cycle, true, seq0);
     if (!tx_allowed()) return;
@@ -781,6 +1077,7 @@ static void __time_critical_func(dyn_new_cycle)(int ev, unsigned cycle, uint8_t 
         if (dde_emu_test_dyn_pick) p = dde_emu_test_dyn_pick(ds, cycle);
         if (p == -1) continue;
 #endif
+        if (p == -2 && ds == DDE_DSLOT_E6 && eng_e6_event) p = DDE_PDU_E6;   // v1g: state change, send now
         if (p == -2) {
             p = dde_core_dyn_pdu_for(ds, cycle);
             if (p < 0) continue;
@@ -848,7 +1145,22 @@ static void __time_critical_func(dyn_feed)(unsigned id, unsigned plen, unsigned 
     if (dyn_plan()) alarm_rearm_next(time_us_32());
 }
 
+static void __time_critical_func(on_fr1_header)(const uint8_t h[5], uint32_t start_pos, uint32_t ring_mask);
+// v1h: the header hook, timed (diagnostics: how long it keeps interrupts off / the core busy)
 void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t start_pos, uint32_t ring_mask)
+{
+    uint32_t t0 = time_us_32();
+    in_hdr_isr = true;
+    on_fr1_header(h, start_pos, ring_mask);
+    in_hdr_isr = false;
+    uint32_t d = time_us_32() - t0;
+    if (d > 0xFFFFu) d = 0xFFFFu;
+    dg.last_hdr_us = (uint16_t)d;
+    if (d > dg.hdr_max) dg.hdr_max = (uint16_t)d;
+    if (d > 10u) sat16_inc(&dg.hdr_over10);
+}
+
+static void __time_critical_func(on_fr1_header)(const uint8_t h[5], uint32_t start_pos, uint32_t ring_mask)
 {
     if (!hw_ready && fault == DDE_EMU_FAULT_NONE) return;
     unsigned id = ((unsigned)(h[0] & 7u) << 8) | h[1];
@@ -933,6 +1245,11 @@ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t st
             if (delta < DDE_EMU_MIN_DELTA_Q8) continue;
             emu_slot_t *s = &slots[i];
             if (s->state == SL_DONE) continue;
+            if (DDE_EMU_RESCHED_MIN_US && i < DDE_EMU_N_STATIC && s->state == SL_ARMED && s->cycle == cycle &&
+                delta < (int32_t)(DDE_EMU_RESCHED_MIN_US * 25600u)) {
+                sat16_inc(&dg.guard_skips);   // v1h option: keep the schedule from the earlier reference
+                continue;
+            }
             if (s->state == SL_IDLE) prepare_slot(i, cycle);
             dde_sched_t sc;
             dde_core_schedule(t0.fine, t0.us, delta, loop, DDE_EMU_LEAD_US, &sc);
@@ -940,6 +1257,7 @@ void __time_critical_func(dde_emu_on_fr1_header)(const uint8_t h[5], uint32_t st
             s->txen_fine = sc.txen_fine;
             s->alarm_us = sc.alarm_us;
             s->state = SL_ARMED;
+            if (i < DDE_EMU_N_STATIC) { dg.sched_ref[i] = (uint16_t)id; dg.sched_us[i] = time_us_32(); }
             changed = true;
         }
     }
@@ -957,6 +1275,11 @@ void dde_emu_init_core1(void)
 {
     dde_core_init();
     dde_lock_reset(&lock);
+    eng_reset(&eng);
+    gear_reset(&gear, true);   // v1h.1: shifting on unless the build (EMU_GEAR=0) or the logger says no
+    gear_e6_last[0] = 2; gear_e6_last[1] = 3;
+    eng_isr = eng.out;
+    dde_core_eng = &eng_isr;   // v1g overlay: does nothing until a start (mode is off by default)
     for (unsigned i = 0; i < DDE_EMU_N_STATIC; i++) for (unsigned c = 0; c < 4; c++) counter[i][c] = 1;
     for (unsigned p = 0; p < DDE_DYN_N_PDU; p++) { pdu_ctr[p] = 1; pdu_due[p] = 0; }
     for (unsigned d = 0; d < DDE_DYN_N_SLOT; d++) dyn_due[d] = -1;
@@ -1118,7 +1441,17 @@ void dde_emu_fill_stats(dde_emu_stats_t *st)
 
 void dde_emu_on_frame(unsigned id, unsigned cycle, const uint8_t *payload, unsigned nbytes)
 {
-    (void)cycle;
+    if (id == 0x74u) {
+        // v1g: 0x74 even cycles = same PDU as PT-CAN 0x12F (Fred): b3 low nibble ST_KL,
+        // b7 bits 0-1 = 3 brake pressed. Odd cycles carry another PDU: ignore them.
+        if ((cycle & 1u) || nbytes < 7u) return;
+        stmb[0].stkl = payload[2] & 0x0Fu;
+        stmb[0].brake = (payload[6] & 3u) == 3u;
+        stmb[0].us = time_us_32();
+        __dmb();
+        stmb[0].seq = stmb[0].seq + 1u;
+        return;
+    }
     if (id != 0xF1u || nbytes < 3u) return;
     f1mb.b3 = payload[2];
     f1mb.us = time_us_32();
@@ -1176,4 +1509,219 @@ void dde_emu_print_stats(void)
            s.kl15_off_ago_ms == 0xFFFFFFFFu ? -1L : (long)s.kl15_off_ago_ms, (unsigned long)s.ceil_left_ms,
            s.nm_ceiling_stops, s.ph142, s.isr_late_min_us, s.isr_late_max_us, s.r_entry_min, s.r_final_min,
            s.topup_timeouts, s.hk_deferred, s.dyn_flags2);
+    dde_emu_diag_t d;
+    dde_emu_fill_diag(&d);
+    printf("emu: diag miss[26=%u 28=%u 29=%u 3D=%u] late[26=%u 28=%u 29=%u 3D=%u] last_miss=0x%02X c%u flags=0x%02X "
+           "r=%d->%d isr_late=%dus sched_by=0x%02X lead=%dus hdr=%uus | hdr_max=%uus alarm_max=%uus hdr>10us=%u "
+           "miss[close=%u crc=%u preempt=%u] crc_fail=%lu no_cand=%lu guard=%u/%uus snap_fail=%u bg_max=%uus\n",
+           d.miss[0], d.miss[1], d.miss[2], d.miss[3], d.late[0], d.late[1], d.late[2], d.late[3], d.lm_slot,
+           d.lm_cycle, d.lm_flags, d.lm_r_entry, d.lm_r_final, d.lm_isr_late_us, d.lm_sched_ref, d.lm_sched_lead_us,
+           d.lm_hdr_us, d.hdr_isr_max_us, d.alarm_isr_max_us, d.hdr_over_10us, d.miss_resched_close,
+           d.miss_crc_near, d.miss_preempt, (unsigned long)d.crc_fail, (unsigned long)d.no_cand,
+           d.resched_guard_skips, d.resched_min_us, d.snap_fail, d.bg_max_us);
+}
+
+// ---------------------------------------------------------------- v1g engine, core0 side
+void dde_engine_on_can(uint16_t id, const uint8_t *d, uint8_t len)
+{
+    if (id == 0x12Fu && len >= 7u) {          // ST_KL d2 low nibble, brake d6 bits 0-1
+        stmb[1].stkl = d[2] & 0x0Fu;
+        stmb[1].brake = (d[6] & 3u) == 3u;
+        stmb[1].us = time_us_32();
+        __dmb();
+        stmb[1].seq = stmb[1].seq + 1u;
+    } else if (id == 0x197u && len >= 4u) {  // v1h.1 gear lever (read only, never sent by us)
+        lvmb.seq = lvmb.seq + 1u;             // odd: writing
+        __dmb();
+        for (unsigned i = 0; i < 4u; i++) lvmb.d[i] = d[i];
+        lvmb.len = len;
+        lvmb.us = time_us_32();
+        __dmb();
+        lvmb.seq = lvmb.seq + 1u;
+    } else if (id == 0x173u && len >= 8u && (d[7] & 3u) == 3u) {   // brake pressed
+        brmb.us = time_us_32();
+        __dmb();
+        brmb.seq = brmb.seq + 1u;
+    }
+}
+
+void dde_engine_host_set(uint16_t wvalue, uint16_t windex)
+{
+    static uint8_t last_mode = 0xFF, last_prof = 0xFF;
+    // v1h.1: wIndex bit 8 = gear shifting off (fixed P as v1h); low byte = start profile
+    uint8_t goff = (windex & 0x100u) ? 1u : 0u;
+    windex &= 0xFFu;
+    uint8_t prof = windex < ENG_PROF_N ? (uint8_t)windex : ENG_PROF_DEFAULT;
+    static uint8_t last_goff = 0xFF;
+    if (goff != last_goff) printf("gear: shifting %s\n", (goff || !EMU_GEAR) ? "off (fixed P)" : "on");
+    last_goff = goff;
+    hostmb.gear_off = goff;
+    hostmb.prof = prof;
+    if (prof != last_prof) printf("engine: start profile %s%s\n", eng_prof_name(prof),
+                                  prof == ENG_PROF_DEFAULT ? " (build default)" : "");
+    last_prof = prof;
+    uint8_t mode = (uint8_t)(wvalue & 0xFFu), cmd = (uint8_t)(wvalue >> 8);
+    if (mode > ENG_MODE_FALLBACK) mode = ENG_MODE_OFF;
+    if (cmd > ENG_CMD_STOP) cmd = ENG_CMD_NONE;
+    hostmb.mode = mode;
+    hostmb.cmd = cmd;
+    hostmb.us = time_us_32();
+    __dmb();
+    hostmb.seq = hostmb.seq + 1u;
+    static const char *const mn[] = {"off", "cas", "fallback"};
+    if (mode != last_mode) printf("engine: fake start mode %s\n", mn[mode]);
+    if (cmd == ENG_CMD_START) printf("engine: start command\n");
+    if (cmd == ENG_CMD_STOP) printf("engine: stop command\n");
+    last_mode = mode;
+}
+
+// v1h.2 seqlock readers (core 0): retry with a short bounded wait (the writer holds the
+// window < 1 us with interrupts off), instead of 8 back-to-back tries.
+#define ENG_READ_WAIT_US 20u
+static bool engine_read(eng_out_t *o, uint32_t *us)
+{
+    uint32_t t0 = time_us_32();
+    do {
+        uint32_t a = eng_pub_seq;
+        if (!(a & 1u)) {
+            __dmb();
+            eng_out_t tmp = eng_pub;
+            uint32_t u = eng_pub_us;
+            __dmb();
+            if (eng_pub_seq == a) {
+                if (a == 0) return false;   // nothing published yet
+                if (o) *o = tmp;
+                if (us) *us = u;
+                return true;
+            }
+        }
+        tight_loop_contents();
+    } while ((uint32_t)(time_us_32() - t0) <= ENG_READ_WAIT_US);
+    return false;
+}
+
+static bool status_read(dde_engine_status_t *st, dde_gear_status_t *gs)
+{
+    uint32_t t0 = time_us_32();
+    do {
+        uint32_t a = eng_st_seq;
+        if (!(a & 1u)) {
+            __dmb();
+            if (st) *st = eng_pub_st;
+            if (gs) *gs = eng_pub_gear;
+            __dmb();
+            if (eng_st_seq == a) return a != 0;
+        }
+        tight_loop_contents();
+    } while ((uint32_t)(time_us_32() - t0) <= ENG_READ_WAIT_US);
+    return false;
+}
+
+// v1h.1 gear status (USB 0xab / console). Before the first FlexRay cycle: "P, nothing yet".
+void dde_gear_fill_status(dde_gear_status_t *gs)
+{
+    if (!status_read(0, gs)) {
+        memset(gs, 0, sizeof *gs);
+        gs->version = 1; gs->enabled = EMU_GEAR ? 3u : 0u; gs->lever = 0xFF;
+    }
+}
+
+// v1h.1: print every new gear event on the console ("GEAR: P -> R (brake on) ..."). Core 0
+// main loop; cheap (one 64-byte copy every 20 ms), never waits.
+void dde_gear_console_poll(void)
+{
+    static uint32_t next_us;
+    static uint16_t seen;
+    uint32_t now = time_us_32();
+    if ((int32_t)(now - next_us) < 0) return;
+    next_us = now + 20000u;
+    dde_gear_status_t gs;
+    dde_gear_fill_status(&gs);
+    if (gs.ev_seq == seen) return;
+    for (unsigned i = 0; i < GEAR_N_EV; i++) {
+        const gear_ev_t *e = &gs.ev[i];
+        if (!e->seq || (int16_t)(e->seq - seen) <= 0) continue;
+        char b[112];
+        gear_ev_text(e, b, sizeof b);
+        printf("%s\n", b);
+    }
+    if ((uint16_t)(gs.ev_seq - seen) > GEAR_N_EV)
+        printf("GEAR: (%u older gear events not shown)\n", (unsigned)(uint16_t)(gs.ev_seq - seen - GEAR_N_EV));
+    seen = gs.ev_seq;
+}
+
+// PT-CAN emulator (core 0, every frame it builds). v1h.2: a failed / torn read reuses the
+// last good snapshot - once the emulation has produced data we never fall back to the
+// stock (fixed-P, engine-not-running) template because of a read race (run 9: 0x3F9
+// 666x, 0x39A 163x, 0x3FD/0x0DC P glitches in D). Counted in the diag line (snap_fail).
+bool dde_engine_snapshot(eng_out_t *out)
+{
+    static eng_snap_cache_t cache;
+    eng_out_t o;
+    uint32_t us = 0;
+    bool ok = engine_read(&o, &us);
+    const eng_out_t *s = eng_snap_select(&cache, ok, &o, us, time_us_32());
+    snap_fail = (uint16_t)(cache.fails > 0xFFFFu ? 0xFFFFu : cache.fails);
+    if (!s) return false;
+    *out = *s;
+    return true;
+}
+
+void dde_engine_fill_status(dde_engine_status_t *st)
+{
+    if (!status_read(st, 0)) {
+        memset(st, 0, sizeof *st); st->version = 2; st->stkl = 0xFF;
+        st->d_to_82_ms = st->d_len_ms = st->t_rpm_ms = 0xFFFFu; st->d_end_after_82_ms = 0x7FFF;
+    }
+}
+
+void dde_engine_print(void)
+{
+    dde_engine_status_t s;
+    dde_engine_fill_status(&s);
+    if (s.mode == 0 && s.starts == 0 && s.rejects == 0) return;
+    printf("engine: mode=%u phase=%s rpm=%u e6=%02X/%02X ready=%u stkl=%X(%s) brake=%u starts=%lu stops=%lu "
+           "rejects=%lu last_reject=%u\n",
+           s.mode, eng_phase_name(s.phase), s.rpm, s.e6_b3, s.e6_b4, s.e6_ready, s.stkl,
+           s.stkl_src ? "12F" : "74", s.brake, (unsigned long)s.starts, (unsigned long)s.stops,
+           (unsigned long)s.rejects, s.last_reject);
+    // v1h: start profile + what the CAS did with our start, loud when it refused
+    printf("engine: profile=%s cas=0x%02X d_to_82=%dms d_len=%dms d_end_after_82=%dms first_rpm=%dms aborts=%lu inj=%u e8=%s\n",
+           eng_prof_name(s.profile ? s.profile : s.profile_req), s.cas_flags,
+           s.d_to_82_ms == 0xFFFFu ? -1 : (int)s.d_to_82_ms, s.d_len_ms == 0xFFFFu ? -1 : (int)s.d_len_ms,
+           (int)s.d_end_after_82_ms, s.t_rpm_ms == 0xFFFFu ? -1 : (int)s.t_rpm_ms, (unsigned long)s.aborts,
+           s.out_flags & 1u, (s.out_flags & 4u) ? "fast" : (s.out_flags & 2u) ? "crank" : "1/s");
+    static uint8_t last_flags;
+    static uint32_t last_starts;
+    if (s.starts != last_starts) { last_starts = s.starts; last_flags = 0; }
+    uint8_t nf = (uint8_t)(s.cas_flags & ~last_flags);
+    if (nf & ENG_CAS_D_ENDED_EARLY)
+        printf("ENGINE: *** CAS ended the start request (ST_KL D -> %X) BEFORE our running report - "
+               "CAS refused / gave up on our start ***\n", s.stkl);
+    if (nf & ENG_CAS_ABANDONED) printf("ENGINE: *** start abandoned (no running report sent) ***\n");
+    if (nf & ENG_CAS_D_LONG)
+        printf("ENGINE: *** CAS still requesting start 300 ms after our running report ***\n");
+    last_flags = s.cas_flags;
+}
+
+void dde_emu_fill_diag(dde_emu_diag_t *d)
+{
+    memset(d, 0, sizeof *d);
+    d->version = 1;
+    d->lm_slot = dg.lm_slot; d->lm_cycle = dg.lm_cycle; d->lm_flags = dg.lm_flags;
+    for (unsigned i = 0; i < DDE_EMU_N_STATIC && i < 4u; i++) { d->miss[i] = dg.miss[i]; d->late[i] = dg.late[i]; }
+    d->lm_r_entry = dg.lm_r0; d->lm_r_final = dg.lm_r; d->lm_isr_late_us = dg.lm_il; d->lm_sched_lead_us = dg.lm_lead;
+    d->lm_sched_ref = dg.lm_ref; d->lm_hdr_us = dg.lm_hdr_us;
+    d->hdr_isr_max_us = dg.hdr_max; d->alarm_isr_max_us = dg.alarm_max;
+    d->miss_resched_close = dg.miss_close; d->miss_crc_near = dg.miss_crc; d->miss_preempt = dg.miss_preempt;
+    d->resched_guard_skips = dg.guard_skips;
+    uint32_t crc, nc;
+    dde_emu_stream_counts(&crc, &nc);
+    d->crc_fail = crc; d->no_cand = nc;
+    d->static_fired = dg.static_fired;
+    d->hdr_over_10us = dg.hdr_over10;
+    d->resched_min_us = (uint16_t)DDE_EMU_RESCHED_MIN_US;
+    d->version = 2;                       // v1h.2: + snapshot read failures, background step time
+    d->snap_fail = snap_fail;
+    d->bg_max_us = bg_max_us;
 }

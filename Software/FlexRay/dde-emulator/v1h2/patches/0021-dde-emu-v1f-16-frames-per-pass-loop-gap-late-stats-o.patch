@@ -1,0 +1,672 @@
+From 55d14faa6f4b2a3ab06c537b9e55e51bcdb61a7e Mon Sep 17 00:00:00 2001
+From: "Sam (local build)" <sam@local>
+Date: Sat, 31 Oct 2026 16:43:25 +0000
+Subject: [PATCH 21/27] dde-emu v1f: 16 frames per pass, loop-gap/late stats,
+ own TX logged via the MCP TX event FIFO (dir=Tx), ptcan_stats v2, logger/frts
+ TX dir + stats v2
+
+---
+ src/mcp251863.c                     | 39 +++++++++++++
+ src/mcp251863.h                     | 18 +++++-
+ src/panda_usb.c                     |  8 ++-
+ src/panda_usb.h                     |  1 +
+ src/pico_can_record.h               |  8 ++-
+ src/ptcan_emu.c                     | 91 ++++++++++++++++++++++++++++-
+ src/ptcan_emu.h                     | 19 +++++-
+ src/v2_cantest.c                    |  1 +
+ tests/host/test_cantx_logger.py     | 35 ++++++++++-
+ tests/host/test_ptcan_emu.c         |  2 +
+ tools/dde_emu/check_ptcan_replay.py |  2 +-
+ tools/ts_capture/fr_ts_logger.py    | 28 ++++++---
+ tools/ts_capture/frts.py            | 28 ++++++++-
+ 13 files changed, 255 insertions(+), 25 deletions(-)
+
+diff --git a/src/mcp251863.c b/src/mcp251863.c
+index f9b62da..de3ff70 100644
+--- a/src/mcp251863.c
++++ b/src/mcp251863.c
+@@ -23,6 +23,9 @@
+ #define REG_C1MASK0    0x1F4
+ #define REG_C1TREC     0x034
+ #define REG_C1BDIAG1   0x03C
++#define REG_C1TEFCON   0x040
++#define REG_C1TEFSTA   0x044
++#define REG_C1TEFUA    0x048
+ #define REG_C1FIFOCON1 0x05C
+ #define REG_C1FIFOSTA1 0x060
+ #define REG_C1FIFOUA1  0x064
+@@ -69,6 +72,7 @@
+ 
+ static const mcp251863_cfg_t *g_cfg;
+ static uint32_t g_tx_seq;
++static bool g_tef_on;
+ static uint8_t g_rx_plsize_bytes = 8;
+ 
+ // nCS setup/hold: >= TSCK/2 before first SCK, >= TSCK high between frames
+@@ -225,6 +229,7 @@ mcp_status_t mcp251863_init(const mcp251863_cfg_t *cfg, mcp_bittiming_t *bt_out,
+     // Restricted retransmissions so an un-ACKed test frame is dropped after 3
+     // retries instead of retrying forever. ISO CRC, BRS allowed.
+     con &= ~(CON_STEF | CON_TXQEN | CON_BRSDIS);
++    if (cfg->tef_depth) con |= CON_STEF;  // v1f: TX event FIFO (our own TX, time stamped)
+     con |= CON_RTXAT | CON_ISOCRCEN;
+     con = (con & ~(7u << CON_REQOP_SHIFT)) | ((uint32_t)OPMOD_CONFIG << CON_REQOP_SHIFT);
+     wr32(REG_C1CON, con);
+@@ -234,6 +239,14 @@ mcp_status_t mcp251863_init(const mcp251863_cfg_t *cfg, mcp_bittiming_t *bt_out,
+     if (pre < 1) pre = 1;
+     wr32(REG_C1TSCON, TSCON_TBCEN | ((pre - 1) & 0x3FF));
+ 
++    // TEF (v1f, optional): tef_depth objects of 12 B (ID, flags+SEQ, SOF time stamp).
++    // No interrupt; polled by the PT-CAN emulation.
++    g_tef_on = cfg->tef_depth != 0;
++    if (g_tef_on) {
++        uint32_t d = cfg->tef_depth > 32 ? 32u : cfg->tef_depth;
++        wr32(REG_C1TEFCON, (1u << 5) | ((d - 1u) << 24)); // TEFTSEN, FSIZE
++    }
++
+     // FIFO1: receive, time stamped, interrupt on not-empty and on overflow.
+     g_rx_plsize_bytes = fd ? 64 : 8;
+     uint32_t rxcon = FIFOCON_TFNRFNIE | FIFOCON_RXOVIE | FIFOCON_RXTSEN |
+@@ -311,6 +324,32 @@ mcp_status_t mcp251863_send_fd_std(uint16_t id, const uint8_t *data, uint8_t len
+     return send_obj(MCP_FIFO_FD, id, data, len, true, brs);
+ }
+ 
++uint32_t mcp251863_next_seq(void) { return g_tx_seq & 0x7FFFFFu; }
++
++int mcp251863_tef_read(mcp_tef_t *e, bool *overflow)
++{
++    if (!g_tef_on || !g_cfg) return 0;
++    uint8_t b[8];
++    mcp_read(REG_C1TEFSTA, b, 8); // C1TEFSTA + C1TEFUA in one transfer
++    uint32_t ua = b[4] | (b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
++    if (ua == 0xFFFFFFFFu) return MCP_ERR_SPI;
++    if (b[0] & (1u << 3)) {                  // TEFOVIF
++        if (overflow) *overflow = true;
++        wr8(REG_C1TEFSTA, 0x00);             // clear (the other bits are read-only)
++    }
++    if (!(b[0] & 1u)) return 0;              // TEFNEIF: not empty
++    uint8_t o[12];
++    mcp_read((uint16_t)(RAM_START + (ua & 0xFFF)), o, sizeof o);
++    uint32_t te0 = o[0] | (o[1] << 8) | ((uint32_t)o[2] << 16) | ((uint32_t)o[3] << 24);
++    uint32_t te1 = o[4] | (o[5] << 8) | ((uint32_t)o[6] << 16) | ((uint32_t)o[7] << 24);
++    e->id = te0 & 0x7FFu;
++    e->dlc = (uint8_t)(te1 & 0xF);
++    e->seq = te1 >> 9;
++    e->ts = o[8] | (o[9] << 8) | ((uint32_t)o[10] << 16) | ((uint32_t)o[11] << 24);
++    wr8((uint16_t)(REG_C1TEFCON + 1), 0x01); // UINC: release the event
++    return 1;
++}
++
+ mcp_status_t mcp251863_set_normal(bool normal)
+ {
+     if (!g_cfg) return MCP_ERR_SPI;
+diff --git a/src/mcp251863.h b/src/mcp251863.h
+index ee0b025..29f066b 100644
+--- a/src/mcp251863.h
++++ b/src/mcp251863.h
+@@ -33,9 +33,13 @@ typedef struct {
+     uint32_t data_bitrate;  // CAN FD data phase (BRS); 0 = classic CAN 2.0 only mode
+     bool listen_only;       // true: REQOP Listen Only (never ACKs / error-frames / transmits)
+     uint8_t tx_fifo_depth;  // classic TX FIFO2 depth, 1..32 (0 = 1)
++    uint8_t tef_depth;      // v1f: TX event FIFO depth 1..32 (0 = no TEF). With a TEF the
++                            // controller notes every frame it SENT SUCCESSFULLY (ACKed) with
++                            // the SOF time stamp, so the logger can show our own TX.
+ } mcp251863_cfg_t;
+ 
+-// FIFO layout (TEF and TXQ disabled, FIFO1 starts at RAM 0x400):
++// FIFO layout (TXQ disabled; TEF only if cfg->tef_depth, 16 x 12 B = 192 B in the
++// emulator build, in front of FIFO1 -> 1608 B total; otherwise FIFO1 starts at RAM 0x400):
+ //   FIFO1 RX, time stamped, 32 x 8 B payload  (32 x 20 B = 640 B)   classic build
+ //                           16 x 64 B payload (16 x 76 B = 1216 B)  FD build
+ //   FIFO2 TX classic, 1 x 8 B   (16 B)
+@@ -90,6 +94,18 @@ mcp_status_t mcp251863_send_fd_std(uint16_t id, const uint8_t *data, uint8_t len
+ // FIFOs): normal = Normal CAN 2.0 (CAN FD if a data bit rate is configured), else
+ // Listen Only. Blocks up to 2 x 20 ms waiting for the controller.
+ mcp_status_t mcp251863_set_normal(bool normal);
++// Sequence number the NEXT queued frame will carry (23 bits; the TEF returns it).
++uint32_t mcp251863_next_seq(void);
++// One TX event (a frame we sent, ACKed by the bus). Returns 1 = event read, 0 = TEF
++// empty or not configured, MCP_ERR_SPI on a bad read. *overflow is set if the TEF had
++// overflowed (events lost) since the last call (TEFOVIF, cleared here).
++typedef struct {
++    uint32_t id;     // 11-bit ID (we only send standard frames)
++    uint32_t seq;    // 23-bit sequence number given at queue time
++    uint8_t dlc;
++    uint32_t ts;     // time base counter at SOF (same 1 us clock as RXMSGTS)
++} mcp_tef_t;
++int mcp251863_tef_read(mcp_tef_t *e, bool *overflow);
+ #endif
+ mcp_status_t mcp251863_read_tx_state_fifo(uint8_t fifo, mcp_tx_state_t *st);
+ mcp_status_t mcp251863_read_tx_state(mcp_tx_state_t *st); // FIFO1
+diff --git a/src/panda_usb.c b/src/panda_usb.c
+index 4460b79..e04f6f7 100644
+--- a/src/panda_usb.c
++++ b/src/panda_usb.c
+@@ -63,6 +63,7 @@ extern void capture_fill_ts_info(pico_ts_info_t *ti); // main.c
+ static pico_can_record_t can_q[CAN_REC_QUEUE_LEN];
+ static uint16_t can_q_w, can_q_r;
+ static bool can_records_enabled = V2_CAN_RECORDS_DEFAULT_ON;
++static bool can_tx_records_enabled; // v1f: SET_CAN_RECORDS wValue bit1 = own TX frames too
+ static panda_can_q_stats_t can_q_stats;
+ static inline bool can_q_empty(void) { return can_q_w == can_q_r; }
+ static void can_q_clear(void) { can_q_w = can_q_r = 0; }
+@@ -476,8 +477,10 @@ static bool handle_control_write(uint8_t rhport, tusb_control_request_t const *r
+     case PICOFLEX_SET_CAN_RECORDS:
+         // Host opts in to CAN records in the bulk-IN stream (see pico_can_record.h).
+         can_records_enabled = (request->wValue & 1) != 0;
++        can_tx_records_enabled = can_records_enabled && (request->wValue & 2) != 0;
+         if (!can_records_enabled) can_q_clear();
+-        printf("Control Write: SET_CAN_RECORDS -> %s\n", can_records_enabled ? "on" : "off");
++        printf("Control Write: SET_CAN_RECORDS -> %s%s\n", can_records_enabled ? "on" : "off",
++               can_tx_records_enabled ? " (+ own TX)" : "");
+         handled = true;
+         break;
+ #endif
+@@ -637,6 +640,7 @@ void tud_umount_cb(void)
+     record_format = PICO_FR_FORMAT_STOCK; // a new host gets stock records until it asks
+ #if PICO_FLEXRAY_BOARD_V2
+     can_records_enabled = V2_CAN_RECORDS_DEFAULT_ON; // a new host has to opt in again
++    can_tx_records_enabled = false;
+     can_q_clear();
+ #endif
+ 
+@@ -705,6 +709,8 @@ void tud_vendor_tx_cb(uint8_t itf, uint32_t sent_bytes)
+ }
+ 
+ #if PICO_FLEXRAY_BOARD_V2
++bool panda_can_tx_records_enabled(void) { return can_records_enabled && can_tx_records_enabled; }
++
+ bool panda_can_record_push(const pico_can_record_t *r)
+ {
+     if (!can_records_enabled || !tud_vendor_mounted()) {
+diff --git a/src/panda_usb.h b/src/panda_usb.h
+index 7fdd503..70181ef 100644
+--- a/src/panda_usb.h
++++ b/src/panda_usb.h
+@@ -142,6 +142,7 @@ typedef struct {
+ // the host hasn't enabled CAN records (not_streamed++) or the queue is full
+ // (dropped++).
+ bool panda_can_record_push(const pico_can_record_t *r);
++bool panda_can_tx_records_enabled(void); // v1f: host asked for our own TX frames too
+ void panda_can_get_q_stats(panda_can_q_stats_t *st);
+ #endif
+ 
+diff --git a/src/pico_can_record.h b/src/pico_can_record.h
+index a0629ce..ff62db3 100644
+--- a/src/pico_can_record.h
++++ b/src/pico_can_record.h
+@@ -10,7 +10,9 @@
+ //     0     1    type   = PICO_CAN_REC_TYPE (0x43)
+ //     1     1    bus    = 2 on the V2 board (SavvyCAN bus number)
+ //     2     1    flags  bit0 IDE (29-bit ID), bit1 RTR, bit2 FDF, bit3 BRS,
+-//                       bit4 ESI, bit7 data truncated (fewer bytes than DLC says)
++//                       bit4 ESI, bit5 TX (v1f: a frame WE sent, from the MCP TX
++//                       event FIFO; only if the host asked for TX records),
++//                       bit7 data truncated (fewer bytes than DLC says)
+ //     3     1    dlc    raw DLC 0..15 as received
+ //     4     4    id     u32 LE, 11- or 29-bit identifier (no flag bits)
+ //     8     4    time   u32 LE, device time in us at SOF (RP2350 time_us_32
+@@ -22,7 +24,8 @@
+ //
+ // Bit 15 of the length marks an "extended" record; body[0] says which kind.
+ // CAN records are only sent after the host opts in with the vendor control
+-// request PICOFLEX_SET_CAN_RECORDS (0xa1, wValue 1 = on, 0 = off, OUT, no data),
++// request PICOFLEX_SET_CAN_RECORDS (0xa1, wValue bit0 1 = on, 0 = off, OUT, no data;
++// v1f: wValue bit1 = also send our own TX frames, flagged PICO_CAN_FLAG_TX),
+ // so hosts that don't know them (older SavvyCAN, flexray_stream_recorder.py)
+ // never receive one. The setting returns to off on USB unmount/reset.
+ #ifndef PICO_CAN_RECORD_H
+@@ -44,6 +47,7 @@
+ #define PICO_CAN_FLAG_FDF        0x04u
+ #define PICO_CAN_FLAG_BRS        0x08u
+ #define PICO_CAN_FLAG_ESI        0x10u
++#define PICO_CAN_FLAG_TX         0x20u
+ #define PICO_CAN_FLAG_TRUNCATED  0x80u
+ 
+ typedef struct {
+diff --git a/src/ptcan_emu.c b/src/ptcan_emu.c
+index 6d6e758..2b56154 100644
+--- a/src/ptcan_emu.c
++++ b/src/ptcan_emu.c
+@@ -22,14 +22,33 @@
+ // - The forbidden-ID list is checked again right before each frame is queued.
+ #include "ptcan_emu.h"
+ 
++#include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+ #include "hardware/sync.h"
+ #include "pico/time.h"
+ #include "ptcan_emu_core.h"
++#include "console.h"
++#include "panda_usb.h"
++#include "pico_can_record.h"
++#include "board_pico_flexray_v2.h"
+ 
+-_Static_assert(sizeof(ptcan_stats_t) == 178, "ptcan_stats_t layout");
++// v1f: frames handed to the controller per main-loop pass. 16 = the TX FIFO depth, so
++// after a hiccup every overdue frame can be queued at once (v1e: 4).
++#define PTCAN_BURST 16
++
++// v1f: own-TX logging. Every queued frame is remembered here by its controller sequence
++// number; when the controller reports it sent (TX event FIFO, with the time of the start
++// of frame) the frame is pushed to the host as a CAN record flagged TX.
++#define TXLOG_N 64
++static struct { uint32_t seq; uint16_t id; uint8_t dlc; uint8_t data[8]; bool used; } txlog[TXLOG_N];
++static uint32_t tx_logged, tx_log_lost;
++static uint32_t loop_gap_max_us, loop_gaps_20ms, burst_max;
++static uint64_t last_pass_us;
++
++_Static_assert(sizeof(ptcan_stats_t) == 214, "ptcan_stats_t layout (v2)");
++_Static_assert(offsetof(ptcan_stats_t, loop_gap_max_us) == 178, "v2 tail starts after the v1 layout");
+ _Static_assert(PTE_N_FRAMES == 19, "ptcan_stats_t has 19 slots");
+ 
+ static pte_t core;
+@@ -118,6 +137,40 @@ static void handle_host(void)
+     }
+ }
+ 
++// v1f: read the controller's TX event FIFO (frames it has sent, ACKed) and push them to
++// the host as CAN records flagged TX, time stamped at the start of frame like RX frames.
++// Always drained while TX is on, so the counters are right even when the host did not
++// ask for TX records.
++static bool drain_tef(void)
++{
++    bool have_ref = false;
++    uint32_t tbc_ref = 0, us_ref = 0;
++    for (int n = 0; n < 16; n++) {
++        mcp_tef_t e;
++        bool ovf = false;
++        int r = mcp251863_tef_read(&e, &ovf);
++        if (ovf) tx_log_lost++;
++        if (r < 0) return false;
++        if (r == 0) break;
++        unsigned k = e.seq % TXLOG_N;
++        if (!txlog[k].used || txlog[k].seq != e.seq || txlog[k].id != e.id) { tx_log_lost++; continue; }
++        txlog[k].used = false;
++        if (!panda_can_tx_records_enabled()) continue;
++        if (!have_ref) { tbc_ref = mcp251863_read_tbc(); us_ref = time_us_32(); have_ref = true; }
++        pico_can_record_t rec;
++        rec.bus = V2_CAN_USB_BUS;
++        rec.flags = PICO_CAN_FLAG_TX;
++        rec.dlc = txlog[k].dlc;
++        rec.len = txlog[k].dlc;
++        rec.id = e.id;
++        rec.time_us = us_ref + (uint32_t)(int32_t)(e.ts - tbc_ref);
++        memcpy(rec.data, txlog[k].data, rec.len);
++        if (panda_can_record_push(&rec)) tx_logged++;
++        else tx_log_lost++;
++    }
++    return true;
++}
++
+ bool ptcan_emu_poll(void)
+ {
+     if (!can_ok) return true;
+@@ -142,8 +195,17 @@ bool ptcan_emu_poll(void)
+         printf("[CANTX] %s -> %s\n", pte_state_name(last_logged_state), pte_state_name(s));
+         last_logged_state = s;
+     }
+-    if (!normal_mode) return true;
+-    for (int n = 0; n < 4; n++) {
++    if (!normal_mode) { last_pass_us = 0; return true; }
++    // v1f: how regularly does the main loop get here? (run 6: 120-160 ms stalls every 5 s)
++    if (last_pass_us && now > last_pass_us) {
++        uint64_t gap = now - last_pass_us;
++        if (gap > loop_gap_max_us) loop_gap_max_us = gap > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)gap;
++        if (gap > 20000u) loop_gaps_20ms++;
++    }
++    last_pass_us = now;
++    if (!drain_tef()) return false;
++    int n = 0;
++    for (; n < PTCAN_BURST; n++) {
+         pte_tx_t tx;
+         if (!pte_next(&core, now, &tx)) break;
+         if (pte_id_forbidden(tx.id)) { // belt and braces: the core never schedules these
+@@ -151,11 +213,19 @@ bool ptcan_emu_poll(void)
+             pte_fault(&core, PTE_FAULT_MODE, tx.id);
+             break;
+         }
++        uint32_t seq = mcp251863_next_seq();
+         mcp_status_t r = mcp251863_send_std(tx.id, tx.data, tx.dlc);
+         if (r == MCP_ERR_TX_FULL) { fifo_full++; break; }
+         if (r != MCP_OK) return false;
++        unsigned k = seq % TXLOG_N;
++        txlog[k].seq = seq;
++        txlog[k].id = tx.id;
++        txlog[k].dlc = tx.dlc;
++        memcpy(txlog[k].data, tx.data, 8);
++        txlog[k].used = true;
+         pte_commit(&core, &tx, now);
+     }
++    if ((uint32_t)n > burst_max) burst_max = (uint32_t)n;
+     return true;
+ }
+ 
+@@ -221,6 +291,16 @@ uint16_t ptcan_emu_get_stats(uint8_t *buf, uint16_t max)
+         s.id[i] = pte_defs[i].id;
+         s.tx[i] = core.f[i].tx;
+     }
++    s.loop_gap_max_us = loop_gap_max_us;
++    s.loop_gaps_20ms = loop_gaps_20ms;
++    s.late_max_us = core.late_max_us;
++    s.late_sends = core.late_sends;
++    s.resyncs = core.resyncs;
++    s.tx_logged = tx_logged;
++    s.tx_log_lost = tx_log_lost;
++    s.console_dropped = console_dropped();
++    s.burst_max = (uint16_t)burst_max;
++    // v1 hosts ask for 178 bytes and get the v1 layout (with version = 2; they only check >= 1)
+     uint16_t n = sizeof s < max ? (uint16_t)sizeof s : max;
+     memcpy(buf, &s, n);
+     return n;
+@@ -237,6 +317,11 @@ void ptcan_emu_print_stats(void)
+            last_state.bus_off ? " BUS-OFF" : (last_state.tx_passive ? " TX-PASSIVE" : ""),
+            normal_mode ? "Normal" : "Listen Only");
+     if (!core.tx_total) return;
++    printf("[CANTX] loop gap max %lu us (>20 ms: %lu) | late %lu (max %lu us) resync %lu | burst max %lu | "
++           "TX logged %lu lost %lu | console dropped %lu\n",
++           (unsigned long)loop_gap_max_us, (unsigned long)loop_gaps_20ms, (unsigned long)core.late_sends,
++           (unsigned long)core.late_max_us, (unsigned long)core.resyncs, (unsigned long)burst_max,
++           (unsigned long)tx_logged, (unsigned long)tx_log_lost, (unsigned long)console_dropped());
+     printf("[CANTX]");
+     for (int i = 0; i < PTE_N_FRAMES; i++)
+         if (core.f[i].tx) printf(" %03x:%lu", pte_defs[i].id, (unsigned long)core.f[i].tx);
+diff --git a/src/ptcan_emu.h b/src/ptcan_emu.h
+index f367814..af99a05 100644
+--- a/src/ptcan_emu.h
++++ b/src/ptcan_emu.h
+@@ -9,12 +9,14 @@
+ #include "mcp251863.h"
+ 
+ #define PICOFLEX_SET_CANTX 0xa5u  // vendor OUT: wValue = ID mask bits 0..15, wIndex = bits 16..31; 0 = off + clear fault
+-#define PICOFLEX_GET_CANTX 0xa6u  // vendor IN: ptcan_stats_t (178 bytes)
++#define PICOFLEX_GET_CANTX 0xa6u  // vendor IN: ptcan_stats_t (v1: 178 bytes, v2 (v1f): 214 bytes;
++                                  // the firmware returns min(sizeof, wLength), so an old host
++                                  // asking for 178 bytes still gets the v1 layout)
+ #define PTCAN_EMU_KEEPALIVE_MS 20000u  // host must repeat SET_CANTX within this, else TX off
+ 
+ // Stats for vendor request 0xa6 (GET_CANTX), little endian, packed. Python:
+-// struct '<BBBBIHBBBBBBIIIiiiiiIIII19H19I'
+-#define PTCAN_STATS_VERSION 1
++// struct '<BBBBIHBBBBBBIIIiiiiiIIII19H19I' + v2 tail '<IIIIIIIIHH'
++#define PTCAN_STATS_VERSION 2
+ typedef struct __attribute__((packed)) {
+     uint8_t version;        // PTCAN_STATS_VERSION
+     uint8_t state;          // pte_state_t
+@@ -31,6 +33,17 @@ typedef struct __attribute__((packed)) {
+     uint32_t tx_total, tx_fifo_full, tx_fail, mode_switches;
+     uint16_t id[19];
+     uint32_t tx[19];
++    // ---- v2 (v1f) ----
++    uint32_t loop_gap_max_us;   // longest gap between two CAN TX passes of the main loop
++    uint32_t loop_gaps_20ms;    // passes that came > 20 ms after the previous one
++    uint32_t late_max_us;       // latest a cyclic frame went out after its slot
++    uint32_t late_sends;        // cyclic frames sent > 5 ms after their slot
++    uint32_t resyncs;           // frames whose schedule restarted (> 250 ms behind)
++    uint32_t tx_logged;         // own TX frames (TEF) pushed to the host as TX records
++    uint32_t tx_log_lost;       // TEF overflow / unknown sequence / record queue full
++    uint32_t console_dropped;   // UART console bytes dropped (ring full; never blocks)
++    uint16_t burst_max;         // most frames queued in one pass
++    uint16_t reserved2;
+ } ptcan_stats_t;
+ 
+ void ptcan_emu_on_can_init(bool ok);
+diff --git a/src/v2_cantest.c b/src/v2_cantest.c
+index 1a330a2..9142737 100644
+--- a/src/v2_cantest.c
++++ b/src/v2_cantest.c
+@@ -30,6 +30,7 @@ static const mcp251863_cfg_t can_cfg = {
+     .data_bitrate = V2_CAN_FD_DATA_BITRATE,
+     .listen_only = (V2_CAN_MODE == V2_CAN_MODE_LISTEN_ONLY),
+     .tx_fifo_depth = V2_CAN_TX_FIFO_DEPTH,
++    .tef_depth = EMU_CAN_TX ? 16 : 0, // v1f: our own TX frames, time stamped, for the logger
+ };
+ 
+ #define FD_ENABLED (V2_CAN_FD_DATA_BITRATE != 0)
+diff --git a/tests/host/test_cantx_logger.py b/tests/host/test_cantx_logger.py
+index fb54f93..1a15df5 100644
+--- a/tests/host/test_cantx_logger.py
++++ b/tests/host/test_cantx_logger.py
+@@ -2,7 +2,9 @@
+ """v1e: fr_ts_logger.py --can-tx/--can-tx-ids against a fake USB device (no pyusb needed).
+ Checks: mask parsing/sets, clear -> mask -> keepalives -> 0 on exit, stats line, and that a
+ firmware that stalls 0xa5 (V1 / older builds) makes the logger stop with an error."""
++import csv
+ import os
++import struct
+ import sys
+ import tempfile
+ import types
+@@ -54,6 +56,12 @@ class FakeDev:
+         raise USBTimeoutError("timeout")
+ 
+ 
++def can_rec(can_id, flags, t_us, data, bus=2):
++    """One CAN record as the firmware sends it (src/pico_can_record.h)."""
++    body = struct.pack("<BBBBII", 0x43, bus, flags, len(data), can_id, t_us) + data
++    return struct.pack("<H", 0x8000 | len(body)) + body
++
++
+ def run(argv, dev):
+     usb.core.find = lambda **kw: dev
+     import importlib
+@@ -91,7 +99,13 @@ def main():
+         want = dict(version=1, state=2, fault=1, flags=0xA5, mask=0x7FFFF, fault_id=0x3FD, st_kl=0xA, n_frames=19,
+                     tec=7, rec=9, opmod=6, rx_frames=123456, n12f=789, wakes=3, ms_wake=1000, ms_rx=2, ms_on=-1,
+                     ms_off=45930, ms_fnm=1950, tx_total=99999, fifo_full=11, tx_fail=12, mode_switches=13)
+-        bad = [k for k in want if d[k] != want[k]]
++        want.update(v2=True, loop_gap_max_us=4321, loop_gaps_20ms=5, late_max_us=131000, late_sends=77, resyncs=1,
++                    tx_logged=36000, tx_log_lost=2, console_dropped=9, burst_max=8)
++        bad = [k for k in want if d.get(k) != want[k]]
++        d1 = frts.parse_cantx_stats(raw[:178])   # v1e firmware / short answer: v1 fields only
++        check(d1 and not d1["v2"] and d1["tx_total"] == 99999 and "loop-gap" not in frts.fmt_cantx(d1),
++              "178-byte (v1) stats still parse")
++        check("late 77 (max 131.0ms)" in frts.fmt_cantx(d), "v2 status line: " + frts.fmt_cantx(d)[:60] + "...")
+         check(not bad and tuple(d["ids"]) == frts.CANTX_IDS and d["tx"] == [1000 + i for i in range(19)],
+               "ptcan_stats_t layout C vs frts.py, ID order = firmware table %s" % (bad or ""))
+     tmp = tempfile.mkdtemp()
+@@ -103,9 +117,26 @@ def main():
+     check(sets[:2] == [0, 3], "clear first, then mask 0x3 (%s)" % sets[:3])
+     check(sets[-1] == 0, "TX disabled on exit")
+     check(sets.count(3) >= 2, "keepalive repeated (%d)" % sets.count(3))
+-    check(any(r == frts.REQ_SET_CAN_RECORDS and v == 1 for _, r, v, _ in dev.log), "--can-tx implies --can")
++    check(any(r == frts.REQ_SET_CAN_RECORDS and v == 3 for _, r, v, _ in dev.log),
++          "--can-tx implies --can (CAN records + own TX records: wValue 3)")
++    check(any(r == frts.REQ_GET_CANTX and i == 0 for bm, r, v, i in dev.log), "stats read")
+     check(any(r == frts.REQ_GET_CANTX for _, r, _, _ in dev.log), "stats read")
+ 
++    # v1f: own TX records (flag bit5) -> dir=Tx rows, counted apart from RX
++    import fr_ts_logger
++    lg = fr_ts_logger.Logger(os.path.join(tmp, "tx.csv"), can_csv=os.path.join(tmp, "tx.can.csv"),
++                             savvy_csv=os.path.join(tmp, "tx.savvy.csv"), quiet=True)
++    lg.feed(can_rec(0x12F, 0, 1000, bytes([0, 0, 0xA, 0, 0, 0, 0, 0])) +
++            can_rec(0x0A5, frts.CAN_FLAG_TX, 1500, bytes(range(8))) +
++            can_rec(0x173, 0, 1700, bytes([0, 0, 0, 0, 0, 0, 0, 3])))
++    lg.close() if hasattr(lg, "close") else None
++    rows = list(csv.DictReader(open(os.path.join(tmp, "tx.can.csv"))))
++    check([(r["can_id"], r["dir"]) for r in rows] == [("0x12F", "Rx"), ("0xA5", "Tx"), ("0x173", "Rx")],
++          "CAN CSV dir column %s" % [(r["can_id"], r["dir"]) for r in rows])
++    sv = open(os.path.join(tmp, "tx.savvy.csv")).read().splitlines()
++    check(len(sv) == 4 and ",Tx,2," in sv[2] and ",Rx,2," in sv[1], "SavvyCAN Dir Tx")
++    check(lg.n_can == 2 and lg.n_can_tx == 1 and "own-tx=1" in lg.can_summary(), lg.can_summary())
++
+     dev = FakeDev(cantx_ok=False)
+     rc = run(["-o", os.path.join(tmp, "t2.csv"), "--duration", "2", "--can-tx", "--no-console-log"], dev)
+     check(rc == 1, "firmware without 0xa5 -> error exit (%s)" % rc)
+diff --git a/tests/host/test_ptcan_emu.c b/tests/host/test_ptcan_emu.c
+index 09cfe6c..59612f7 100644
+--- a/tests/host/test_ptcan_emu.c
++++ b/tests/host/test_ptcan_emu.c
+@@ -396,6 +396,8 @@ static int write_stats(const char *path)
+     st.ms_since_wake = 1000; st.ms_since_rx = 2; st.ms_since_on = -1; st.ms_since_off = 45930; st.ms_since_foreign_nm = 1950;
+     st.tx_total = 99999; st.tx_fifo_full = 11; st.tx_fail = 12; st.mode_switches = 13;
+     for (int i = 0; i < PTE_N_FRAMES; i++) { st.id[i] = pte_defs[i].id; st.tx[i] = 1000u + (uint32_t)i; }
++    st.loop_gap_max_us = 4321; st.loop_gaps_20ms = 5; st.late_max_us = 131000; st.late_sends = 77; st.resyncs = 1;
++    st.tx_logged = 36000; st.tx_log_lost = 2; st.console_dropped = 9; st.burst_max = 8;
+     FILE *f = fopen(path, "wb");
+     if (!f) { perror(path); return 2; }
+     fwrite(&st, sizeof st, 1, f);
+diff --git a/tools/dde_emu/check_ptcan_replay.py b/tools/dde_emu/check_ptcan_replay.py
+index fb39a4f..08d4b9b 100644
+--- a/tools/dde_emu/check_ptcan_replay.py
++++ b/tools/dde_emu/check_ptcan_replay.py
+@@ -37,7 +37,7 @@ def check(ok, msg):
+ def load(path):
+     out = []
+     for r in csv.DictReader(open(path)):
+-        if r.get("ide", "0") == "1":
++        if r.get("ide", "0") == "1" or r.get("dir", "Rx") == "Tx":   # v1f logs: own TX rows are not bus input
+             continue
+         out.append((int(float(r["t_us"])), int(r["can_id"], 16), bytes.fromhex(r["data_hex"])))
+     out.sort(key=lambda x: x[0])
+diff --git a/tools/ts_capture/fr_ts_logger.py b/tools/ts_capture/fr_ts_logger.py
+index 40ae3ee..73d2bb1 100644
+--- a/tools/ts_capture/fr_ts_logger.py
++++ b/tools/ts_capture/fr_ts_logger.py
+@@ -113,6 +113,8 @@ class Logger:
+         self.seq = frts.SeqTracker()
+         self.n_fr = 0
+         self.n_can = 0
++        self.n_can_tx = 0
++        self.can_tx_ids = {}
+         self.can_by_bus = {}
+         self.can_ids = set()
+         self.n_hw = 0
+@@ -123,9 +125,14 @@ class Logger:
+     def feed(self, data, host_time=None):
+         for rec in self.parser.feed(data):
+             if rec["kind"] == "can":
+-                self.n_can += 1
+-                self.can_by_bus[rec["bus"]] = self.can_by_bus.get(rec["bus"], 0) + 1
+-                self.can_ids.add(rec["can_id"])
++                if rec["can_flags"] & frts.CAN_FLAG_TX:
++                    # v1f: our own PT-CAN TX (dir=Tx); counted apart from what we heard
++                    self.n_can_tx += 1
++                    self.can_tx_ids[rec["can_id"]] = self.can_tx_ids.get(rec["can_id"], 0) + 1
++                else:
++                    self.n_can += 1
++                    self.can_by_bus[rec["bus"]] = self.can_by_bus.get(rec["bus"], 0) + 1
++                    self.can_ids.add(rec["can_id"])
+                 t = self.can_time(rec["t_us_raw"])
+                 if self.cf:
+                     self.cw.writerow(frts.can_csv_row(rec, host_time, t))
+@@ -157,10 +164,11 @@ class Logger:
+         return float(c.t64 + delta)
+ 
+     def can_summary(self):
++        tx = (" own-tx=%d (ids=%d)" % (self.n_can_tx, len(self.can_tx_ids))) if self.n_can_tx else ""
+         if not self.n_can:
+-            return "can=0"
+-        return "can=%d (%s ids=%d)" % (self.n_can, " ".join("bus%d:%d" % kv for kv in sorted(self.can_by_bus.items())),
+-                                       len(self.can_ids))
++            return "can=0" + tx
++        return "can=%d (%s ids=%d)%s" % (self.n_can, " ".join("bus%d:%d" % kv for kv in sorted(self.can_by_bus.items())),
++                                         len(self.can_ids), tx)
+ 
+     def summary(self):
+         return ("frames=%d (%s) hw_ts=%d (%.1f%%) seq_gaps=%d seq_missing=%d %s "
+@@ -237,8 +245,10 @@ def live(args):
+     print("device: " + fmt_info(info))
+     if args.can:
+         try:
+-            ctrl_out(frts.REQ_SET_CAN_RECORDS, 1)
+-            print("CAN records enabled (V2 board)")
++            # bit1: v1f firmware also streams our own PT-CAN TX frames (CSV dir=Tx); older
++            # firmware only looks at bit0
++            ctrl_out(frts.REQ_SET_CAN_RECORDS, frts.CAN_RECORDS_RX | frts.CAN_RECORDS_TX)
++            print("CAN records enabled (V2 board; own TX frames logged as dir=Tx on v1f+ firmware)")
+         except usb.core.USBError:
+             print("note: CAN records not supported by this board (main board build) - ignored")
+     ctrl_out(frts.REQ_RESET_COMMS, 0)
+@@ -316,7 +326,7 @@ def live(args):
+     def cantx_line(delta=False):
+         try:
+             d = frts.parse_cantx_stats(dev.ctrl_transfer(0xC0, frts.REQ_GET_CANTX, 0, 0,
+-                                                         frts.CANTX_STATS_STRUCT.size, timeout=1000))
++                                                         frts.CANTX_STATS_LEN, timeout=1000))
+         except usb.core.USBError:
+             return "(PT-CAN TX stats read failed)"
+         if d and d["fault"] and d["fault"] != cantx["fault"]:
+diff --git a/tools/ts_capture/frts.py b/tools/ts_capture/frts.py
+index 9fb0a87..9cc57c7 100644
+--- a/tools/ts_capture/frts.py
++++ b/tools/ts_capture/frts.py
+@@ -18,7 +18,7 @@ REQ_GET_TS_INFO = 0xA2
+ REQ_SET_EMU = 0xA3        # DDE emulator build: wValue 1 = enable TX / keepalive, 0 = disable + clear fault
+ REQ_GET_EMU = 0xA4        # DDE emulator build: stats, 64/128/192/256 bytes by version (src/dde_emu.h dde_emu_stats_t)
+ REQ_SET_CANTX = 0xA5      # v1e V2 DDE emulator: PT-CAN TX ID mask, wValue = bits 0..15, wIndex = bits 16..31, 0 = off
+-REQ_GET_CANTX = 0xA6      # v1e: PT-CAN TX stats (src/ptcan_emu.h ptcan_stats_t, 178 bytes)
++REQ_GET_CANTX = 0xA6      # v1e: PT-CAN TX stats (src/ptcan_emu.h ptcan_stats_t, 178 bytes; v1f: 214)
+ REQ_RESET_COMMS = 0xC0
+ 
+ FLAG_FRAME_CRC_OK = 0x01
+@@ -41,7 +41,13 @@ CSV_COLUMNS = [
+     "null_frame", "sync", "startup", "t_us_raw", "t_fine", "seq", "rec_flags", "ts_hw",
+     "rec_format", "host_time_s",
+ ]
+-CAN_CSV_COLUMNS = ["t_us", "t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s"]
++# v1f: "dir" = Rx (heard on the bus) or Tx (sent by us: the board's own PT-CAN TX, from the
++# controller's TX event FIFO, time stamped at the start of frame like the RX frames).
++CAN_CSV_COLUMNS = ["t_us", "t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s",
++                   "dir"]
++CAN_FLAG_TX = 0x20        # CAN record flags bit5 (src/pico_can_record.h PICO_CAN_FLAG_TX)
++CAN_RECORDS_RX = 1        # REQ_SET_CAN_RECORDS wValue bit0: CAN records on
++CAN_RECORDS_TX = 2        # bit1 (v1f firmware): our own TX frames too (older firmware ignores it)
+ 
+ 
+ EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h (v1 layout = first 64 bytes of v2)
+@@ -80,6 +86,9 @@ CANTX_SETS = {
+ }
+ CANTX_STATS_STRUCT = struct.Struct("<BBBBIHBBBBBBIIIiiiiiIIII19H19I")
+ assert CANTX_STATS_STRUCT.size == 178
++CANTX_STATS_V2_STRUCT = struct.Struct("<IIIIIIIIHH")   # bytes 178..213 (v1f firmware)
++assert CANTX_STATS_V2_STRUCT.size == 36
++CANTX_STATS_LEN = 214     # request this many; v1e firmware answers 178
+ CANTX_STATES = ("off", "wait-bus", "RUN", "silent", "prep-sleep", "FAULT")
+ CANTX_FAULTS = ("none", "foreign sender of an emulated ID (real DDE/EGS still on the bus?)", "BUS-OFF",
+                 "TX error passive", "controller mode change failed", "SPI")
+@@ -128,6 +137,11 @@ def parse_cantx_stats(raw):
+     for b, k in enumerate(("enabled", "normal", "kl15", "kl15_ever", "bus_off", "tx_passive", "rx_passive",
+                            "keepalive_lost")):
+         d[k] = bool(fl >> b & 1)
++    d["v2"] = len(raw) >= CANTX_STATS_STRUCT.size + CANTX_STATS_V2_STRUCT.size
++    if d["v2"]:
++        w = CANTX_STATS_V2_STRUCT.unpack_from(raw, CANTX_STATS_STRUCT.size)
++        d.update(zip(("loop_gap_max_us", "loop_gaps_20ms", "late_max_us", "late_sends", "resyncs", "tx_logged",
++                      "tx_log_lost", "console_dropped", "burst_max"), w[:9]))
+     return d
+ 
+ 
+@@ -149,6 +163,12 @@ def fmt_cantx(d, prev_tx=None):
+         d["rec"], " BUS-OFF" if d["bus_off"] else (" TX-PASSIVE" if d["tx_passive"] else ""))
+     if d["keepalive_lost"]:
+         s += " KEEPALIVE-LOST"
++    if d.get("v2"):
++        s += " | loop-gap max %.1fms >20ms:%d late %d (max %.1fms) resync %d burst %d | tx-log %d lost %d" % (
++            d["loop_gap_max_us"] / 1000.0, d["loop_gaps_20ms"], d["late_sends"], d["late_max_us"] / 1000.0,
++            d["resyncs"], d["burst_max"], d["tx_logged"], d["tx_log_lost"])
++        if d["console_dropped"]:
++            s += " console-dropped %d" % d["console_dropped"]
+     per = []
+     for k, (i, n) in enumerate(zip(d["ids"], d["tx"])):
+         if n or (d["mask"] >> k & 1):
+@@ -468,6 +488,7 @@ def can_csv_row(rec, host_time=None, t_us=None):
+         "ide": f & 1, "rtr": (f >> 1) & 1, "fdf": (f >> 2) & 1, "brs": (f >> 3) & 1,
+         "dlc": rec["dlc"], "data_hex": rec["data"].hex(),
+         "host_time_s": "" if host_time is None else "%.6f" % host_time,
++        "dir": "Tx" if f & CAN_FLAG_TX else "Rx",
+     }
+ 
+ 
+@@ -508,5 +529,6 @@ def savvy_fr_row(rec, t_us):
+ 
+ def savvy_can_row(rec, t_us):
+     f = rec["can_flags"]
+-    return "%d,%08X,%s,Rx,%d,%d%s" % (int(t_us), rec["can_id"], "true" if f & 1 else "false", rec["bus"],
++    return "%d,%08X,%s,%s,%d,%d%s" % (int(t_us), rec["can_id"], "true" if f & 1 else "false",
++                                      "Tx" if f & CAN_FLAG_TX else "Rx", rec["bus"],
+                                       len(rec["data"]), "".join(",%02X" % x for x in rec["data"]))
+-- 
+2.47.3
+

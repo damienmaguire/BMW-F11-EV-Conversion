@@ -1,8 +1,11 @@
 # DDE emulator for the F11 EV conversion (pico-flexray V1)
 
-> **Latest: v1e** (FlexRay + PT-CAN DDE/EGS emulation, car run 6 clean). See
-> [`v1e/README.md`](v1e/README.md). The `source/` tree below is now at v1e;
-> the v1c notes below are kept as history.
+> **Latest: v1h.2** (FlexRay + PT-CAN DDE/EGS emulation with fake engine start
+> and P/R/N/D gears; car run 10 behaved like the original car, no fault codes).
+> See [`v1h2/README.md`](v1h2/README.md), the [`CHANGELOG.md`](CHANGELOG.md) and
+> the car test notes in [`docs/notes/`](docs/notes/). The `source/` tree is now
+> at v1h.2. The previous release is in [`v1e/`](v1e/README.md); the v1c notes
+> below are kept as history.
 
 > **Status: v1c, not yet tested on the car.** Car test 2 (v1b) showed the
 > static frames are now right: their DTCs are gone and there was no emulator
@@ -339,9 +342,13 @@ silent.
 ## Files
 
 ```
-firmware/                 v1c UF2 (use this), old v1b and v1 UF2s, SHA256SUMS
+v1h2/                     current release: 4 UF2s, SHA256SUMS, tools, patches 0020-0027, README
+v1e/                      previous release (car run 6)
+docs/notes/               car test write-ups, runs 6 to 10
+CHANGELOG.md              what changed in each version
+firmware/                 v1c UF2, old v1b and v1 UF2s, SHA256SUMS (history only)
 tools/                    laptop tools: fr_ts_logger.py (with --emulate), frts.py (v1c: reads stats v3), reset_to_bootloader.py
-source/                   complete firmware source tree (dde-emulator branch) incl. tests and generator
+source/                   complete firmware source tree (now at v1h.2) incl. tests and generator
   src/dde_emu*.{c,h,pio}  emulator firmware (dde_emu_tables.h is generated)
   tools/dde_emu/          table generator, Python model, test_dde_emu.py, test_logger_emulate.py
                           extract_replay.py (replay vectors from a logger CSV), extract_dyn.py (dynamic frames)

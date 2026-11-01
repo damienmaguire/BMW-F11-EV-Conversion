@@ -5,7 +5,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define FLEXRAY_FIFO_SIZE 256
+// How many FlexRay frames can wait in memory for the USB link to the laptop.
+// v1g.2: 1024 (was 256). In plain words: the waiting room for frames. The bus delivers
+// about 5,800 frames a second; 256 places covered 44 ms of a USB hiccup, 1024 cover
+// about 175 ms. Each place is 280 bytes, so this uses 287 KB of the 520 KB RAM
+// (the whole firmware then uses about 400 KB; checked at build time, see README).
+#ifndef FLEXRAY_FIFO_SIZE
+#define FLEXRAY_FIFO_SIZE 1024
+#endif
 
 #define MAX_FRAME_PAYLOAD_BYTES 254
 #define FRAME_BUF_SIZE_BYTES 8 + MAX_FRAME_PAYLOAD_BYTES

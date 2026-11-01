@@ -18,8 +18,23 @@ REQ_GET_TS_INFO = 0xA2
 REQ_SET_EMU = 0xA3        # DDE emulator build: wValue 1 = enable TX / keepalive, 0 = disable + clear fault
 REQ_GET_EMU = 0xA4        # DDE emulator build: stats, 64/128/192/256 bytes by version (src/dde_emu.h dde_emu_stats_t)
 REQ_SET_CANTX = 0xA5      # v1e V2 DDE emulator: PT-CAN TX ID mask, wValue = bits 0..15, wIndex = bits 16..31, 0 = off
-REQ_GET_CANTX = 0xA6      # v1e: PT-CAN TX stats (src/ptcan_emu.h ptcan_stats_t, 178 bytes)
+REQ_GET_CANTX = 0xA6      # v1e: PT-CAN TX stats (src/ptcan_emu.h ptcan_stats_t, 178 bytes; v1f: 214)
+REQ_SET_ENGINE = 0xA7     # v1g: fake engine start, wValue = mode | cmd << 8 (repeat <= 3 s)
+REQ_GET_ENGINE = 0xA9     # v1g: engine status (src/dde_emu.h dde_engine_status_t, 40 bytes; v1h: 56)
+REQ_GET_EMUDIAG = 0xAA    # v1h: echo-miss diagnostics (src/dde_emu.h dde_emu_diag_t, 64 bytes)
+REQ_GET_GEAR = 0xAB       # v1h.1: gear status (src/dde_gear.h dde_gear_status_t, 64 bytes)
+GEAR_OFF_WINDEX = 0x100   # v1h.1: SET_ENGINE wIndex bit 8 = gear shifting off (fixed P as v1h)
 REQ_RESET_COMMS = 0xC0
+REQ_GET_FW_VERSION = 0xD6  # panda "git version": v1g.2+ firmware answers e.g. "dde-emu-v1h" (older: "dev")
+
+# v1g.2: version of this logger. The firmware of the same release answers a version that
+# ends with the same text (src/fw_version.h); the logger warns at start when it does not.
+LOGGER_VERSION = "v1h.2"
+
+
+def fw_version_matches(fw):
+    """True if the firmware version string belongs to this logger's release."""
+    return bool(fw) and fw.endswith("-" + LOGGER_VERSION)
 
 FLAG_FRAME_CRC_OK = 0x01
 FLAG_HEADER_CRC_OK = 0x02
@@ -41,7 +56,13 @@ CSV_COLUMNS = [
     "null_frame", "sync", "startup", "t_us_raw", "t_fine", "seq", "rec_flags", "ts_hw",
     "rec_format", "host_time_s",
 ]
-CAN_CSV_COLUMNS = ["t_us", "t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s"]
+# v1f: "dir" = Rx (heard on the bus) or Tx (sent by us: the board's own PT-CAN TX, from the
+# controller's TX event FIFO, time stamped at the start of frame like the RX frames).
+CAN_CSV_COLUMNS = ["t_us", "t_us_raw", "bus", "can_id", "ide", "rtr", "fdf", "brs", "dlc", "data_hex", "host_time_s",
+                   "dir"]
+CAN_FLAG_TX = 0x20        # CAN record flags bit5 (src/pico_can_record.h PICO_CAN_FLAG_TX)
+CAN_RECORDS_RX = 1        # REQ_SET_CAN_RECORDS wValue bit0: CAN records on
+CAN_RECORDS_TX = 2        # bit1 (v1f firmware): our own TX frames too (older firmware ignores it)
 
 
 EMU_STATS_STRUCT = struct.Struct("<4B5I6I3h2H2BI")  # 64 bytes, src/dde_emu.h (v1 layout = first 64 bytes of v2)
@@ -80,6 +101,9 @@ CANTX_SETS = {
 }
 CANTX_STATS_STRUCT = struct.Struct("<BBBBIHBBBBBBIIIiiiiiIIII19H19I")
 assert CANTX_STATS_STRUCT.size == 178
+CANTX_STATS_V2_STRUCT = struct.Struct("<IIIIIIIIHH")   # bytes 178..213 (v1f firmware)
+assert CANTX_STATS_V2_STRUCT.size == 36
+CANTX_STATS_LEN = 214     # request this many; v1e firmware answers 178
 CANTX_STATES = ("off", "wait-bus", "RUN", "silent", "prep-sleep", "FAULT")
 CANTX_FAULTS = ("none", "foreign sender of an emulated ID (real DDE/EGS still on the bus?)", "BUS-OFF",
                 "TX error passive", "controller mode change failed", "SPI")
@@ -128,6 +152,11 @@ def parse_cantx_stats(raw):
     for b, k in enumerate(("enabled", "normal", "kl15", "kl15_ever", "bus_off", "tx_passive", "rx_passive",
                            "keepalive_lost")):
         d[k] = bool(fl >> b & 1)
+    d["v2"] = len(raw) >= CANTX_STATS_STRUCT.size + CANTX_STATS_V2_STRUCT.size
+    if d["v2"]:
+        w = CANTX_STATS_V2_STRUCT.unpack_from(raw, CANTX_STATS_STRUCT.size)
+        d.update(zip(("loop_gap_max_us", "loop_gaps_20ms", "late_max_us", "late_sends", "resyncs", "tx_logged",
+                      "tx_log_lost", "console_dropped", "burst_max"), w[:9]))
     return d
 
 
@@ -149,6 +178,12 @@ def fmt_cantx(d, prev_tx=None):
         d["rec"], " BUS-OFF" if d["bus_off"] else (" TX-PASSIVE" if d["tx_passive"] else ""))
     if d["keepalive_lost"]:
         s += " KEEPALIVE-LOST"
+    if d.get("v2"):
+        s += " | loop-gap max %.1fms >20ms:%d late %d (max %.1fms) resync %d burst %d | tx-log %d lost %d" % (
+            d["loop_gap_max_us"] / 1000.0, d["loop_gaps_20ms"], d["late_sends"], d["late_max_us"] / 1000.0,
+            d["resyncs"], d["burst_max"], d["tx_logged"], d["tx_log_lost"])
+        if d["console_dropped"]:
+            s += " console-dropped %d" % d["console_dropped"]
     per = []
     for k, (i, n) in enumerate(zip(d["ids"], d["tx"])):
         if n or (d["mask"] >> k & 1):
@@ -468,6 +503,7 @@ def can_csv_row(rec, host_time=None, t_us=None):
         "ide": f & 1, "rtr": (f >> 1) & 1, "fdf": (f >> 2) & 1, "brs": (f >> 3) & 1,
         "dlc": rec["dlc"], "data_hex": rec["data"].hex(),
         "host_time_s": "" if host_time is None else "%.6f" % host_time,
+        "dir": "Tx" if f & CAN_FLAG_TX else "Rx",
     }
 
 
@@ -508,5 +544,225 @@ def savvy_fr_row(rec, t_us):
 
 def savvy_can_row(rec, t_us):
     f = rec["can_flags"]
-    return "%d,%08X,%s,Rx,%d,%d%s" % (int(t_us), rec["can_id"], "true" if f & 1 else "false", rec["bus"],
+    return "%d,%08X,%s,%s,%d,%d%s" % (int(t_us), rec["can_id"], "true" if f & 1 else "false",
+                                      "Tx" if f & CAN_FLAG_TX else "Rx", rec["bus"],
                                       len(rec["data"]), "".join(",%02X" % x for x in rec["data"]))
+
+
+# --- v1g fake engine start ---------------------------------------------------------
+ENGINE_MODES = {"off": 0, "cas": 1, "fallback": 2}
+ENGINE_CMD_NONE, ENGINE_CMD_START, ENGINE_CMD_STOP = 0, 1, 2
+ENGINE_PHASES = ("off", "crank", "run", "stop", "stopped")
+ENGINE_REJECTS = ("-", "no brake", "ST_KL not A/D (ignition off?)", "no start command", "busy", "mode off")
+ENGINE_STATUS_FIELDS = (
+    "version", "mode", "phase", "stkl", "stkl_src", "brake", "last_reject", "e6_b3", "rpm", "torque_raw",
+    "starts", "stops", "rejects", "ms_since_start", "ms_since_stkl", "cnt_hi", "fb9_b2", "e6_b4", "e6_ready", "seq",
+)
+ENGINE_STATUS_STRUCT = struct.Struct("<8B2H5I4BI")
+ENGINE_STATUS_LEN = ENGINE_STATUS_STRUCT.size
+assert ENGINE_STATUS_LEN == 40
+
+
+# v1h status additions (version 2, 16 more bytes)
+ENGINE_STATUS_V2_FIELDS = ("profile", "profile_req", "cas_flags", "out_flags", "d_to_82_ms", "d_len_ms",
+                           "d_end_after_82_ms", "t_rpm_ms", "aborts")
+ENGINE_STATUS_V2_STRUCT = struct.Struct("<4B2Hh H I")
+ENGINE_STATUS_V2_LEN = ENGINE_STATUS_LEN + ENGINE_STATUS_V2_STRUCT.size
+assert ENGINE_STATUS_V2_LEN == 56
+# v1h start profiles (SET_ENGINE wIndex; src/dde_engine.h ENG_PROF_*)
+ENGINE_PROFILES = {"default": 0, "short": 1, "realistic": 2, "run8": 3}
+ENGINE_PROFILE_NAMES = {v: k for k, v in ENGINE_PROFILES.items()}
+ENGINE_PROFILE_TEXT = {
+    "short": "running ~0.17 s after START (shorter than any real start; the CAS may refuse it)",
+    "realistic": "running ~0.84 s after START (fastest real start: 0.85 s)",
+    "run8": "the v1g.2 start that passed run 8 (running ~0.94 s after START)",
+    "default": "whatever the firmware build defaults to (v1h: short)",
+}
+ENG_CAS_D_ENDED_EARLY, ENG_CAS_D_ENDED, ENG_CAS_D_LONG, ENG_CAS_ABANDONED = 1, 2, 4, 8
+
+
+def engine_cas_news(d, prev):
+    """v1h: loud messages for new CAS reactions. prev = (starts, cas_flags) of the last poll."""
+    if not d or "cas_flags" not in d:
+        return []
+    old = prev[1] if prev and prev[0] == d["starts"] else 0
+    new = d["cas_flags"] & ~old
+    out = []
+    if new & ENG_CAS_D_ENDED_EARLY:
+        out.append("CAS ended the start request (ST_KL D -> %s) %s ms after START, BEFORE our running report "
+                   "- CAS refused / gave up on our start"
+                   % ("-" if d["stkl"] == 0xFF else "%X" % d["stkl"],
+                      "?" if d["d_len_ms"] == 0xFFFF else d["d_len_ms"]))
+    if new & ENG_CAS_ABANDONED:
+        out.append("start abandoned: no running report sent (profile %s)"
+                   % ENGINE_PROFILE_NAMES.get(d["profile"], d["profile"]))
+    if new & ENG_CAS_D_LONG:
+        out.append("CAS still requesting start 300 ms after our running report (it does not believe it?)")
+    if new & ENG_CAS_D_ENDED:
+        out.append("CAS released START %d ms after our running report (real cars: 8-39 ms)" % d["d_end_after_82_ms"])
+    return out
+
+
+def engine_wvalue(mode, cmd=ENGINE_CMD_NONE):
+    """SET_ENGINE wValue: low byte mode (0 off, 1 cas, 2 fallback), high byte command."""
+    if isinstance(mode, str):
+        mode = ENGINE_MODES[mode]
+    if mode not in (0, 1, 2) or cmd not in (0, 1, 2):
+        raise ValueError("bad engine mode/command")
+    return mode | cmd << 8
+
+
+def parse_engine_status(raw):
+    raw = bytes(raw)
+    if len(raw) < ENGINE_STATUS_LEN:
+        return None
+    d = dict(zip(ENGINE_STATUS_FIELDS, ENGINE_STATUS_STRUCT.unpack_from(raw)))
+    if d["version"] >= 2 and len(raw) >= ENGINE_STATUS_V2_LEN:
+        d.update(zip(ENGINE_STATUS_V2_FIELDS, ENGINE_STATUS_V2_STRUCT.unpack_from(raw, ENGINE_STATUS_LEN)))
+    return d
+
+
+def fmt_engine(d):
+    if not d:
+        return "(no engine status)"
+    mode = {v: k for k, v in ENGINE_MODES.items()}.get(d["mode"], str(d["mode"]))
+    phase = ENGINE_PHASES[d["phase"]] if d["phase"] < len(ENGINE_PHASES) else str(d["phase"])
+    rej = ENGINE_REJECTS[d["last_reject"]] if d["last_reject"] < len(ENGINE_REJECTS) else str(d["last_reject"])
+    stkl = "-" if d["stkl"] == 0xFF else "%X" % d["stkl"]
+    e6 = "%02X/%02X" % (d["e6_b3"], d["e6_b4"]) if d["e6_b3"] else "stock"
+    ready = "-" if d["e6_ready"] == 0xFF else str(d["e6_ready"])
+    return ("mode %s phase %s rpm %d E6 %s ready %s CounterHi %d FB9 %02X | ST_KL %s (%s, %s) brake %d | "
+            "starts %d stops %d rejects %d (last: %s)"
+            % (mode, phase, d["rpm"], e6, ready, d["cnt_hi"], d["fb9_b2"], stkl,
+               "PT-CAN 0x12F" if d["stkl_src"] else "FR 0x74",
+               "%d ms ago" % d["ms_since_stkl"] if d["ms_since_stkl"] != 0xFFFFFFFF else "never",
+               d["brake"], d["starts"], d["stops"], d["rejects"], rej)
+            + fmt_engine_v2(d))
+
+
+def fmt_engine_v2(d):
+    if "cas_flags" not in d:
+        return ""
+    ms = lambda v: "-" if v == 0xFFFF else "%d ms" % v
+    f = d["cas_flags"]
+    cas = ",".join(n for b, n in ((1, "ENDED-EARLY"), (2, "released"), (4, "HELD-LONG"), (8, "ABANDONED"))
+                   if f & b) or "-"
+    e8 = "fast" if d["out_flags"] & 4 else "crank" if d["out_flags"] & 2 else "1/s"
+    return (" | profile %s, START->rpm %s, START->82 %s, START held %s, CAS %s, aborts %d, inj %d, E8 %s"
+            % (ENGINE_PROFILE_NAMES.get(d["profile"] or d["profile_req"], d["profile"]), ms(d["t_rpm_ms"]),
+               ms(d["d_to_82_ms"]), ms(d["d_len_ms"]), cas, d["aborts"], d["out_flags"] & 1, e8))
+
+
+# --- v1h echo-miss diagnostics (USB 0xaa) ---------------------------------------------
+EMU_DIAG_STRUCT = struct.Struct("<4B4H4H4hHHHHHHHHIIIHHHH")   # v1h.2: + snap_fail, bg_max_us
+EMU_DIAG_LEN = EMU_DIAG_STRUCT.size
+assert EMU_DIAG_LEN == 64
+EMU_DIAG_FIELDS = ("version", "lm_slot", "lm_cycle", "lm_flags", "miss26", "miss28", "miss29", "miss3d",
+                   "late26", "late28", "late29", "late3d", "lm_r_entry", "lm_r_final", "lm_isr_late_us",
+                   "lm_sched_lead_us", "lm_sched_ref", "lm_hdr_us", "hdr_isr_max_us", "alarm_isr_max_us",
+                   "miss_resched_close", "miss_crc_near", "miss_preempt", "resched_guard_skips", "crc_fail",
+                   "no_cand", "static_fired", "hdr_over_10us", "resched_min_us", "snap_fail", "bg_max_us")
+
+
+def parse_emu_diag(raw):
+    if raw is None:
+        return None
+    raw = bytes(raw)
+    if len(raw) < EMU_DIAG_LEN:
+        return None
+    return dict(zip(EMU_DIAG_FIELDS, EMU_DIAG_STRUCT.unpack_from(raw)))
+
+
+def fmt_emu_diag(d):
+    if not d:
+        return "(no diag)"
+    fl = d["lm_flags"]
+    why = ",".join(n for b, n in ((1, "alarm-in-header-ISR"), (2, "re-armed<40us"), (4, "hdr-CRC-fail"),
+                                  (8, "no-candidate-IRQ"), (16, "prev-frame-on-wire")) if fl & b) or "-"
+    return ("miss 26/28/29/3D %d/%d/%d/%d late %d/%d/%d/%d | last miss 0x%02X c%d [%s] r %d->%d isr_late %dus "
+            "armed by 0x%02X %dus before | hdr ISR max %dus (>10us %d) alarm ISR max %dus | misses: re-armed<40us %d, "
+            "CRC-near %d, in-header-ISR %d | hdr CRC fails %d no-cand %d | guard %d (%dus)%s"
+            % (d["miss26"], d["miss28"], d["miss29"], d["miss3d"], d["late26"], d["late28"], d["late29"], d["late3d"],
+               d["lm_slot"], d["lm_cycle"], why, d["lm_r_entry"], d["lm_r_final"], d["lm_isr_late_us"],
+               d["lm_sched_ref"], d["lm_sched_lead_us"], d["hdr_isr_max_us"], d["hdr_over_10us"],
+               d["alarm_isr_max_us"], d["miss_resched_close"], d["miss_crc_near"], d["miss_preempt"],
+               d["crc_fail"], d["no_cand"], d["resched_guard_skips"], d["resched_min_us"],
+               # v1h.2 (diag version 2): PT-CAN snapshot read failures (last good one reused), core 1 background step
+               (" | snapshot read fails %d, background step max %dus" % (d["snap_fail"], d["bg_max_us"]))
+               if d["version"] >= 2 else ""))
+
+
+# --- v1h.1 gear status (USB 0xab, src/dde_gear.h) --------------------------------------
+GEAR_STATUS_STRUCT = struct.Struct("<8B4H2I" + "HBBBBH" * 5)
+GEAR_STATUS_LEN = GEAR_STATUS_STRUCT.size
+assert GEAR_STATUS_LEN == 64
+GEAR_NAMES = "PRND"
+GEAR_STAGES = ("P (pawl in)", "leaving P", "in gear", "P coming", "P (pawl not yet confirmed)",
+               "P released (lever pushed)")   # v1h.2: GST_P_RELEASED
+GEAR_WHY = {1: "lever forward 1", 2: "lever forward 2", 3: "lever back 1", 4: "lever back 2", 5: "P button",
+            6: "engine not running: auto P", 7: "off", 8: "on"}
+
+
+def parse_gear_status(raw):
+    if raw is None:
+        return None
+    raw = bytes(raw)
+    if len(raw) < GEAR_STATUS_LEN:
+        return None
+    v = GEAR_STATUS_STRUCT.unpack_from(raw)
+    d = dict(zip(("version", "enabled", "gear", "stage", "lever", "pbtn", "brake", "running", "ev_seq",
+                  "changes", "refusals", "reserved", "lever_frames", "lever_bad"), v[:14]))
+    d["ev"] = [dict(zip(("seq", "kind", "from_to", "why", "flags", "t_ms"), v[14 + 6 * i:20 + 6 * i]))
+               for i in range(5)]
+    return d
+
+
+def gear_name(g):
+    return GEAR_NAMES[g] if 0 <= g < 4 else "?"
+
+
+def gear_ev_text(e):
+    """Same text as gear_ev_text() in src/dde_gear.c."""
+    f, t = gear_name(e["from_to"] & 15), gear_name(e["from_to"] >> 4)
+    br = "brake on" if e["flags"] & 1 else "brake off"
+    k = e["kind"]
+    if k == 1:
+        return "GEAR: %s -> %s (%s) %s" % (f, t, br, GEAR_WHY.get(e["why"], ""))
+    if k == 2:
+        return "GEAR: refused, %s (%s -> %s, %s)" % ("brake not pressed" if e["why"] == 16 else "engine not running",
+                                                     f, t, GEAR_WHY.get(e["flags"] >> 4, ""))
+    if k == 3:
+        return "GEAR: P pawl confirmed (0x39A E2, 0x3F9 bits 28-29 = 2)"
+    if k == 4:
+        return "GEAR: shifting %s" % ("on" if e["why"] == 8 else "off (fixed P as v1h)")
+    if k == 5:
+        return "GEAR: lever 0x197 lost (no valid frame for 90 ms), holding %s" % t
+    if k == 6:
+        return "GEAR: lever 0x197 back"
+    return "GEAR: event %d" % k
+
+
+def gear_news(d, seen):
+    """New gear event texts since event number 'seen' (oldest first) and the new 'seen'."""
+    if not d:
+        return [], seen
+    out = []
+    for e in d["ev"]:
+        if e["seq"] and ((e["seq"] - seen) & 0xFFFF) and ((e["seq"] - seen) & 0xFFFF) < 0x8000:
+            out.append(gear_ev_text(e))
+    lost = ((d["ev_seq"] - seen) & 0xFFFF) - 5
+    if seen and lost > 0:
+        out.insert(0, "GEAR: (%d older gear events not shown)" % lost)
+    return out, d["ev_seq"]
+
+
+def fmt_gear(d):
+    if not d:
+        return "(no gear status)"
+    if not d["enabled"] & 2:
+        return "gear: not in this build (fixed P)"
+    lv = {0: "centre", 1: "fwd1", 2: "fwd2", 3: "back1", 4: "back2", 0xFF: "none"}.get(d["lever"], "0x%X" % d["lever"])
+    return ("gear %s (%s)%s | lever %s%s, brake %d, running %d | changes %d refusals %d | 0x197 ok %d bad %d"
+            % (gear_name(d["gear"]), GEAR_STAGES[d["stage"]] if d["stage"] < len(GEAR_STAGES) else d["stage"],
+               "" if d["enabled"] & 1 else " SHIFTING OFF", lv, " P-button" if d["pbtn"] else "", d["brake"],
+               d["running"], d["changes"], d["refusals"], d["lever_frames"], d["lever_bad"]))

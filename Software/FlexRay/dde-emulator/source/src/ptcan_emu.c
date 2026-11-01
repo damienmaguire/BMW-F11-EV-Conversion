@@ -22,14 +22,51 @@
 // - The forbidden-ID list is checked again right before each frame is queued.
 #include "ptcan_emu.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "hardware/sync.h"
 #include "pico/time.h"
 #include "ptcan_emu_core.h"
+#include "dde_emu.h"
+#include "console.h"
+#include "panda_usb.h"
+#include "pico_can_record.h"
+#include "board_pico_flexray_v2.h"
 
-_Static_assert(sizeof(ptcan_stats_t) == 178, "ptcan_stats_t layout");
+// v1f: frames handed to the controller per main-loop pass. 16 = the TX FIFO depth, so
+// after a hiccup every overdue frame can be queued at once (v1e: 4).
+#define PTCAN_BURST 16
+
+// v1f: own-TX logging. Every queued frame is remembered here by its controller sequence
+// number; when the controller reports it sent (TX event FIFO, with the time of the start
+// of frame) the frame is pushed to the host as a CAN record flagged TX.
+#define TXLOG_N 64
+static struct {
+    uint32_t seq;        // the chip's number for this frame
+    uint16_t id;
+    uint8_t dlc;
+    uint8_t data[8];
+    bool used;           // handed to the chip, not reported back yet
+    uint64_t queued_us;  // v1g.2: when it was handed to the chip
+} txlog[TXLOG_N];
+static uint32_t tx_logged, tx_log_lost;
+static uint32_t loop_gap_max_us, loop_gaps_20ms, burst_max;
+static uint64_t last_pass_us;
+
+// v1g.2: own-TX logging - when to read the chip's "sent" list (explained at tef_service())
+#define TEF_MIN_INTERVAL_US 1000u    // look at most once per millisecond
+#define TEF_GIVE_UP_US 50000u        // a frame not reported 50 ms after it was queued never will
+                                     // be (e.g. the chip gave up because nobody acknowledged it)
+static uint32_t tef_unconfirmed;     // frames handed to the chip that it has not reported yet
+static uint64_t tef_last_look_us;    // when we last looked at the list
+static bool tef_logging;             // did the laptop want our own frames at the last pass?
+static uint32_t tef_looks;           // how often we looked (shown in the 5 s status line)
+
+
+_Static_assert(sizeof(ptcan_stats_t) == 214, "ptcan_stats_t layout (v2)");
+_Static_assert(offsetof(ptcan_stats_t, loop_gap_max_us) == 178, "v2 tail starts after the v1 layout");
 _Static_assert(PTE_N_FRAMES == 19, "ptcan_stats_t has 19 slots");
 
 static pte_t core;
@@ -63,6 +100,9 @@ static bool set_mode(bool normal)
 {
     mcp_status_t r = mcp251863_set_normal(normal);
     mode_switches++;
+    // Every mode change passes through Configuration mode, which empties the chip's
+    // send queue and its "sent" list: nothing is outstanding any more.
+    tef_unconfirmed = 0;
     if (r == MCP_OK) {
         normal_mode = normal;
         printf("[CANTX] controller -> %s\n", normal ? "NORMAL (TX enabled, ACKs frames)" : "LISTEN-ONLY");
@@ -90,7 +130,10 @@ void ptcan_emu_on_rx(const mcp_rx_frame_t *f, uint32_t t_us32)
 {
     // Extended / remote frames only count as bus traffic.
     if (f->ide || f->rtr || f->fdf) pte_on_rx(&core, 0, NULL, 0, to64(t_us32));
-    else pte_on_rx(&core, (uint16_t)f->id, f->data, f->len, to64(t_us32));
+    else {
+        pte_on_rx(&core, (uint16_t)f->id, f->data, f->len, to64(t_us32));
+        dde_engine_on_can((uint16_t)f->id, f->data, f->len);   // v1g: ST_KL / brake for the fake start
+    }
 }
 
 void ptcan_emu_host_set(uint32_t mask)
@@ -99,6 +142,8 @@ void ptcan_emu_host_set(uint32_t mask)
     host_pending = true;
     __sev();
 }
+
+uint8_t ptcan_emu_fault(void) { return (uint8_t)core.fault; }
 
 static void handle_host(void)
 {
@@ -116,6 +161,119 @@ static void handle_host(void)
         uint32_t used = pte_set_mask(&core, m);
         printf("[CANTX] host mask 0x%05lx -> in use 0x%05lx\n", (unsigned long)m, (unsigned long)used);
     }
+}
+
+// ---------------------------------------------------------------------------------
+// Own-TX logging: reading the chip's "sent" list (TX event FIFO, TEF)
+// ---------------------------------------------------------------------------------
+// In plain words
+// --------------
+// After the CAN chip has sent one of our frames (and another node acknowledged it), it
+// writes a short note into a small list inside the chip: which frame, and the exact
+// time it went out. Reading that list is how the laptop gets our own frames in its log
+// (CSV dir=Tx), with the same time base as the frames we hear.
+//
+// Every look at that list is a conversation with the chip over the SPI wires, and the
+// main loop waits for it (about 25 us for "anything new?", about 60 us per note read).
+// v1f/v1g looked on EVERY pass of the main loop - many thousand times a second, almost
+// always to hear "nothing new". That ate the time the main loop needs to hand FlexRay
+// frames to USB, and in run 7 frames were dropped before they reached the laptop
+// (usb_fifo_dropped). v1g.2 only looks when it is worth it:
+//   1. Only if the laptop asked for our own frames (logger v1f or newer). If it did not,
+//      the list is not read at all. When the list is full the chip simply forgets the
+//      newest notes (it still SENDS every frame - Microchip reference manual DS20005678B,
+//      section 8, figure 8-27: "the ID is discarded, and TEFOVIF is set").
+//   2. Only if we handed the chip a frame that it has not reported back yet.
+//   3. At most once per millisecond. The list holds 16 notes. We send about 280 frames
+//      a second (usually 1-4 at a time); even the largest burst (16 frames after a
+//      hiccup) takes the bus about 4 ms to send, so the list does not fill up in between.
+// The time stamps are taken by the chip when the frame starts on the wire, so looking
+// up to 1 ms later does not make them any less exact.
+// (settings and counters: see "Own-TX logging" near the top of this file)
+
+// Read up to max notes from the chip's list and turn them into TX records for the laptop.
+// Returns how many notes were read (0 = list empty), or -1 if the SPI talk failed.
+// count_losses = false is used once when logging starts, to throw old notes away quietly.
+static int drain_tef(int max, bool count_losses)
+{
+    bool have_ref = false;
+    uint32_t tbc_ref = 0, us_ref = 0;
+    int got = 0;
+    for (int n = 0; n < max; n++) {
+        mcp_tef_t e;
+        bool ovf = false;
+        int r = mcp251863_tef_read(&e, &ovf);
+        if (ovf && count_losses) tx_log_lost++;      // the list was full: some notes are gone
+        if (r < 0) return -1;
+        if (r == 0) break;                           // list empty
+        got++;
+        unsigned k = e.seq % TXLOG_N;
+        if (!txlog[k].used || txlog[k].seq != e.seq || txlog[k].id != e.id) {
+            if (count_losses) tx_log_lost++;         // a note we have no copy of the frame for
+            continue;
+        }
+        txlog[k].used = false;
+        if (!count_losses) continue;
+        // The chip counts time with its own clock: read it once and convert to pico time.
+        if (!have_ref) { tbc_ref = mcp251863_read_tbc(); us_ref = time_us_32(); have_ref = true; }
+        pico_can_record_t rec;
+        rec.bus = V2_CAN_USB_BUS;
+        rec.flags = PICO_CAN_FLAG_TX;
+        rec.dlc = txlog[k].dlc;
+        rec.len = txlog[k].dlc;
+        rec.id = e.id;
+        rec.time_us = us_ref + (uint32_t)(int32_t)(e.ts - tbc_ref);
+        memcpy(rec.data, txlog[k].data, rec.len);
+        if (panda_can_record_push(&rec)) tx_logged++;
+        else tx_log_lost++;
+    }
+    return got;
+}
+
+// Called once per main-loop pass while the controller is in Normal mode. Usually
+// returns at once without touching the SPI wires. false = SPI failure.
+static bool tef_service(uint64_t now)
+{
+    // 1. Laptop did not ask for our own frames: never read the list.
+    if (!panda_can_tx_records_enabled()) {
+        tef_logging = false;
+        return true;
+    }
+    if (!tef_logging) {
+        // Logging was just switched on. The list may still hold old notes (or be full)
+        // from before: throw them away once, without counting them as lost.
+        tef_logging = true;
+        for (unsigned k = 0; k < TXLOG_N; k++) txlog[k].used = false;
+        if (drain_tef(16, false) < 0) return false;
+        tef_unconfirmed = 0;
+        tef_last_look_us = now;
+        return true;
+    }
+    // 2. Nothing sent that we have not heard back about: nothing to read.
+    if (tef_unconfirmed == 0) return true;
+    // 3. Looked less than 1 ms ago: wait.
+    if (now - tef_last_look_us < TEF_MIN_INTERVAL_US) return true;
+    tef_last_look_us = now;
+    tef_looks++;
+    // Read exactly as many notes as we expect (max 16 = list size), so the usual case
+    // costs no extra "anything else?" question.
+    int want = tef_unconfirmed > 16u ? 16 : (int)tef_unconfirmed;
+    int got = drain_tef(want, true);
+    if (got < 0) return false;
+    tef_unconfirmed = (uint32_t)got >= tef_unconfirmed ? 0u : tef_unconfirmed - (uint32_t)got;
+    if (got < want) {
+        // The list ran dry before we got all the reports we expected. Count again what
+        // is really still outstanding: frames queued in the last 50 ms. Older ones were
+        // never sent (the chip gave up after its retries) and will never be reported.
+        uint32_t still = 0;
+        for (unsigned k = 0; k < TXLOG_N; k++) {
+            if (!txlog[k].used) continue;
+            if (now - txlog[k].queued_us > TEF_GIVE_UP_US) txlog[k].used = false;
+            else still++;
+        }
+        tef_unconfirmed = still;
+    }
+    return true;
 }
 
 bool ptcan_emu_poll(void)
@@ -142,8 +300,20 @@ bool ptcan_emu_poll(void)
         printf("[CANTX] %s -> %s\n", pte_state_name(last_logged_state), pte_state_name(s));
         last_logged_state = s;
     }
-    if (!normal_mode) return true;
-    for (int n = 0; n < 4; n++) {
+    if (!normal_mode) { last_pass_us = 0; return true; }
+    // v1f: how regularly does the main loop get here? (run 6: 120-160 ms stalls every 5 s)
+    if (last_pass_us && now > last_pass_us) {
+        uint64_t gap = now - last_pass_us;
+        if (gap > loop_gap_max_us) loop_gap_max_us = gap > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)gap;
+        if (gap > 20000u) loop_gaps_20ms++;
+    }
+    last_pass_us = now;
+    if (!tef_service(now)) return false;   // v1g.2: cheap; usually no SPI at all
+    int n = 0;
+    // v1g: fresh fake-engine snapshot from core 1 (NULL when off / FlexRay not stepping)
+    static eng_out_t eng_snap;
+    core.eng = dde_engine_snapshot(&eng_snap) ? &eng_snap : NULL;
+    for (; n < PTCAN_BURST; n++) {
         pte_tx_t tx;
         if (!pte_next(&core, now, &tx)) break;
         if (pte_id_forbidden(tx.id)) { // belt and braces: the core never schedules these
@@ -151,11 +321,21 @@ bool ptcan_emu_poll(void)
             pte_fault(&core, PTE_FAULT_MODE, tx.id);
             break;
         }
+        uint32_t seq = mcp251863_next_seq();
         mcp_status_t r = mcp251863_send_std(tx.id, tx.data, tx.dlc);
         if (r == MCP_ERR_TX_FULL) { fifo_full++; break; }
         if (r != MCP_OK) return false;
+        unsigned k = seq % TXLOG_N;
+        txlog[k].seq = seq;
+        txlog[k].id = tx.id;
+        txlog[k].dlc = tx.dlc;
+        memcpy(txlog[k].data, tx.data, 8);
+        txlog[k].used = true;
+        txlog[k].queued_us = now;
+        tef_unconfirmed++;        // the chip will report this one back once it is sent
         pte_commit(&core, &tx, now);
     }
+    if ((uint32_t)n > burst_max) burst_max = (uint32_t)n;
     return true;
 }
 
@@ -221,6 +401,16 @@ uint16_t ptcan_emu_get_stats(uint8_t *buf, uint16_t max)
         s.id[i] = pte_defs[i].id;
         s.tx[i] = core.f[i].tx;
     }
+    s.loop_gap_max_us = loop_gap_max_us;
+    s.loop_gaps_20ms = loop_gaps_20ms;
+    s.late_max_us = core.late_max_us;
+    s.late_sends = core.late_sends;
+    s.resyncs = core.resyncs;
+    s.tx_logged = tx_logged;
+    s.tx_log_lost = tx_log_lost;
+    s.console_dropped = console_dropped();
+    s.burst_max = (uint16_t)burst_max;
+    // v1 hosts ask for 178 bytes and get the v1 layout (with version = 2; they only check >= 1)
     uint16_t n = sizeof s < max ? (uint16_t)sizeof s : max;
     memcpy(buf, &s, n);
     return n;
@@ -237,6 +427,12 @@ void ptcan_emu_print_stats(void)
            last_state.bus_off ? " BUS-OFF" : (last_state.tx_passive ? " TX-PASSIVE" : ""),
            normal_mode ? "Normal" : "Listen Only");
     if (!core.tx_total) return;
+    printf("[CANTX] loop gap max %lu us (>20 ms: %lu) | late %lu (max %lu us) resync %lu | burst max %lu | "
+           "TX logged %lu lost %lu (TEF looks %lu) | console dropped %lu\n",
+           (unsigned long)loop_gap_max_us, (unsigned long)loop_gaps_20ms, (unsigned long)core.late_sends,
+           (unsigned long)core.late_max_us, (unsigned long)core.resyncs, (unsigned long)burst_max,
+           (unsigned long)tx_logged, (unsigned long)tx_log_lost, (unsigned long)tef_looks,
+           (unsigned long)console_dropped());
     printf("[CANTX]");
     for (int i = 0; i < PTE_N_FRAMES; i++)
         if (core.f[i].tx) printf(" %03x:%lu", pte_defs[i].id, (unsigned long)core.f[i].tx);

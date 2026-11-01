@@ -490,3 +490,14 @@ void setup_stream_fr34(PIO pio)
     pio_sm_set_enabled(pio, sm_fr3, true);
     pio_sm_set_enabled(pio, sm_fr4, true);
 }
+
+#if PICO_FLEXRAY_DDE_EMU
+// v1h: header counters for the DDE emulator's echo-miss diagnostics (USB 0xaa)
+// v1h.2: in RAM - it is called from fire_slot (alarm ISR) for every static frame; from
+// flash it was an XIP fetch that can stall behind core 0's flash traffic (USB, printf)
+void __not_in_flash_func(dde_emu_stream_counts)(uint32_t *crc_fail, uint32_t *no_cand)
+{
+    *crc_fail = flexray_stream_diag.fr12_header_crc_fail;
+    *no_cand = flexray_stream_diag.fr12_header_no_candidate;
+}
+#endif

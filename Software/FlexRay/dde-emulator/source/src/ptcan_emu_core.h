@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "dde_engine.h"
 
 // ---- frame table (bit i of the host mask = table index i) ---------------------
 enum {
@@ -45,10 +46,22 @@ extern const pte_def_t pte_defs[PTE_N_FRAMES];
 #define PTE_NEW_WAKE_US     1000000u  // silence >= 1 s: the next frame is a new wake (restart timelines)
 #define PTE_SLEEP_PREP_US   1950000u  // KL15 off, own NM released, no foreign NM for 1.95 s: stop cyclics
 #define PTE_NM_CEILING_US   60000000u // NM (0x512/0x518) never later than 60 s after max(wake, last KL15-on 0x12F)
-#define PTE_512_RELEASE_US  45930000u // real DDE: last 0x512 at OFF+45.93 s
-#define PTE_518_RELEASE_US  29910000u // real EGS: last 0x518 at OFF+29.91 s
+// NM release timers (v1f). The real DDE/EGS keep their 645 ms NM grid running through
+// KL15 off and stop at a fixed time after OFF; the last frame is simply the last grid
+// slot before that time. Run 4: last 0x512 OFF+45.929 (next slot would be +46.57),
+// last 0x518 OFF+29.915 (ddecan) / +29.428 (noddecan; next slot +30.07). So the timers
+// are 46.0 s and 30.0 s (v1e stopped at "last real frame" = 45.93/29.91 and therefore
+// sent its last frame up to one period, ~0.25 s in run 6, earlier than the real ECU).
+#define PTE_512_RELEASE_US  46000000u // DDE: no 0x512 from OFF+46.0 s
+#define PTE_518_RELEASE_US  30000000u // EGS: no 0x518 from OFF+30.0 s
 #define PTE_518_NOKL15_US   30000000u // wake without KL15: 0x518 stops W+30 s (assumption, no capture)
 #define PTE_3FD_P_HOLD_US   30164000u // 0x3FD b2 0x20 -> 0x00 at OFF+30.164 s
+// v1f: a cyclic frame that is due but could not be sent on time is sent late (the grid
+// is kept, so the missed copies go out back to back with continuous alive counters),
+// unless it is more than 250 ms behind; then the grid restarts from now (counted in
+// 'resyncs'). A send more than PTE_LATE_US after its slot counts as a late send.
+#define PTE_CATCHUP_MAX_US  250000u
+#define PTE_LATE_US         5000u
 
 // ---- state --------------------------------------------------------------------
 typedef enum {
@@ -75,6 +88,8 @@ typedef struct {
     uint8_t ctr;           // last alive counter sent (0..14)
     uint8_t nm_pre_idx;    // 0x512: index into the pre-KL15 wake pattern
     uint8_t last[8];
+    uint8_t want[8];       // v1h.2: last INTENDED payload (event detection compares intent, not what went out)
+    bool ev_pend;          // v1h.2: the intended payload changed and no frame has carried it yet
     uint64_t next_us;      // next cyclic send
     uint64_t last_tx_us;
     uint32_t tx;           // frames handed to the controller (all wakes)
@@ -96,6 +111,13 @@ typedef struct {
     uint32_t n12f, kl15_on_edges, kl15_off_edges;
     pte_frame_t f[PTE_N_FRAMES];
     uint32_t tx_total, refused;
+    // v1f timing health
+    uint32_t late_sends;   // cyclic sends more than PTE_LATE_US after their slot
+    uint32_t late_max_us;  // worst lateness of a cyclic send
+    uint32_t resyncs;      // grid restarts (frames skipped because too far behind)
+    // v1g: fake-engine overlay (NULL = none). The glue points it at a fresh snapshot
+    // before every pte_next(); eng_patch_can() changes bytes before the counter + CRC.
+    const eng_out_t *eng;
 } pte_t;
 
 typedef struct {
@@ -103,6 +125,8 @@ typedef struct {
     uint16_t id;
     uint8_t dlc;
     uint8_t data[8];
+    uint64_t due_us;       // the slot this frame was due in (lateness = send time - due_us)
+    bool cyclic_slot;      // true = a cyclic slot, false = an on-change (event) copy
 } pte_tx_t;
 
 // ---- API ----------------------------------------------------------------------

@@ -5,7 +5,7 @@
 | Upstream | https://github.com/dynm/pico-flexray, branch `feature/frame-blocker` | `5c77833ea0b1f9337de2973e54bc3378c0533d34` |
 | Local, not on any remote | pass-through build (the known-good firmware) | `9a9ddcc` |
 | Local, not on any remote | `ts-capture-fixed` (FIXED timestamped capture build) | `acf675e5693eadddcd28ed0d1cda9be54f53aaa5` |
-| Local, not on any remote | `dde-emulator` (this work, v1e) | `a2f3321` (v1c was `60e749b`, v1b `f120e10`, v1 `954110e`) |
+| Local, not on any remote | `dde-emu-v1h` (this work, v1h.2) | `bc62e95` (v1e was `a2f3321`/`d7e490a`, v1c `60e749b`, v1b `f120e10`, v1 `954110e`) |
 
 History, oldest first:
 
@@ -34,7 +34,28 @@ af3af72 V2 board (Pi_Flex_V2) for the DDE emulator: PT-CAN capture, MCP251863 RX
 29eae7a dde-emu v1e: FlexRay content follows KL15 after off
 9653dc9 dde-emu v1e: PT-CAN DDE/EGS frame emulation on the V2 board (opt-in TX)
 a2f3321 logger: --can-tx / --can-tx-ids (v1e PT-CAN TX), cantx: status line; run.sh ptcan tests   (= v1e)
+d7e490a dde-emu v1e: plain-English comments in the PT-CAN emulator (comments only, V2 UF2 byte-identical)
+7dec502 dde-emu v1f WIP: non-blocking console, keep-grid catch-up, NM release 46/30 s, 0x397 blips + OFF walk
+55d14fa dde-emu v1f: 16 frames per pass, loop-gap/late stats, own TX logged via the MCP TX event FIFO
+46535d5 dde-emu v1f: check_emu_capture.py (own-TX slots, 0x397, foreign IDs, brake signals)   (= v1f)
+58cf388 dde-emu v1g: opt-in fake engine start (CAS ST_KL D + brake)
+895fe20 dde-emu v1g.2: stop USB record drops; FW_VERSION; logger version check   (= v1g.2)
+7514b68 dde-emu v1h: PICO_FR_USB_FAST (1 KB transfers), start profiles short/realistic/run8, echo-miss diagnostics   (= v1h)
+d3ebc30 dde-emu v1h.1: gear shifting P/R/N/D (lever 0x197 + brake 0x173), standalone build, checker --gear   (= v1h.1)
+bc62e95 dde-emu v1h.2: snapshot reuse (no stale PT-CAN frames), engine/gear out of the FR header ISR, ISR tables in RAM, re-arm guard 70 us, E6 grid fix   (= v1h.2)
 ```
+
+**v1h.2 patches** (`v1h2/patches/0020..0027`): `git format-patch --start-number 20
+d7e490a..` on top of the v1e series (`v1e/patches/0012..0019`). 0020..0026 are
+the commits above, unchanged. 0027 is `bc62e95` with one difference: the test
+vector `tests/host/run9_ptcan_rx.txt.gz` (all PT-CAN frames received in car run
+9) has the immobiliser, VIN and diagnostic IDs (0x80, 0x85, 0x351, 0x380, 0x580,
+0x592, 0x598, 0x5C0 and 0x6xx; 144 frames) removed for publication. The test
+that uses it gives the same transmitted frames with or without them, and the
+host tests (`run.sh`) pass. `source/` carries the same cleaned file.
+
+`source/` is at v1h.2: a rebuild gives the four v1h.2 UF2s byte for byte
+(same SHA-256 as `v1h2/firmware/SHA256SUMS`).
 
 `patches/` is the series ts-capture-fixed..dde-emulator. These are 11 patches:
 0001–0004 = v1 (`git format-patch ts-capture-fixed..954110e`, unchanged),

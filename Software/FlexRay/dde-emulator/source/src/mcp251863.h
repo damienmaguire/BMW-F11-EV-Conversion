@@ -33,9 +33,13 @@ typedef struct {
     uint32_t data_bitrate;  // CAN FD data phase (BRS); 0 = classic CAN 2.0 only mode
     bool listen_only;       // true: REQOP Listen Only (never ACKs / error-frames / transmits)
     uint8_t tx_fifo_depth;  // classic TX FIFO2 depth, 1..32 (0 = 1)
+    uint8_t tef_depth;      // v1f: TX event FIFO depth 1..32 (0 = no TEF). With a TEF the
+                            // controller notes every frame it SENT SUCCESSFULLY (ACKed) with
+                            // the SOF time stamp, so the logger can show our own TX.
 } mcp251863_cfg_t;
 
-// FIFO layout (TEF and TXQ disabled, FIFO1 starts at RAM 0x400):
+// FIFO layout (TXQ disabled; TEF only if cfg->tef_depth, 16 x 12 B = 192 B in the
+// emulator build, in front of FIFO1 -> 1608 B total; otherwise FIFO1 starts at RAM 0x400):
 //   FIFO1 RX, time stamped, 32 x 8 B payload  (32 x 20 B = 640 B)   classic build
 //                           16 x 64 B payload (16 x 76 B = 1216 B)  FD build
 //   FIFO2 TX classic, 1 x 8 B   (16 B)
@@ -90,6 +94,18 @@ mcp_status_t mcp251863_send_fd_std(uint16_t id, const uint8_t *data, uint8_t len
 // FIFOs): normal = Normal CAN 2.0 (CAN FD if a data bit rate is configured), else
 // Listen Only. Blocks up to 2 x 20 ms waiting for the controller.
 mcp_status_t mcp251863_set_normal(bool normal);
+// Sequence number the NEXT queued frame will carry (23 bits; the TEF returns it).
+uint32_t mcp251863_next_seq(void);
+// One TX event (a frame we sent, ACKed by the bus). Returns 1 = event read, 0 = TEF
+// empty or not configured, MCP_ERR_SPI on a bad read. *overflow is set if the TEF had
+// overflowed (events lost) since the last call (TEFOVIF, cleared here).
+typedef struct {
+    uint32_t id;     // 11-bit ID (we only send standard frames)
+    uint32_t seq;    // 23-bit sequence number given at queue time
+    uint8_t dlc;
+    uint32_t ts;     // time base counter at SOF (same 1 us clock as RXMSGTS)
+} mcp_tef_t;
+int mcp251863_tef_read(mcp_tef_t *e, bool *overflow);
 #endif
 mcp_status_t mcp251863_read_tx_state_fifo(uint8_t fifo, mcp_tx_state_t *st);
 mcp_status_t mcp251863_read_tx_state(mcp_tx_state_t *st); // FIFO1
